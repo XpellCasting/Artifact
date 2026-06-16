@@ -1,0 +1,25 @@
+services:
+  api:
+    build:
+      context: ./backend
+    environment:
+      MULTISTATE_FIXTURE_DIR: /app/fixtures
+      STATIC_HISTORY_DIR: /app/data/static_history
+      REAL_HISTORY_PATH: /app/data/datosreales/history.csv
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    volumes:
+      - ./data/fixtures:/app/fixtures:ro
+      - ./data/static_history:/app/data/static_history
+      - ./data/datosreales:/app/data/datosreales:ro
+    ports:
+      - "8000:8000"
+
+  web:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
