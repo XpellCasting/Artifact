@@ -1,324 +1,377 @@
 from __future__ import annotations
 
 import os
-import re
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from .pipeline import create_state
-
-
-class DatasetLoadRequest(BaseModel):
-    dataset_dir: str | None = None
+from .Cargar_Historial.Cargar_Historial import CargadorHistorial, ResultadoHistorial
+from .Filtro_Estadistico.Filtro import FiltroEstadistico
 
 
-class EntitySelectionRequest(BaseModel):
-    entity_ids: list[str]
-
-
-class SimulationGenerateRequest(BaseModel):
-    duration_hours: int = 72
-    sample_seconds: int = 10
-    seed: int = 20260614
-    faults: list[dict[str, Any]] | None = None
-    selected_entities: list[str] | None = None
-
-
-class SimulationFaultsRequest(BaseModel):
-    faults: list[dict[str, Any]]
-
-
-class StatisticalFilterRequest(BaseModel):
-    suspicion_threshold: float = 0.5
-
-
-class RealtimeTickRequest(BaseModel):
-    selected_entities: list[str]
+class TickRequest(BaseModel):
+    selected_entities: list[str] = Field(default_factory=list)
     tick_seconds: int = 60
-    faults: list[dict[str, Any]] = []
-    suspicion_threshold: float = 0.5
+    faults: list[dict[str, Any]] = Field(default_factory=list)
+    suspicion_threshold: float = 0.6
 
 
-class RealHistoryLoadRequest(BaseModel):
-    path: str | None = None
+class AnalyzeRequest(BaseModel):
+    suspicion_threshold: float = 0.6
 
 
-openapi_tags = [
-    {
-        "name": "health",
-        "description": "Control operativo basico del servicio API.",
-    },
-    {
-        "name": "datasets",
-        "description": "Carga de historicos Home Assistant y fixtures de evaluacion.",
-    },
-    {
-        "name": "simulation",
-        "description": "Historico canonico estatico, ticks de tiempo real y fallas sinteticas.",
-    },
-    {
-        "name": "entities",
-        "description": "Listado, clasificacion y seleccion de entidades diagnosticables.",
-    },
-    {
-        "name": "preprocess",
-        "description": "Validacion, limpieza, normalizacion y alineacion temporal.",
-    },
-    {
-        "name": "baseline",
-        "description": "Construccion de base de normalidad para cada entidad.",
-    },
-    {
-        "name": "filters",
-        "description": "Ejecucion del filtro estadistico-temporal.",
-    },
-    {
-        "name": "results",
-        "description": "Consulta de sospechas estadisticas calculadas.",
-    },
-]
+@dataclass
+class EstadoAplicacion:
+    cargador: CargadorHistorial
+    filtro_estadistico: FiltroEstadistico
+    static_history_dir: Path
+    real_history_path: Path
+    historial: ResultadoHistorial | None = None
+    resultados: list[dict[str, Any]] = field(default_factory=list)
+    realtime_events: pd.DataFrame = field(default_factory=pd.DataFrame)
+    realtime_tick_index: int = 0
+    realtime_current_timestamp: str | None = None
+    selected_entities: set[str] = field(default_factory=set)
 
-app = FastAPI(
-    title="Artifacto estadistico HA",
-    version="0.1.0",
-    description=(
-        "API del prototipo para crear historico canonico estatico, emitir "
-        "ticks de tiempo real y ejecutar el filtro estadistico-temporal."
-    ),
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    openapi_tags=openapi_tags,
-    swagger_ui_parameters={
-        "defaultModelsExpandDepth": -1,
-        "displayRequestDuration": True,
-        "docExpansion": "none",
-        "operationsSorter": "method",
-        "tagsSorter": "alpha",
-    },
-)
-state = create_state()
+    def status(self) -> dict[str, Any]:
+        if self.historial is None:
+            if (self.static_history_dir / "events.csv").exists():
+                try:
+                    self.historial = self.cargador.cargar_canonico(self.static_history_dir)
+                except Exception:
+                    pass
 
-DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000"
-origins = [item.strip() for item in os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",") if item.strip()]
-LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        if self.historial is None:
+            return {
+                "exists": False,
+                "valid": False,
+                "rows": 0,
+                "entity_count": 0,
+                "entities": [],
+                "source_type": "",
+                "start": None,
+                "end": None,
+                "normality_history": {"exists": False, "rows": 0},
+            }
+        return self._status_desde_historial(self.historial)
+
+    def cargar_real(self) -> dict[str, Any]:
+        self.historial = self.cargador.cargar_real(self.real_history_path)
+        self._reset_realtime()
+        return self._status_desde_historial(self.historial)
+
+    def asegurar_canonico(self) -> dict[str, Any]:
+        self.historial = self.cargador.crear_canonico_minimo(self.static_history_dir)
+        self._reset_realtime()
+        return self._status_desde_historial(self.historial)
+
+    def analizar_historial(self, suspicion_threshold: float) -> dict[str, Any]:
+        if self.historial is None:
+            self.status()
+        if self.historial is None:
+            raise ValueError("Primero debes cargar un historial.")
+
+        resultado = self.filtro_estadistico.analizar_historial(
+            eventos=self.historial.eventos,
+            entidades=self.historial.entidades,
+            suspicion_threshold=suspicion_threshold,
+        )
+        self.resultados = list(resultado.get("results", []))
+        return resultado
+
+    def reset_realtime(self) -> dict[str, Any]:
+        self._reset_realtime()
+        return self.current_realtime({})
+
+    def tick(self, request: TickRequest) -> dict[str, Any]:
+        if self.historial is None:
+            self.status()
+        if self.historial is None:
+            raise ValueError("Primero debes cargar un historial.")
+        entidades_validas = set(self.historial.entidades["entity_id"].astype(str))
+        seleccion = [entity_id for entity_id in request.selected_entities if entity_id in entidades_validas]
+        if not seleccion:
+            raise ValueError("Selecciona al menos una entidad valida para generar un tick.")
+
+        base = self.historial.eventos[self.historial.eventos["entity_id"].isin(seleccion)].copy()
+        if base.empty:
+            raise ValueError("No hay eventos historicos para las entidades seleccionadas.")
+        siguiente = base.groupby("entity_id", as_index=False).tail(1).copy()
+        ultimo = pd.to_datetime(self.historial.eventos["timestamp_dt"], errors="coerce", utc=True).max()
+        if self.realtime_current_timestamp:
+            ultimo = pd.to_datetime(self.realtime_current_timestamp, errors="coerce", utc=True)
+        nuevo_timestamp = ultimo + pd.Timedelta(seconds=max(10, int(request.tick_seconds)))
+        siguiente["timestamp_dt"] = nuevo_timestamp
+        siguiente["timestamp"] = nuevo_timestamp.isoformat()
+        self.realtime_tick_index += 1
+        self.realtime_current_timestamp = nuevo_timestamp.isoformat()
+        self.selected_entities = set(seleccion)
+        self.realtime_events = pd.concat([self.realtime_events, siguiente], ignore_index=True)
+        summary = self._summary_vacio(0.0)
+        return self.current_realtime(summary)
+
+    def current_realtime(self, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "current_timestamp": self.realtime_current_timestamp,
+            "tick_index": self.realtime_tick_index,
+            "events": int(len(self.realtime_events)),
+            "ground_truth_rows": 0,
+            "ground_truth_labels": {},
+            "results": self.resultados,
+            "historical_results": self.resultados,
+            "result_count": len(self.resultados),
+            "historical_result_count": len(self.resultados),
+            "summary": summary or {},
+            "historical_summary": summary or {},
+            "faults": [],
+            "fault_ticks": [],
+        }
+
+    def timeline(self, start: str | None, end: str | None, max_points: int) -> dict[str, Any]:
+        if self.historial is None:
+            self.status()
+        if self.historial is None:
+            return {"entities": [], "faults": []}
+
+        eventos = self.historial.eventos.copy()
+        if not self.realtime_events.empty:
+            eventos = pd.concat([eventos, self.realtime_events], ignore_index=True)
+        if self.selected_entities:
+            eventos = eventos[eventos["entity_id"].isin(self.selected_entities)]
+        eventos = filtrar_rango(eventos, start, end)
+        return construir_timeline(eventos, self.historial.entidades, max_points=max_points)
+
+    def _status_desde_historial(self, historial: ResultadoHistorial) -> dict[str, Any]:
+        metadatos = historial.metadatos
+        return {
+            "exists": True,
+            "valid": True,
+            "rows": int(metadatos.get("rows", len(historial.eventos))),
+            "entity_count": int(metadatos.get("entity_count", len(historial.entidades))),
+            "entities": historial.entidades.to_dict("records"),
+            "source_type": metadatos.get("source_type", ""),
+            "source_path": metadatos.get("source_path", ""),
+            "start": metadatos.get("start"),
+            "end": metadatos.get("end"),
+            "normality_history": {"exists": False, "rows": 0},
+        }
+
+    def _summary_vacio(self, elapsed_ms: float) -> dict[str, Any]:
+        return {
+            "results": 0,
+            "suspicious": 0,
+            "by_kind": {},
+            "top_results": [],
+            "elapsed_ms": round(float(elapsed_ms), 3),
+            "elapsed_seconds": round(float(elapsed_ms) / 1000.0, 6),
+            "timings_by_kind_ms": {},
+            "first_detection_delay_seconds": None,
+        }
+
+    def _reset_realtime(self) -> None:
+        self.realtime_events = pd.DataFrame()
+        self.realtime_tick_index = 0
+        self.realtime_current_timestamp = None
+        self.selected_entities = set()
+        self.resultados = []
 
 
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    origin = request.headers.get("origin")
-    headers = {}
-    if origin and (origin in origins or LOCAL_ORIGIN_RE.match(origin)):
-        headers["Access-Control-Allow-Origin"] = origin
-        headers["Access-Control-Allow-Credentials"] = "true"
-        headers["Vary"] = "Origin"
-    return JSONResponse(
-        status_code=500,
-        content={"detail": str(exc), "error_type": type(exc).__name__},
-        headers=headers,
+def crear_app() -> FastAPI:
+    api = FastAPI(
+        title="Artefacto de tesis",
+        description="API para carga de historial y filtros del artefacto.",
+        version="0.2.0",
     )
+    cors_origins = [
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+        if origin.strip()
+    ]
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    return api
 
 
-@app.get("/health", tags=["health"], summary="Verifica que la API este operativa")
+app = crear_app()
+state = EstadoAplicacion(
+    cargador=CargadorHistorial(),
+    filtro_estadistico=FiltroEstadistico(),
+    static_history_dir=Path(os.getenv("STATIC_HISTORY_DIR", "data/static_history")),
+    real_history_path=Path(os.getenv("REAL_HISTORY_PATH", "data/datosreales/history.csv")),
+)
+
+
+@app.get("/health", tags=["health"])
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "dataset_dir": str(state.dataset_dir),
-        "fixture_dir": str(state.fixture_dir),
+        "mensaje": "API operativa",
         "static_history_dir": str(state.static_history_dir),
         "real_history_path": str(state.real_history_path),
     }
 
 
-@app.post("/history/static/ensure", tags=["simulation"], summary="Crea o carga historico canonico estatico")
-def ensure_static_history_endpoint() -> dict[str, Any]:
+@app.get("/history/static/status", tags=["history"])
+def history_static_status() -> dict[str, Any]:
+    return state.status()
+
+
+@app.post("/history/static/ensure", tags=["history"])
+def history_static_ensure() -> dict[str, Any]:
     try:
-        return state.ensure_static_history()
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        return state.asegurar_canonico()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/history/static/status", tags=["simulation"], summary="Estado del historico canonico estatico")
-def static_history_status() -> dict[str, Any]:
-    return state.static_history_status()
-
-
-@app.post("/history/real/load", tags=["simulation"], summary="Carga historico real desde CSV")
-def load_real_history(request: RealHistoryLoadRequest | None = None) -> dict[str, Any]:
+@app.post("/history/real/load", tags=["history"])
+def history_real_load() -> dict[str, Any]:
     try:
-        return state.load_real_history(request.path if request else None)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        return state.cargar_real()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/history/analyze", tags=["simulation"], summary="Analiza sospechas en el historico cargado")
-def analyze_history(request: StatisticalFilterRequest | None = None) -> dict[str, Any]:
-    threshold = request.suspicion_threshold if request else 0.5
-    summary = state.run_historical_filter(suspicion_threshold=threshold)
-    return {
-        "summary": summary,
-        "results": state.historical_results,
-        "count": len(state.historical_results),
-    }
+@app.post("/history/analyze", tags=["history"])
+def history_analyze(request: AnalyzeRequest) -> dict[str, Any]:
+    try:
+        return state.analizar_historial(request.suspicion_threshold)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/realtime/reset", tags=["simulation"], summary="Limpia eventos de tiempo real")
+@app.post("/realtime/reset", tags=["realtime"])
 def realtime_reset() -> dict[str, Any]:
     return state.reset_realtime()
 
 
-@app.post("/realtime/tick", tags=["simulation"], summary="Genera un tick de tiempo real y ejecuta filtro")
-def realtime_tick(request: RealtimeTickRequest) -> dict[str, Any]:
+@app.post("/realtime/tick", tags=["realtime"])
+def realtime_tick(request: TickRequest) -> dict[str, Any]:
     try:
-        return state.realtime_tick(
-            selected_entities=request.selected_entities,
-            tick_seconds=request.tick_seconds,
-            faults=request.faults,
-            suspicion_threshold=request.suspicion_threshold,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        return state.tick(request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/realtime/current", tags=["simulation"], summary="Estado actual de tiempo real")
+@app.get("/realtime/current", tags=["realtime"])
 def realtime_current() -> dict[str, Any]:
     return state.current_realtime()
 
 
-@app.get("/realtime/timeline", tags=["simulation"], summary="Linea temporal de historico reciente y tiempo real")
+@app.get("/realtime/timeline", tags=["realtime"])
 def realtime_timeline(
     start: str | None = None,
     end: str | None = None,
-    max_points: int = 900,
+    max_points: int = Query(default=1000, ge=10, le=10000),
 ) -> dict[str, Any]:
-    return state.realtime_timeline(start=start, end=end, max_points=max_points)
+    return state.timeline(start=start, end=end, max_points=max_points)
 
 
-@app.post("/simulation/generate", tags=["simulation"], summary="Genera escenario sintetico")
-def generate_simulation_endpoint(request: SimulationGenerateRequest) -> dict[str, Any]:
-    return state.generate_simulation(
-        duration_hours=request.duration_hours,
-        sample_seconds=request.sample_seconds,
-        seed=request.seed,
-        faults=request.faults,
-        selected_entities=request.selected_entities,
-    )
+def filtrar_rango(eventos: pd.DataFrame, start: str | None, end: str | None) -> pd.DataFrame:
+    if eventos.empty:
+        return eventos
+    trabajo = eventos.copy()
+    if start:
+        start_dt = pd.to_datetime(start, errors="coerce", utc=True)
+        if pd.notna(start_dt):
+            trabajo = trabajo[trabajo["timestamp_dt"] >= start_dt]
+    if end:
+        end_dt = pd.to_datetime(end, errors="coerce", utc=True)
+        if pd.notna(end_dt):
+            trabajo = trabajo[trabajo["timestamp_dt"] <= end_dt]
+    if not start and not end:
+        limite = trabajo["timestamp_dt"].max() - pd.Timedelta(days=30)
+        trabajo = trabajo[trabajo["timestamp_dt"] >= limite]
+    return trabajo
 
 
-@app.get("/simulation/current", tags=["simulation"], summary="Obtiene el escenario sintetico actual")
-def current_simulation() -> dict[str, Any]:
-    return state.current_simulation()
+def construir_timeline(eventos: pd.DataFrame, entidades: pd.DataFrame, max_points: int) -> dict[str, Any]:
+    if eventos.empty:
+        return {"entities": [], "faults": []}
+    lookup = entidades.set_index("entity_id").to_dict("index") if not entidades.empty else {}
+    timelines = []
+    for entity_id, grupo in eventos.sort_values("timestamp_dt").groupby("entity_id", sort=True):
+        entidad = lookup.get(str(entity_id), {})
+        tipo = str(entidad.get("sensor_kind", grupo["sensor_kind"].iloc[0] if "sensor_kind" in grupo else "multistate"))
+        if tipo == "binary":
+            points, bucket_seconds = timeline_binario(grupo, max_points=max_points)
+            chart_kind = "active_percentage"
+            scale_unit = "%"
+        else:
+            sampleado = reducir_puntos(grupo, max_points)
+            points = [
+                {
+                    "timestamp": str(fila["timestamp"]),
+                    "state": str(fila["state"]),
+                    "value": valor_para_timeline(fila, tipo),
+                }
+                for fila in sampleado.to_dict("records")
+            ]
+            bucket_seconds = None
+            chart_kind = "state_line"
+            scale_unit = "state"
+        timelines.append(
+            {
+                "entity_id": str(entity_id),
+                "sensor_kind": tipo,
+                "area_id": "",
+                "chart_kind": chart_kind,
+                "scale_unit": scale_unit,
+                "bucket_seconds": bucket_seconds,
+                "points": points,
+                "categories": {},
+            }
+        )
+    return {"entities": timelines, "faults": []}
 
 
-@app.get("/simulation/timeline", tags=["simulation"], summary="Obtiene series temporales simuladas")
-def simulation_timeline() -> dict[str, Any]:
-    return state.simulation_timeline()
+def reducir_puntos(frame: pd.DataFrame, max_points: int) -> pd.DataFrame:
+    if len(frame) <= max_points:
+        return frame
+    step = max(1, len(frame) // max_points)
+    return frame.iloc[::step].head(max_points)
 
 
-@app.post("/simulation/faults", tags=["simulation"], summary="Actualiza fallas configuradas")
-def simulation_faults(request: SimulationFaultsRequest) -> dict[str, Any]:
-    return state.set_simulation_faults(request.faults)
+def timeline_binario(frame: pd.DataFrame, max_points: int) -> tuple[list[dict[str, Any]], int]:
+    trabajo = frame.sort_values("timestamp_dt").copy()
+    if trabajo.empty:
+        return [], 60
+    inicio = trabajo["timestamp_dt"].min()
+    fin = trabajo["timestamp_dt"].max()
+    duracion = max((fin - inicio).total_seconds(), 60.0)
+    bucket_seconds = max(60, int(duracion / max(max_points, 1)))
+    trabajo["bucket"] = ((trabajo["timestamp_dt"] - inicio).dt.total_seconds() // bucket_seconds).astype(int)
+    points = []
+    for _, grupo in trabajo.groupby("bucket", sort=True):
+        activos = pd.to_numeric(grupo["value"], errors="coerce").fillna(0.0)
+        porcentaje = float(activos.mean() * 100.0)
+        points.append(
+            {
+                "timestamp": str(grupo["timestamp"].iloc[-1]),
+                "state": str(grupo["state"].iloc[-1]),
+                "value": round(porcentaje, 4),
+                "activations": int(((activos.shift(1).fillna(0) == 0) & (activos == 1)).sum()),
+            }
+        )
+    return points[:max_points], bucket_seconds
 
 
-@app.get("/simulation/export/states.csv", tags=["simulation"], summary="Exporta estados simulados")
-def export_states() -> Response:
-    return csv_response(state.export_csv("states"), "ha_states.csv")
-
-
-@app.get("/simulation/export/entities.csv", tags=["simulation"], summary="Exporta entidades simuladas")
-def export_entities() -> Response:
-    return csv_response(state.export_csv("entities"), "ha_entities.csv")
-
-
-@app.get("/simulation/export/ground_truth.csv", tags=["simulation"], summary="Exporta ground truth simulado")
-def export_ground_truth() -> Response:
-    return csv_response(state.export_csv("ground_truth"), "ground_truth.csv")
-
-
-@app.post("/datasets/load", tags=["datasets"], summary="Carga el dataset historico")
-def load_dataset(request: DatasetLoadRequest | None = None) -> dict[str, Any]:
-    try:
-        return state.load_dataset(request.dataset_dir if request else None)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@app.get("/entities", tags=["entities"], summary="Lista entidades cargadas")
-def entities() -> list[dict[str, Any]]:
-    return state.list_entities()
-
-
-@app.post("/entities/selection", tags=["entities"], summary="Guarda la seleccion de entidades")
-def select_entities(request: EntitySelectionRequest) -> dict[str, Any]:
-    try:
-        return state.select_entities(request.entity_ids)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@app.post("/preprocess/validate", tags=["preprocess"], summary="Valida historicos y calidad de datos")
-def validate() -> dict[str, Any]:
-    return state.validate()
-
-
-@app.post("/preprocess/normalize", tags=["preprocess"], summary="Normaliza y alinea entidades")
-def normalize() -> dict[str, Any]:
-    return state.normalize()
-
-
-@app.post("/preprocess/features", tags=["preprocess"], summary="Calcula features temporales")
-def features() -> dict[str, Any]:
-    return state.build_feature_tables()
-
-
-@app.post("/baseline/build", tags=["baseline"], summary="Construye la base de normalidad")
-def baseline() -> dict[str, Any]:
-    return state.build_baseline()
-
-
-@app.post("/fixtures/multistate/load", tags=["datasets"], summary="Carga fixture multivalorico")
-def load_multistate_fixture() -> dict[str, Any]:
-    try:
-        return state.load_multistate_fixture()
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@app.post("/filters/statistical/run", tags=["filters"], summary="Ejecuta el filtro estadistico")
-def run_statistical_filter(request: StatisticalFilterRequest | None = None) -> dict[str, Any]:
-    threshold = request.suspicion_threshold if request else 0.5
-    return state.run_statistical_filter(suspicion_threshold=threshold)
-
-
-@app.get("/results/statistical", tags=["results"], summary="Obtiene sospechas estadisticas")
-def statistical_results() -> dict[str, Any]:
-    combined = state.historical_results + state.results
-    combined = sorted(combined, key=lambda item: item.get("suspicion_score", 0), reverse=True)[:1000]
-    return {
-        "results": combined,
-        "count": len(combined),
-        "historical_results": state.historical_results,
-        "historical_count": len(state.historical_results),
-        "realtime_results": state.results,
-        "realtime_count": len(state.results),
-    }
-
-
-def csv_response(content: str, filename: str) -> Response:
-    return Response(
-        content=content,
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+def valor_para_timeline(fila: dict[str, Any], tipo: str) -> float:
+    if tipo == "continuous":
+        valor = fila.get("value")
+        if valor is not None and not pd.isna(valor):
+            return float(valor)
+        return float(pd.to_numeric(pd.Series([fila.get("state")]), errors="coerce").fillna(0).iloc[0])
+    return 0.0

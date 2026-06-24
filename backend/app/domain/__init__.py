@@ -1,2 +1,0 @@
-"""Dominio compartido del artefacto."""
-

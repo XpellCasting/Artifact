@@ -1,0 +1,1 @@
+"""Filtros estadisticos del artefacto."""
