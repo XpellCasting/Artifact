@@ -19,7 +19,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000
 const RED_SUSPICION_SCORE = 0.60;
 const MARKER_GROUP_GAP_MS = 15 * 60 * 1000;
 
-const CONTINUOUS_FAULT_TYPES = ["random/spike", "malfunction", "bias", "drift", "missing"];
+const CONTINUOUS_FAULT_TYPES = ["random", "malfunction", "bias", "drift", "missing"];
 const BINARY_FAULT_TYPES = ["random", "malfunction", "bias", "missing"];
 
 const EQUATIONS = [

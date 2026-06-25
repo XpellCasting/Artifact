@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .Cargar_Historial.Cargar_Historial import CargadorHistorial, ResultadoHistorial
 from .Filtro_Estadistico.Filtro import FiltroEstadistico
 from .Patrones_Diseno.Unidad_Trabajo_Iteraciones import UnidadTrabajoIteraciones
+from .simulacion.Inyeccion_Fallas import InyectorFallasSensornets
 
 
 class TickRequest(BaseModel):
@@ -39,6 +40,7 @@ class EstadoAplicacion:
     static_history_dir: Path
     real_history_path: Path
     analysis_cache_path: Path
+    inyector_fallas: InyectorFallasSensornets = field(default_factory=InyectorFallasSensornets)
     historial: ResultadoHistorial | None = None
     resultados: list[dict[str, Any]] = field(default_factory=list)
     realtime_events: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -331,8 +333,25 @@ class EstadoAplicacion:
             fila = self._proyectar_siguiente_fila(grupo, entidad, timestamp)
             fault = fallas.get(entity_id)
             if fault:
-                fila = self._aplicar_falla_tick(fila, grupo, entidad, fault, tick_seconds)
-                self._registrar_falla_tick(entity_id, str(fault.get("fault_type", "fault")), fila["timestamp_dt"], tick_seconds)
+                resultado = self.inyector_fallas.aplicar(
+                    fila=fila,
+                    grupo=self._grupo_historico_entidad(entity_id, grupo),
+                    entidad=entidad,
+                    fault=fault,
+                    tick_index=self.realtime_tick_index,
+                    tick_seconds=tick_seconds,
+                )
+                fila = resultado.fila
+                if resultado.aplicada:
+                    self._registrar_falla_tick(
+                        entity_id=entity_id,
+                        fault_type=resultado.fault_type,
+                        timestamp=fila["timestamp_dt"],
+                        tick_seconds=tick_seconds,
+                        clean_state=resultado.clean_state,
+                        observed_state=resultado.observed_state,
+                        metadata=resultado.metadata,
+                    )
             filas.append(fila)
         if not filas:
             return pd.DataFrame(columns=eventos.columns)
@@ -358,51 +377,26 @@ class EstadoAplicacion:
             fila["state"] = self._estado_binario(fila["value"])
         return fila
 
-    def _aplicar_falla_tick(
+    def _registrar_falla_tick(
         self,
-        fila: dict[str, Any],
-        grupo: pd.DataFrame,
-        entidad: dict[str, Any],
-        fault: dict[str, Any],
+        entity_id: str,
+        fault_type: str,
+        timestamp: pd.Timestamp,
         tick_seconds: int,
-    ) -> dict[str, Any]:
-        tipo = str(entidad.get("sensor_kind") or fila.get("sensor_kind") or "")
-        fault_type = str(fault.get("fault_type", "random"))
-        if "missing" in fault_type:
-            missing_seconds = max(3600, tick_seconds * 10)
-            timestamp = pd.to_datetime(fila["timestamp_dt"], errors="coerce", utc=True) + pd.Timedelta(seconds=missing_seconds)
-            fila["timestamp_dt"] = timestamp
-            fila["timestamp"] = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-        if tipo == "continuous":
-            valor = float(pd.to_numeric(pd.Series([fila.get("value")]), errors="coerce").fillna(0.0).iloc[0])
-            escala = self._escala_continua(self._grupo_historico_entidad(str(fila.get("entity_id")), grupo))
-            if fault_type in {"random/spike", "random"}:
-                signo = -1.0 if self.realtime_tick_index % 2 else 1.0
-                valor += signo * escala * 10.0
-            elif fault_type == "malfunction":
-                valor += escala * 16.0
-            elif fault_type == "bias":
-                valor += escala * 5.0
-            elif fault_type == "drift":
-                valor += max(escala * 0.08, 0.02)
-            fila["value"] = round(valor, 6)
-            fila["state"] = f"{valor:.6f}"
-        elif tipo == "binary":
-            valor = float(pd.to_numeric(pd.Series([fila.get("value")]), errors="coerce").fillna(0.0).iloc[0])
-            if fault_type in {"random", "malfunction"}:
-                valor = 0.0 if valor >= 0.5 else 1.0
-            elif fault_type == "bias":
-                valor = 1.0
-            fila["value"] = valor
-            fila["state"] = self._estado_binario(valor)
-        return fila
-
-    def _registrar_falla_tick(self, entity_id: str, fault_type: str, timestamp: pd.Timestamp, tick_seconds: int) -> None:
+        clean_state: str,
+        observed_state: str,
+        metadata: dict[str, Any],
+    ) -> None:
         start = pd.to_datetime(timestamp, errors="coerce", utc=True)
         end = start + pd.Timedelta(seconds=max(10, tick_seconds))
         evento = {
             "entity_id": entity_id,
             "fault_type": fault_type,
+            "label": "sensor_fault",
+            "is_reliable": True,
+            "clean_state": clean_state,
+            "observed_state": observed_state,
+            "metadata": metadata,
             "start": start.isoformat(),
             "end": end.isoformat(),
             "tick_index": self.realtime_tick_index,
@@ -411,8 +405,11 @@ class EstadoAplicacion:
         ultima = self.realtime_faults[-1] if self.realtime_faults else None
         if ultima and ultima["entity_id"] == entity_id and ultima["fault_type"] == fault_type:
             ultima["end"] = evento["end"]
+            ultima["observed_state"] = observed_state
         else:
-            self.realtime_faults.append({k: evento[k] for k in ("entity_id", "fault_type", "start", "end")})
+            self.realtime_faults.append(
+                {k: evento[k] for k in ("entity_id", "fault_type", "label", "start", "end", "clean_state", "observed_state")}
+            )
 
     def _escala_continua(self, grupo: pd.DataFrame) -> float:
         valores = pd.to_numeric(grupo["value"], errors="coerce").dropna()
