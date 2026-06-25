@@ -19,6 +19,7 @@ class ResultadoHistorial:
     eventos: pd.DataFrame
     entidades: pd.DataFrame
     metadatos: dict[str, Any] = field(default_factory=dict)
+    normalizacion_muestras: list[dict[str, Any]] = field(default_factory=list)
 
 
 class CargadorHistorial:
@@ -149,6 +150,7 @@ class CargadorHistorial:
 
     def _normalizar(self, frame: pd.DataFrame, origen: str, ruta: Path) -> ResultadoHistorial:
         trabajo = frame.copy()
+        trabajo["_raw_index"] = range(len(trabajo))
         trabajo["entity_id"] = trabajo["entity_id"].astype(str).str.strip()
         trabajo["state"] = trabajo["state"].astype(str).str.strip()
         trabajo["timestamp_dt"] = pd.to_datetime(trabajo["timestamp"], errors="coerce", utc=True)
@@ -173,6 +175,7 @@ class CargadorHistorial:
         trabajo = trabajo.sort_values(["entity_id", "timestamp_dt"]).reset_index(drop=True)
 
         entidades = self._construir_entidades(trabajo)
+        muestras = self._construir_muestras_normalizacion(frame, trabajo)
         metadatos = {
             "source_type": origen,
             "source_path": str(ruta),
@@ -181,7 +184,12 @@ class CargadorHistorial:
             "start": None if trabajo.empty else trabajo["timestamp_dt"].min().isoformat(),
             "end": None if trabajo.empty else trabajo["timestamp_dt"].max().isoformat(),
         }
-        return ResultadoHistorial(eventos=trabajo, entidades=entidades, metadatos=metadatos)
+        return ResultadoHistorial(
+            eventos=trabajo,
+            entidades=entidades,
+            metadatos=metadatos,
+            normalizacion_muestras=muestras,
+        )
 
     def _clasificar_fila(self, fila: pd.Series) -> str:
         if str(fila.get("sensor_kind", "")).strip() in {"continuous", "binary", "multistate"}:
@@ -229,6 +237,59 @@ class CargadorHistorial:
             return pd.DataFrame(columns=columnas)
         entidades = eventos.groupby("entity_id", as_index=False).first()[columnas]
         return entidades.sort_values("entity_id").reset_index(drop=True)
+
+    def _construir_muestras_normalizacion(
+        self,
+        original: pd.DataFrame,
+        normalizado: pd.DataFrame,
+        filas_por_entidad: int = 5,
+    ) -> list[dict[str, Any]]:
+        if original.empty or normalizado.empty:
+            return []
+
+        columnas_originales = [
+            columna
+            for columna in ["entity_id", "timestamp", "state", "domain", "unit_of_measurement", "device_class", "sensor_kind"]
+            if columna in original.columns
+        ]
+        columnas_normalizadas = [
+            "entity_id",
+            "timestamp",
+            "state",
+            "domain",
+            "sensor_kind",
+            "tipo_interno",
+            "value",
+            "unit_of_measurement",
+            "device_class",
+        ]
+        muestras = []
+        for entity_id, grupo in normalizado.groupby("entity_id", sort=True):
+            for fila in grupo.head(filas_por_entidad).to_dict("records"):
+                raw_index = fila.get("_raw_index")
+                original_fila = original.iloc[int(raw_index)].to_dict() if raw_index is not None else {}
+                muestras.append(
+                    {
+                        "entity_id": str(entity_id),
+                        "raw_index": int(raw_index) if raw_index is not None else None,
+                        "original": {
+                            columna: self._serializar_valor(original_fila.get(columna))
+                            for columna in columnas_originales
+                        },
+                        "normalizado": {
+                            columna: self._serializar_valor(fila.get(columna))
+                            for columna in columnas_normalizadas
+                        },
+                    }
+                )
+        return muestras
+
+    def _serializar_valor(self, valor: Any) -> Any:
+        if pd.isna(valor):
+            return None
+        if isinstance(valor, pd.Timestamp):
+            return valor.isoformat()
+        return valor
 
     def _mezclar_entidades(self, inferidas: pd.DataFrame, declaradas: pd.DataFrame) -> pd.DataFrame:
         base = inferidas.set_index("entity_id")

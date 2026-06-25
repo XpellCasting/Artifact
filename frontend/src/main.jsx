@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -6,9 +6,9 @@ import {
   BarChart3,
   X,
   Database,
+  Eye,
   FlaskConical,
   Loader2,
-  Pause,
   Play,
   RotateCcw,
   Zap,
@@ -132,8 +132,9 @@ function App() {
   const [error, setError] = useState("");
   const [isIterating, setIsIterating] = useState(false);
   const [selectedResult, setSelectedResult] = useState(null);
+  const [normalizationPreview, setNormalizationPreview] = useState(null);
   const [activeModule, setActiveModule] = useState("estadistico");
-  const stopIterationsRef = useRef(false);
+  const [resultEntityFilterIds, setResultEntityFilterIds] = useState(null);
 
   const continuousEntities = useMemo(
     () => entities.filter((entity) => entity.sensor_kind === "continuous"),
@@ -160,11 +161,24 @@ function App() {
       .filter((result) => ["continuous", "binary"].includes(result.sensor_kind));
   }, [historicalResults, realtime]);
 
-  const displayResults = useMemo(() => {
-    return [...allAnalyzedResults]
-      .sort((left, right) => Number(right.suspicion_score || 0) - Number(left.suspicion_score || 0))
-      .slice(0, 1000);
+  const resultEntityOptions = useMemo(() => {
+    return [...new Set(allAnalyzedResults.map((result) => result.entity_id).filter(Boolean))]
+      .sort((left, right) => left.localeCompare(right));
   }, [allAnalyzedResults]);
+
+  const filteredAnalyzedResults = useMemo(() => {
+    if (resultEntityFilterIds === null) {
+      return allAnalyzedResults;
+    }
+    const selected = new Set(resultEntityFilterIds);
+    return allAnalyzedResults.filter((result) => selected.has(result.entity_id));
+  }, [allAnalyzedResults, resultEntityFilterIds]);
+
+  const displayResults = useMemo(() => {
+    return [...filteredAnalyzedResults]
+      .sort(compareResultsByExecutionDate)
+      .slice(0, 1000);
+  }, [filteredAnalyzedResults]);
 
   const suspiciousCount = allAnalyzedResults.filter(isRedSuspicion).length;
   const activeFaults = faults.filter((fault) => fault.enabled && selectedAnalyzable.includes(fault.entity_id));
@@ -241,6 +255,13 @@ function App() {
     });
   }
 
+  async function openNormalizationPreview() {
+    await runStep("normalization-preview", async () => {
+      const payload = await api("/history/normalization/preview");
+      setNormalizationPreview(payload);
+    });
+  }
+
   async function resetRealtime() {
     await runStep("reset", async () => {
       const payload = await api("/realtime/reset", { method: "POST" });
@@ -285,31 +306,35 @@ function App() {
       setError("Selecciona al menos una entidad continua o binaria para generar iteraciones.");
       return;
     }
-    stopIterationsRef.current = false;
     setIsIterating(true);
     setBusy("iterations");
     setError("");
     setIterationsDone(0);
     try {
       const target = Math.max(1, Number(iterationCount) || 1);
-      for (let index = 0; index < target; index += 1) {
-        if (stopIterationsRef.current) {
-          break;
-        }
-        await generateOneTick({ quiet: true });
-        setIterationsDone(index + 1);
-        await sleep(80);
-      }
+      const payload = await api("/realtime/iterations", {
+        method: "POST",
+        body: JSON.stringify({
+          selected_entities: selectedAnalyzable,
+          tick_seconds: tickSeconds,
+          iteration_count: target,
+          faults: faults.map((fault) => ({
+            ...fault,
+            enabled: fault.enabled && selectedAnalyzable.includes(fault.entity_id),
+          })),
+          suspicion_threshold: suspicionThreshold,
+        }),
+      });
+      setRealtime(payload);
+      setRunSummary(payload.summary || {});
+      setIterationsDone(payload.summary?.iterations_done || target);
+      await loadTimeline(chartStart, chartEnd);
     } catch (err) {
       setError(err.message);
     } finally {
       setIsIterating(false);
       setBusy("");
     }
-  }
-
-  function stopIterations() {
-    stopIterationsRef.current = true;
   }
 
   async function loadTimeline(startValue = chartStart, endValue = chartEnd) {
@@ -341,6 +366,18 @@ function App() {
     setFaults((current) => current.map((fault) => ({ ...fault, enabled: false })));
   }
 
+  function toggleResultEntityFilter(entityId) {
+    setResultEntityFilterIds((current) => {
+      const next = new Set(current === null ? resultEntityOptions : current);
+      if (next.has(entityId)) {
+        next.delete(entityId);
+      } else {
+        next.add(entityId);
+      }
+      return resultEntityOptions.filter((option) => next.has(option));
+    });
+  }
+
   return (
     <main className="app-shell">
       <header className="app-header">
@@ -358,9 +395,9 @@ function App() {
             Generar tick
           </button>
           {isIterating ? (
-            <button className="secondary-action" onClick={stopIterations}>
-              <Pause size={18} />
-              Detener
+            <button className="secondary-action" disabled>
+              <Loader2 className="spin" size={18} />
+              Ejecutando
             </button>
           ) : (
             <button className="secondary-action" onClick={runIterations} disabled={Boolean(busy) || !selectedAnalyzable.length}>
@@ -424,6 +461,7 @@ function App() {
                 <StepButton id="real-history" busy={busy} onClick={loadRealHistory} icon={<Database size={17} />} label="Cargar historico real" />
                 <StepButton id="static-history" busy={busy} onClick={loadStaticHistory} icon={<Database size={17} />} label="Crear/cargar historico canonico" />
                 <StepButton id="analyze-history" busy={busy} onClick={analyzeHistory} icon={<BarChart3 size={17} />} label="Analizar historico" disabled={!historyStatus?.exists} />
+                <StepButton id="normalization-preview" busy={busy} onClick={openNormalizationPreview} icon={<Eye size={17} />} label="Ver normalizacion" disabled={!historyStatus?.exists} />
               </div>
               <div className="entity-list compact">
                 {analyzableEntities.map((entity) => (
@@ -554,8 +592,16 @@ function App() {
                 <SummaryRow label="Tiempo total filtro" value={formatElapsed(runSummary?.elapsed_ms)} />
                 <SummaryRow label="Tiempo continuas" value={formatElapsed(runSummary?.timings_by_kind_ms?.continuous)} />
                 <SummaryRow label="Tiempo binarias" value={formatElapsed(runSummary?.timings_by_kind_ms?.binary)} />
+                <SummaryRow label="Cache analisis" value={runSummary ? (runSummary.cache_hit ? "reutilizado" : "nuevo") : "-"} />
                 <SummaryRow label="Paso a contextual" value={allAnalyzedResults.filter(isRedSuspicion).length} />
+                <SummaryRow label="Resultados visibles" value={`${formatCount(displayResults.length)} / ${formatCount(allAnalyzedResults.length)}`} />
               </div>
+              <ResultEntityFilters
+                entities={resultEntityOptions}
+                selectedIds={resultEntityFilterIds}
+                onToggle={toggleResultEntityFilter}
+                onShowAll={() => setResultEntityFilterIds(null)}
+              />
               <ResultsTable results={displayResults} onResultClick={setSelectedResult} />
             </Panel>
           </section>
@@ -574,6 +620,12 @@ function App() {
         <CalculationModal
           result={selectedResult}
           onClose={() => setSelectedResult(null)}
+        />
+      )}
+      {normalizationPreview && (
+        <NormalizationModal
+          preview={normalizationPreview}
+          onClose={() => setNormalizationPreview(null)}
         />
       )}
     </main>
@@ -646,12 +698,42 @@ function Empty({ text }) {
   return <div className="empty">{text}</div>;
 }
 
+function ResultEntityFilters({ entities, selectedIds, onToggle, onShowAll }) {
+  if (!entities.length) {
+    return null;
+  }
+  const selectedCount = selectedIds === null ? entities.length : selectedIds.length;
+  return (
+    <div className="results-filter">
+      <div className="results-filter-header">
+        <span>Filtrar por entidad</span>
+        <strong>{selectedCount} / {entities.length}</strong>
+        <button type="button" className="secondary-action inline" onClick={onShowAll}>
+          Todas
+        </button>
+      </div>
+      <div className="results-filter-list">
+        {entities.map((entityId) => (
+          <label className="entity-filter-chip" key={entityId}>
+            <input
+              type="checkbox"
+              checked={selectedIds === null || selectedIds.includes(entityId)}
+              onChange={() => onToggle(entityId)}
+            />
+            <span>{entityId}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ResultsTable({ results, onResultClick }) {
   return (
     <div className="results-table">
       <div className="table-head">
         <span>Entidad</span>
-        <span>Tiempo</span>
+        <span>Tiempo mayor-menor</span>
         <span>Score</span>
         <span>Raw</span>
         <span>Lectura</span>
@@ -668,7 +750,7 @@ function ResultsTable({ results, onResultClick }) {
           title="Ver calculo estadistico"
         >
           <span>{result.entity_id}</span>
-          <span>{shortDate(result.timestamp)}</span>
+          <TimeStack value={result.timestamp} />
           <span>{formatNumber(result.suspicion_score)}</span>
           <span>{formatNumber(result.raw_score)}</span>
           <span>{formatReading(result)}</span>
@@ -679,6 +761,16 @@ function ResultsTable({ results, onResultClick }) {
       ))}
       {!results.length && <Empty text="No hay sospechas estadisticas para mostrar." />}
     </div>
+  );
+}
+
+function TimeStack({ value }) {
+  const parts = splitDateTime(value);
+  return (
+    <span className="time-stack">
+      <strong>{parts.date}</strong>
+      <small>{parts.time}</small>
+    </span>
   );
 }
 
@@ -750,6 +842,131 @@ function CalculationModal({ result, onClose }) {
           </div>
         </article>
       </section>
+    </div>
+  );
+}
+
+function NormalizationModal({ preview, onClose }) {
+  const grouped = groupNormalizationSamples(preview?.samples || []);
+  const fragmentsByEntity = new Map((preview?.fragments || []).map((fragment) => [fragment.entity_id, fragment]));
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <section className="calculation-modal normalization-modal" role="dialog" aria-modal="true" aria-label="Vista de normalizacion" onClick={(event) => event.stopPropagation()}>
+        <header className="modal-header">
+          <div>
+            <span>Fragmentos procesados</span>
+            <h2>Normalizacion del historial</h2>
+            <small>{preview.source_type || "-"} / {formatCount(preview.rows)} filas / {formatCount(preview.entity_count)} entidades</small>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Cerrar vista de normalizacion">
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="normalization-list">
+          {grouped.map(([entityId, samples]) => (
+            <article className="modal-block" key={entityId}>
+              <h3>{entityId}</h3>
+              {fragmentsByEntity.has(entityId) && (
+                <NormalizationFragmentChart timeline={fragmentsByEntity.get(entityId)} />
+              )}
+              <div className="normalization-table">
+                <div className="normalization-head">
+                  <span>Fila</span>
+                  <span>Original recibido</span>
+                  <span>Normalizado usado por el filtro</span>
+                </div>
+                {samples.map((sample) => (
+                  <div className="normalization-row" key={`${entityId}-${sample.raw_index}`}>
+                    <span>#{Number(sample.raw_index) + 1}</span>
+                    <KeyValueGrid rows={compactRows(sample.original)} />
+                    <KeyValueGrid rows={compactRows(sample.normalizado)} />
+                  </div>
+                ))}
+              </div>
+            </article>
+          ))}
+          {!grouped.length && <Empty text="No hay fragmentos de normalizacion disponibles." />}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function NormalizationFragmentChart({ timeline }) {
+  const width = 720;
+  const height = 190;
+  const padding = { top: 14, right: 22, bottom: 30, left: 54 };
+  const points = (timeline?.points || []).map((point, index) => ({
+    ...point,
+    value: Number(point.value),
+    time: Date.parse(point.timestamp),
+    index,
+  }));
+  const isBinary = timeline?.sensor_kind === "binary";
+  const values = points.map((point) => point.value).filter(Number.isFinite);
+  const min = isBinary ? 0 : (values.length ? Math.min(...values) : 0);
+  const max = isBinary ? 100 : (values.length ? Math.max(...values) : 1);
+  const range = max - min || 1;
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const validTimes = points.length > 1 && points.every((point) => Number.isFinite(point.time));
+  const firstTime = validTimes ? points[0].time : 0;
+  const lastTime = validTimes ? points.at(-1).time : Math.max(points.length - 1, 1);
+  const timeRange = Math.max(lastTime - firstTime, 1);
+  const xFor = (point) => padding.left + ((validTimes ? point.time - firstTime : point.index) / (validTimes ? timeRange : Math.max(points.length - 1, 1))) * plotWidth;
+  const yFor = (value) => height - padding.bottom - ((value - min) / range) * plotHeight;
+  const linePath = points
+    .filter((point) => Number.isFinite(point.value))
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${xFor(point).toFixed(1)} ${yFor(point.value).toFixed(1)}`)
+    .join(" ");
+
+  return (
+    <div className="normalization-chart">
+      <div className="chart-title compact">
+        <div>
+          <strong>Fragmento visual normalizado</strong>
+          <small>{points.length} puntos / {kindText(timeline?.sensor_kind)}</small>
+        </div>
+        <span>{isBinary ? "0-100%" : `${formatAxisValue(min)} - ${formatAxisValue(max)}`}</span>
+      </div>
+      <svg className="timeline-svg" viewBox={`0 0 ${width} ${height}`}>
+        {[0, 0.5, 1].map((tick) => {
+          const y = padding.top + tick * plotHeight;
+          const label = max - tick * range;
+          return (
+            <React.Fragment key={tick}>
+              <line className="grid" x1={padding.left} y1={y} x2={width - padding.right} y2={y} />
+              <text x="8" y={y + 4}>{isBinary ? `${Math.round(label)}%` : formatAxisValue(label)}</text>
+            </React.Fragment>
+          );
+        })}
+        <line className="axis" x1={padding.left} y1={padding.top} x2={padding.left} y2={height - padding.bottom} />
+        <line className="axis" x1={padding.left} y1={height - padding.bottom} x2={width - padding.right} y2={height - padding.bottom} />
+        {isBinary && points.map((point, index) => {
+          const barWidth = Math.max(2, plotWidth / Math.max(points.length, 1) * 0.72);
+          const y = yFor(point.value);
+          return (
+            <rect
+              className="binary-bar"
+              key={`${point.timestamp}-normalization-bar-${index}`}
+              x={xFor(point) - barWidth / 2}
+              y={y}
+              width={barWidth}
+              height={height - padding.bottom - y}
+            />
+          );
+        })}
+        {linePath && <path d={linePath} />}
+        {points.map((point, index) => (
+          index % Math.max(1, Math.floor(points.length / 28)) === 0
+            ? <circle key={`${point.timestamp}-${index}`} cx={xFor(point)} cy={yFor(point.value)} r="2.4" />
+            : null
+        ))}
+        <text x={padding.left} y={height - 8}>{points[0]?.timestamp ? shortDate(points[0].timestamp).slice(0, 16) : "-"}</text>
+        <text x={width - 142} y={height - 8}>{points.at(-1)?.timestamp ? shortDate(points.at(-1).timestamp).slice(0, 16) : "-"}</text>
+      </svg>
     </div>
   );
 }
@@ -928,6 +1145,17 @@ function syncFaultRows(entities, currentFaults) {
 
 function isRedSuspicion(result) {
   return Boolean(result?.is_suspicious) && Number(result?.suspicion_score || 0) >= RED_SUSPICION_SCORE;
+}
+
+function compareResultsByExecutionDate(left, right) {
+  const leftTime = Date.parse(left?.timestamp || "");
+  const rightTime = Date.parse(right?.timestamp || "");
+  const safeLeft = Number.isFinite(leftTime) ? leftTime : 0;
+  const safeRight = Number.isFinite(rightTime) ? rightTime : 0;
+  if (safeRight !== safeLeft) {
+    return safeRight - safeLeft;
+  }
+  return Number(right?.suspicion_score || 0) - Number(left?.suspicion_score || 0);
 }
 
 function mergeTimelineWithSuspiciousPoints(points, results, timeline) {
@@ -1292,6 +1520,24 @@ function objectRows(object) {
   }));
 }
 
+function compactRows(object) {
+  return Object.entries(object || {})
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => ({
+      label: key,
+      value: typeof value === "number" ? formatNumber(value) : String(value),
+    }));
+}
+
+function groupNormalizationSamples(samples) {
+  const grouped = new Map();
+  for (const sample of samples || []) {
+    const entityId = sample.entity_id || "sin entidad";
+    grouped.set(entityId, [...(grouped.get(entityId) || []), sample]);
+  }
+  return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right));
+}
+
 function formatReading(result) {
   const reading = result.reading || {};
   if (reading.missing_ticks !== undefined) {
@@ -1413,13 +1659,18 @@ function shortDate(value) {
   return value ? String(value).replace("T", " ").slice(0, 19) : "-";
 }
 
+function splitDateTime(value) {
+  const formatted = shortDate(value);
+  if (formatted === "-") {
+    return { date: "-", time: "-" };
+  }
+  const [date, time = ""] = formatted.split(" ");
+  return { date, time: time.replace("Z", "") || "-" };
+}
+
 function iterationProgress(done, target) {
   const total = Math.max(1, Number(target) || 1);
   return Math.min(100, Math.max(0, (Number(done) / total) * 100));
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 createRoot(document.getElementById("root")).render(<App />);

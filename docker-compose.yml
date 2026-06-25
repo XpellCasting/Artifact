@@ -11,6 +11,7 @@ services:
       - ./data/fixtures:/app/fixtures:ro
       - ./data/static_history:/app/data/static_history
       - ./data/datosreales:/app/data/datosreales:ro
+      - ./data/cache:/app/data/cache
     ports:
       - "8000:8000"
 

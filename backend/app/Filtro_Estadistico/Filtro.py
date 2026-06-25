@@ -43,11 +43,7 @@ class FiltroEstadistico:
         tiempo_binarios_ms = (perf_counter() - inicio_binarios) * 1000.0
         elapsed_ms = (perf_counter() - inicio_total) * 1000.0
 
-        resultados = sorted(
-            resultados_continuos + resultados_binarios,
-            key=lambda item: item["suspicion_score"],
-            reverse=True,
-        )
+        resultados = sorted(resultados_continuos + resultados_binarios, key=self._clave_fecha_resultado, reverse=True)
         top_results = resultados[:1000]
         resumen = {
             "results": len(resultados),
@@ -75,3 +71,9 @@ class FiltroEstadistico:
             "all_results": resultados,
             "summary": resumen,
         }
+
+    def _clave_fecha_resultado(self, item: dict[str, Any]) -> tuple[pd.Timestamp, float]:
+        timestamp = pd.to_datetime(item.get("timestamp"), errors="coerce", utc=True)
+        if pd.isna(timestamp):
+            timestamp = pd.Timestamp.min.tz_localize("UTC")
+        return timestamp, float(item.get("suspicion_score") or 0.0)

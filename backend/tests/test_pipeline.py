@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from app.Cargar_Historial.Cargar_Historial import CargadorHistorial  # noqa: E402
 from app.Filtro_Estadistico.Filtro import FiltroEstadistico  # noqa: E402
+from app.main import EstadoAplicacion  # noqa: E402
 
 
 class CargaHistorialTest(unittest.TestCase):
@@ -154,6 +155,141 @@ class CargaHistorialTest(unittest.TestCase):
                 self.assertGreaterEqual(item["suspicion_score"], 0.0)
                 self.assertLessEqual(item["suspicion_score"], 1.0)
                 self.assertTrue(set(item["triggered_indicators"]).issubset(indicadores_validos))
+
+    def test_analisis_real_reutiliza_cache_persistente(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ruta = base / "history.csv"
+            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
+            filas = []
+            for indice in range(80):
+                filas.append(
+                    {
+                        "entity_id": "sensor.cache_temperature",
+                        "state": str(18.0 if indice != 40 else -8.0),
+                        "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
+                    }
+                )
+            pd.DataFrame(filas).to_csv(ruta, index=False)
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=FiltroEstadistico(),
+                static_history_dir=base / "static_history",
+                real_history_path=ruta,
+                analysis_cache_path=base / "cache" / "analysis.json",
+            )
+
+            estado.cargar_real()
+            primero = estado.analizar_historial(0.6)
+            estado.resultados = []
+            segundo = estado.analizar_historial(0.6)
+
+            self.assertTrue(estado.analysis_cache_path.exists())
+            self.assertFalse(primero["summary"]["cache_hit"])
+            self.assertTrue(segundo["summary"]["cache_hit"])
+            self.assertEqual(primero["results"], segundo["results"])
+
+    def test_tick_realtime_aplica_falla_y_reanaliza(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ruta = base / "history.csv"
+            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
+            filas = [
+                {
+                    "entity_id": "sensor.realtime_temperature",
+                    "state": str(20.0 + (0.05 if indice % 2 else 0.0)),
+                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
+                }
+                for indice in range(120)
+            ]
+            pd.DataFrame(filas).to_csv(ruta, index=False)
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=FiltroEstadistico(),
+                static_history_dir=base / "static_history",
+                real_history_path=ruta,
+                analysis_cache_path=base / "cache" / "analysis.json",
+            )
+
+            estado.cargar_real()
+            payload = estado.tick(
+                request=type(
+                    "Request",
+                    (),
+                    {
+                        "selected_entities": ["sensor.realtime_temperature"],
+                        "tick_seconds": 60,
+                        "faults": [
+                            {
+                                "entity_id": "sensor.realtime_temperature",
+                                "fault_type": "random/spike",
+                                "enabled": True,
+                            }
+                        ],
+                        "suspicion_threshold": 0.6,
+                    },
+                )()
+            )
+
+            self.assertEqual(payload["events"], 1)
+            self.assertTrue(payload["faults"])
+            self.assertTrue(payload["fault_ticks"])
+            self.assertGreaterEqual(payload["result_count"], 1)
+            self.assertTrue(
+                any(
+                    item["entity_id"] == "sensor.realtime_temperature"
+                    and item["timestamp"] >= estado.realtime_current_timestamp[:19]
+                    for item in payload["results"]
+                )
+            )
+
+    def test_iteraciones_realtime_usan_unidad_de_trabajo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ruta = base / "history.csv"
+            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
+            filas = [
+                {
+                    "entity_id": "sensor.batch_temperature",
+                    "state": str(21.0 + (0.05 if indice % 2 else 0.0)),
+                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
+                }
+                for indice in range(120)
+            ]
+            pd.DataFrame(filas).to_csv(ruta, index=False)
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=FiltroEstadistico(),
+                static_history_dir=base / "static_history",
+                real_history_path=ruta,
+                analysis_cache_path=base / "cache" / "analysis.json",
+            )
+
+            estado.cargar_real()
+            payload = estado.iterations(
+                request=type(
+                    "Request",
+                    (),
+                    {
+                        "selected_entities": ["sensor.batch_temperature"],
+                        "tick_seconds": 60,
+                        "iteration_count": 5,
+                        "faults": [
+                            {
+                                "entity_id": "sensor.batch_temperature",
+                                "fault_type": "drift",
+                                "enabled": True,
+                            }
+                        ],
+                        "suspicion_threshold": 0.6,
+                    },
+                )()
+            )
+
+            self.assertEqual(payload["events"], 5)
+            self.assertEqual(payload["summary"]["iterations_done"], 5)
+            self.assertTrue(payload["faults"])
+            self.assertGreaterEqual(payload["result_count"], 1)
 
 
 if __name__ == "__main__":

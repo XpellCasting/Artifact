@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -12,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from .Cargar_Historial.Cargar_Historial import CargadorHistorial, ResultadoHistorial
 from .Filtro_Estadistico.Filtro import FiltroEstadistico
+from .Patrones_Diseno.Unidad_Trabajo_Iteraciones import UnidadTrabajoIteraciones
 
 
 class TickRequest(BaseModel):
@@ -19,6 +22,10 @@ class TickRequest(BaseModel):
     tick_seconds: int = 60
     faults: list[dict[str, Any]] = Field(default_factory=list)
     suspicion_threshold: float = 0.6
+
+
+class IterationsRequest(TickRequest):
+    iteration_count: int = 1
 
 
 class AnalyzeRequest(BaseModel):
@@ -31,11 +38,14 @@ class EstadoAplicacion:
     filtro_estadistico: FiltroEstadistico
     static_history_dir: Path
     real_history_path: Path
+    analysis_cache_path: Path
     historial: ResultadoHistorial | None = None
     resultados: list[dict[str, Any]] = field(default_factory=list)
     realtime_events: pd.DataFrame = field(default_factory=pd.DataFrame)
     realtime_tick_index: int = 0
     realtime_current_timestamp: str | None = None
+    realtime_faults: list[dict[str, Any]] = field(default_factory=list)
+    realtime_fault_ticks: list[dict[str, Any]] = field(default_factory=list)
     selected_entities: set[str] = field(default_factory=set)
 
     def status(self) -> dict[str, Any]:
@@ -76,19 +86,92 @@ class EstadoAplicacion:
         if self.historial is None:
             raise ValueError("Primero debes cargar un historial.")
 
+        cached = self._leer_cache_analisis_real(suspicion_threshold)
+        if cached is not None:
+            self.resultados = list(cached.get("results", []))
+            return cached
+
         resultado = self.filtro_estadistico.analizar_historial(
             eventos=self.historial.eventos,
             entidades=self.historial.entidades,
             suspicion_threshold=suspicion_threshold,
         )
+        summary = dict(resultado.get("summary") or {})
+        summary["cache_hit"] = False
+        summary["cache_path"] = str(self.analysis_cache_path) if self._es_historial_real_activo() else ""
+        resultado["summary"] = summary
         self.resultados = list(resultado.get("results", []))
+        self._guardar_cache_analisis_real(suspicion_threshold, resultado)
         return resultado
+
+    def vista_normalizacion(self) -> dict[str, Any]:
+        if self.historial is None:
+            self.status()
+        if self.historial is None:
+            raise ValueError("Primero debes cargar un historial.")
+        return {
+            "source_type": self.historial.metadatos.get("source_type", ""),
+            "source_path": self.historial.metadatos.get("source_path", ""),
+            "rows": int(self.historial.metadatos.get("rows", len(self.historial.eventos))),
+            "entity_count": int(self.historial.metadatos.get("entity_count", len(self.historial.entidades))),
+            "samples_per_entity": 5,
+            "samples": self.historial.normalizacion_muestras,
+            "fragments": self._fragmentos_normalizacion(),
+        }
+
+    def _fragmentos_normalizacion(self, max_points_per_entity: int = 80) -> list[dict[str, Any]]:
+        if self.historial is None or self.historial.eventos.empty:
+            return []
+        lookup = self.historial.entidades.set_index("entity_id").to_dict("index") if not self.historial.entidades.empty else {}
+        fragments = []
+        for entity_id, grupo in self.historial.eventos.sort_values("timestamp_dt").groupby("entity_id", sort=True):
+            entidad = lookup.get(str(entity_id), {})
+            tipo = str(entidad.get("sensor_kind", grupo["sensor_kind"].iloc[0] if "sensor_kind" in grupo else "multistate"))
+            sampleado = reducir_puntos(grupo.head(max_points_per_entity * 3), max_points_per_entity)
+            points = []
+            for fila in sampleado.to_dict("records"):
+                if tipo == "binary":
+                    value = pd.to_numeric(pd.Series([fila.get("value")]), errors="coerce").fillna(0.0).iloc[0]
+                    value = 100.0 if float(value) >= 0.5 else 0.0
+                else:
+                    value = valor_para_timeline(fila, tipo)
+                points.append(
+                    {
+                        "timestamp": str(fila["timestamp"]),
+                        "state": str(fila["state"]),
+                        "value": value,
+                    }
+                )
+            fragments.append(
+                {
+                    "entity_id": str(entity_id),
+                    "sensor_kind": tipo,
+                    "area_id": "",
+                    "chart_kind": "normalization_fragment",
+                    "scale_unit": "%" if tipo == "binary" else str(entidad.get("unit_of_measurement") or "state"),
+                    "points": points,
+                }
+            )
+        return fragments
 
     def reset_realtime(self) -> dict[str, Any]:
         self._reset_realtime()
         return self.current_realtime({})
 
     def tick(self, request: TickRequest) -> dict[str, Any]:
+        self._insertar_tick_realtime(request)
+        summary = self._analizar_realtime(request.suspicion_threshold)
+        return self.current_realtime(summary)
+
+    def iterations(self, request: IterationsRequest) -> dict[str, Any]:
+        unidad = UnidadTrabajoIteraciones(request.iteration_count)
+        resultado_unidad = unidad.ejecutar(lambda: self._insertar_tick_realtime(request))
+        summary = self._analizar_realtime(request.suspicion_threshold)
+        summary["iterations_requested"] = resultado_unidad.solicitadas
+        summary["iterations_done"] = resultado_unidad.completadas
+        return self.current_realtime(summary)
+
+    def _insertar_tick_realtime(self, request: TickRequest) -> None:
         if self.historial is None:
             self.status()
         if self.historial is None:
@@ -98,38 +181,61 @@ class EstadoAplicacion:
         if not seleccion:
             raise ValueError("Selecciona al menos una entidad valida para generar un tick.")
 
-        base = self.historial.eventos[self.historial.eventos["entity_id"].isin(seleccion)].copy()
+        eventos_actuales = self._eventos_combinados()
+        base = eventos_actuales[eventos_actuales["entity_id"].isin(seleccion)].copy()
         if base.empty:
             raise ValueError("No hay eventos historicos para las entidades seleccionadas.")
-        siguiente = base.groupby("entity_id", as_index=False).tail(1).copy()
-        ultimo = pd.to_datetime(self.historial.eventos["timestamp_dt"], errors="coerce", utc=True).max()
+        ultimo = pd.to_datetime(eventos_actuales["timestamp_dt"], errors="coerce", utc=True).max()
         if self.realtime_current_timestamp:
             ultimo = pd.to_datetime(self.realtime_current_timestamp, errors="coerce", utc=True)
-        nuevo_timestamp = ultimo + pd.Timedelta(seconds=max(10, int(request.tick_seconds)))
-        siguiente["timestamp_dt"] = nuevo_timestamp
-        siguiente["timestamp"] = nuevo_timestamp.isoformat()
+        tick_seconds = max(10, int(request.tick_seconds))
+        nuevo_timestamp = ultimo + pd.Timedelta(seconds=tick_seconds)
         self.realtime_tick_index += 1
-        self.realtime_current_timestamp = nuevo_timestamp.isoformat()
         self.selected_entities = set(seleccion)
-        self.realtime_events = pd.concat([self.realtime_events, siguiente], ignore_index=True)
-        summary = self._summary_vacio(0.0)
-        return self.current_realtime(summary)
+        siguiente = self._generar_tick_simulado(
+            eventos=eventos_actuales,
+            seleccion=seleccion,
+            timestamp=nuevo_timestamp,
+            tick_seconds=tick_seconds,
+            faults=request.faults,
+        )
+        if not siguiente.empty:
+            self.realtime_events = pd.concat([self.realtime_events, siguiente], ignore_index=True)
+            timestamp_real = pd.to_datetime(siguiente["timestamp_dt"], errors="coerce", utc=True).max()
+            if pd.notna(timestamp_real):
+                nuevo_timestamp = max(nuevo_timestamp, timestamp_real)
+        self.realtime_current_timestamp = nuevo_timestamp.isoformat()
+
+    def _analizar_realtime(self, suspicion_threshold: float) -> dict[str, Any]:
+        inicio = perf_counter()
+        resultado = self.filtro_estadistico.analizar_historial(
+            eventos=self._eventos_combinados(),
+            entidades=self.historial.entidades,
+            suspicion_threshold=suspicion_threshold,
+        )
+        summary = dict(resultado.get("summary") or {})
+        summary["elapsed_ms"] = round((perf_counter() - inicio) * 1000.0, 3)
+        summary["realtime_events"] = int(len(self.realtime_events))
+        summary["active_faults"] = len(self.realtime_faults)
+        self.resultados = list(resultado.get("results", []))
+        return summary
 
     def current_realtime(self, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+        realtime_results = self._resultados_realtime()
         return {
             "current_timestamp": self.realtime_current_timestamp,
             "tick_index": self.realtime_tick_index,
             "events": int(len(self.realtime_events)),
             "ground_truth_rows": 0,
             "ground_truth_labels": {},
-            "results": self.resultados,
+            "results": realtime_results,
             "historical_results": self.resultados,
-            "result_count": len(self.resultados),
+            "result_count": len(realtime_results),
             "historical_result_count": len(self.resultados),
             "summary": summary or {},
             "historical_summary": summary or {},
-            "faults": [],
-            "fault_ticks": [],
+            "faults": self.realtime_faults,
+            "fault_ticks": self.realtime_fault_ticks,
         }
 
     def timeline(self, start: str | None, end: str | None, max_points: int) -> dict[str, Any]:
@@ -138,13 +244,13 @@ class EstadoAplicacion:
         if self.historial is None:
             return {"entities": [], "faults": []}
 
-        eventos = self.historial.eventos.copy()
-        if not self.realtime_events.empty:
-            eventos = pd.concat([eventos, self.realtime_events], ignore_index=True)
+        eventos = self._eventos_combinados()
         if self.selected_entities:
             eventos = eventos[eventos["entity_id"].isin(self.selected_entities)]
         eventos = filtrar_rango(eventos, start, end)
-        return construir_timeline(eventos, self.historial.entidades, max_points=max_points)
+        payload = construir_timeline(eventos, self.historial.entidades, max_points=max_points)
+        payload["faults"] = self.realtime_faults
+        return payload
 
     def _status_desde_historial(self, historial: ResultadoHistorial) -> dict[str, Any]:
         metadatos = historial.metadatos
@@ -177,8 +283,225 @@ class EstadoAplicacion:
         self.realtime_events = pd.DataFrame()
         self.realtime_tick_index = 0
         self.realtime_current_timestamp = None
+        self.realtime_faults = []
+        self.realtime_fault_ticks = []
         self.selected_entities = set()
         self.resultados = []
+
+    def _eventos_combinados(self) -> pd.DataFrame:
+        if self.historial is None:
+            return pd.DataFrame()
+        if self.realtime_events.empty:
+            return self.historial.eventos.copy()
+        return pd.concat([self.historial.eventos, self.realtime_events], ignore_index=True)
+
+    def _resultados_realtime(self) -> list[dict[str, Any]]:
+        if self.realtime_events.empty:
+            return []
+        inicio = pd.to_datetime(self.realtime_events["timestamp_dt"], errors="coerce", utc=True).min()
+        if pd.isna(inicio):
+            return []
+        resultados = []
+        for resultado in self.resultados:
+            timestamp = pd.to_datetime(resultado.get("timestamp"), errors="coerce", utc=True)
+            if pd.notna(timestamp) and timestamp >= inicio:
+                resultados.append(resultado)
+        return resultados
+
+    def _generar_tick_simulado(
+        self,
+        eventos: pd.DataFrame,
+        seleccion: list[str],
+        timestamp: pd.Timestamp,
+        tick_seconds: int,
+        faults: list[dict[str, Any]],
+    ) -> pd.DataFrame:
+        entidades = self.historial.entidades.set_index("entity_id").to_dict("index") if self.historial is not None else {}
+        fallas = {
+            str(fault.get("entity_id")): fault
+            for fault in faults
+            if fault.get("enabled") and str(fault.get("entity_id")) in seleccion
+        }
+        filas: list[dict[str, Any]] = []
+        for entity_id in seleccion:
+            grupo = eventos[eventos["entity_id"].eq(entity_id)].sort_values("timestamp_dt")
+            if grupo.empty:
+                continue
+            entidad = entidades.get(entity_id, {})
+            fila = self._proyectar_siguiente_fila(grupo, entidad, timestamp)
+            fault = fallas.get(entity_id)
+            if fault:
+                fila = self._aplicar_falla_tick(fila, grupo, entidad, fault, tick_seconds)
+                self._registrar_falla_tick(entity_id, str(fault.get("fault_type", "fault")), fila["timestamp_dt"], tick_seconds)
+            filas.append(fila)
+        if not filas:
+            return pd.DataFrame(columns=eventos.columns)
+        return pd.DataFrame(filas).reindex(columns=eventos.columns)
+
+    def _proyectar_siguiente_fila(self, grupo: pd.DataFrame, entidad: dict[str, Any], timestamp: pd.Timestamp) -> dict[str, Any]:
+        ultima = grupo.tail(1).iloc[0].to_dict()
+        fila = dict(ultima)
+        fila["timestamp_dt"] = timestamp
+        fila["timestamp"] = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        tipo = str(entidad.get("sensor_kind") or ultima.get("sensor_kind") or "")
+        if tipo == "continuous":
+            valores = pd.to_numeric(grupo["value"], errors="coerce").dropna()
+            deltas = valores.diff().dropna()
+            valor = float(valores.iloc[-1]) if not valores.empty else 0.0
+            tendencia = float(deltas.tail(8).median()) if not deltas.tail(8).empty else 0.0
+            valor = valor + tendencia
+            fila["value"] = valor
+            fila["state"] = f"{valor:.6f}"
+        elif tipo == "binary":
+            valor = float(pd.to_numeric(pd.Series([ultima.get("value")]), errors="coerce").fillna(0.0).iloc[0])
+            fila["value"] = 1.0 if valor >= 0.5 else 0.0
+            fila["state"] = self._estado_binario(fila["value"])
+        return fila
+
+    def _aplicar_falla_tick(
+        self,
+        fila: dict[str, Any],
+        grupo: pd.DataFrame,
+        entidad: dict[str, Any],
+        fault: dict[str, Any],
+        tick_seconds: int,
+    ) -> dict[str, Any]:
+        tipo = str(entidad.get("sensor_kind") or fila.get("sensor_kind") or "")
+        fault_type = str(fault.get("fault_type", "random"))
+        if "missing" in fault_type:
+            missing_seconds = max(3600, tick_seconds * 10)
+            timestamp = pd.to_datetime(fila["timestamp_dt"], errors="coerce", utc=True) + pd.Timedelta(seconds=missing_seconds)
+            fila["timestamp_dt"] = timestamp
+            fila["timestamp"] = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if tipo == "continuous":
+            valor = float(pd.to_numeric(pd.Series([fila.get("value")]), errors="coerce").fillna(0.0).iloc[0])
+            escala = self._escala_continua(self._grupo_historico_entidad(str(fila.get("entity_id")), grupo))
+            if fault_type in {"random/spike", "random"}:
+                signo = -1.0 if self.realtime_tick_index % 2 else 1.0
+                valor += signo * escala * 10.0
+            elif fault_type == "malfunction":
+                valor += escala * 16.0
+            elif fault_type == "bias":
+                valor += escala * 5.0
+            elif fault_type == "drift":
+                valor += max(escala * 0.08, 0.02)
+            fila["value"] = round(valor, 6)
+            fila["state"] = f"{valor:.6f}"
+        elif tipo == "binary":
+            valor = float(pd.to_numeric(pd.Series([fila.get("value")]), errors="coerce").fillna(0.0).iloc[0])
+            if fault_type in {"random", "malfunction"}:
+                valor = 0.0 if valor >= 0.5 else 1.0
+            elif fault_type == "bias":
+                valor = 1.0
+            fila["value"] = valor
+            fila["state"] = self._estado_binario(valor)
+        return fila
+
+    def _registrar_falla_tick(self, entity_id: str, fault_type: str, timestamp: pd.Timestamp, tick_seconds: int) -> None:
+        start = pd.to_datetime(timestamp, errors="coerce", utc=True)
+        end = start + pd.Timedelta(seconds=max(10, tick_seconds))
+        evento = {
+            "entity_id": entity_id,
+            "fault_type": fault_type,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "tick_index": self.realtime_tick_index,
+        }
+        self.realtime_fault_ticks.append(evento)
+        ultima = self.realtime_faults[-1] if self.realtime_faults else None
+        if ultima and ultima["entity_id"] == entity_id and ultima["fault_type"] == fault_type:
+            ultima["end"] = evento["end"]
+        else:
+            self.realtime_faults.append({k: evento[k] for k in ("entity_id", "fault_type", "start", "end")})
+
+    def _escala_continua(self, grupo: pd.DataFrame) -> float:
+        valores = pd.to_numeric(grupo["value"], errors="coerce").dropna()
+        if valores.empty:
+            return 1.0
+        iqr = float(valores.quantile(0.75) - valores.quantile(0.25))
+        std = float(valores.std()) if len(valores) > 1 else 0.0
+        return max(abs(iqr), abs(std), abs(float(valores.median())) * 0.05, 1.0)
+
+    def _grupo_historico_entidad(self, entity_id: str, fallback: pd.DataFrame) -> pd.DataFrame:
+        if self.historial is None or self.historial.eventos.empty or not entity_id:
+            return fallback
+        grupo = self.historial.eventos[self.historial.eventos["entity_id"].eq(entity_id)]
+        return grupo if not grupo.empty else fallback
+
+    def _estado_binario(self, value: float) -> str:
+        return "on" if float(value) >= 0.5 else "off"
+
+    def _es_historial_real_activo(self) -> bool:
+        return self.historial is not None and self.historial.metadatos.get("source_type") == "real"
+
+    def _identidad_historial_real(self, suspicion_threshold: float) -> dict[str, Any] | None:
+        if not self._es_historial_real_activo() or not self.real_history_path.exists():
+            return None
+        stat = self.real_history_path.stat()
+        return {
+            "cache_version": 1,
+            "source_path": str(self.real_history_path),
+            "source_size": int(stat.st_size),
+            "source_mtime_ns": int(stat.st_mtime_ns),
+            "suspicion_threshold": round(float(suspicion_threshold), 6),
+        }
+
+    def _leer_cache_analisis_real(self, suspicion_threshold: float) -> dict[str, Any] | None:
+        identidad = self._identidad_historial_real(suspicion_threshold)
+        if identidad is None or not self.analysis_cache_path.exists():
+            return None
+        try:
+            with self.analysis_cache_path.open("r", encoding="utf-8") as archivo:
+                cache = json.load(archivo)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if cache.get("identity") != identidad:
+            return None
+        payload = cache.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        payload = dict(payload)
+        payload["cache"] = {"hit": True, "path": str(self.analysis_cache_path)}
+        summary = dict(payload.get("summary") or {})
+        summary["cache_hit"] = True
+        summary["cache_path"] = str(self.analysis_cache_path)
+        payload["summary"] = summary
+        return payload
+
+    def _guardar_cache_analisis_real(self, suspicion_threshold: float, resultado: dict[str, Any]) -> None:
+        identidad = self._identidad_historial_real(suspicion_threshold)
+        if identidad is None:
+            return
+        payload = serializable_json(resultado)
+        payload["cache"] = {"hit": False, "path": str(self.analysis_cache_path)}
+        try:
+            self.analysis_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.analysis_cache_path.open("w", encoding="utf-8") as archivo:
+                json.dump({"identity": identidad, "payload": payload}, archivo, ensure_ascii=True)
+        except OSError:
+            return
+
+
+def serializable_json(valor: Any) -> Any:
+    if isinstance(valor, dict):
+        return {str(clave): serializable_json(contenido) for clave, contenido in valor.items()}
+    if isinstance(valor, (list, tuple, set)):
+        return [serializable_json(item) for item in valor]
+    if isinstance(valor, pd.Timestamp):
+        return None if pd.isna(valor) else valor.isoformat()
+    if valor is None or isinstance(valor, (str, int, float, bool)):
+        return valor
+    if hasattr(valor, "item"):
+        try:
+            return serializable_json(valor.item())
+        except (TypeError, ValueError):
+            pass
+    if hasattr(valor, "isoformat"):
+        try:
+            return valor.isoformat()
+        except (TypeError, ValueError):
+            pass
+    return str(valor)
 
 
 def crear_app() -> FastAPI:
@@ -208,6 +531,7 @@ state = EstadoAplicacion(
     filtro_estadistico=FiltroEstadistico(),
     static_history_dir=Path(os.getenv("STATIC_HISTORY_DIR", "data/static_history")),
     real_history_path=Path(os.getenv("REAL_HISTORY_PATH", "data/datosreales/history.csv")),
+    analysis_cache_path=Path(os.getenv("ANALYSIS_CACHE_PATH", "data/cache/real_history_analysis.json")),
 )
 
 
@@ -252,6 +576,14 @@ def history_analyze(request: AnalyzeRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/history/normalization/preview", tags=["history"])
+def history_normalization_preview() -> dict[str, Any]:
+    try:
+        return state.vista_normalizacion()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/realtime/reset", tags=["realtime"])
 def realtime_reset() -> dict[str, Any]:
     return state.reset_realtime()
@@ -261,6 +593,14 @@ def realtime_reset() -> dict[str, Any]:
 def realtime_tick(request: TickRequest) -> dict[str, Any]:
     try:
         return state.tick(request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/realtime/iterations", tags=["realtime"])
+def realtime_iterations(request: IterationsRequest) -> dict[str, Any]:
+    try:
+        return state.iterations(request)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
