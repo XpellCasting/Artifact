@@ -100,10 +100,10 @@ class InyectorFallasSensornets:
             formula = "I_k = S_k + N(0, sigma_original^2) * n_m"
         elif fault_type == "drift":
             nd = float(fault.get("nd", 2.0))
-            intensity = self._elegir_intensidad(fault, "id", [0.08, 0.12, -0.08, -0.12], rng)
-            progreso = max(1, tick_index)
+            intensity = self._elegir_intensidad(fault, "id", [0.025, 0.04, -0.025, -0.04], rng)
+            progreso = max(1, int(fault.get("fault_tick_count", tick_index)))
             offset = stats["scale"] * intensity * progreso
-            ruido = self._ruido_gaussiano(rng, stats["std"], stats["scale"]) * nd * 0.25
+            ruido = self._ruido_gaussiano(rng, stats["std"], stats["scale"]) * nd * 0.05
             nuevo_valor = valor + offset + ruido
             formula = "I_k = S_k + N(0, sigma_original^2) * n_d + offset"
         elif fault_type == "bias":

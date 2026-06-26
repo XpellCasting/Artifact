@@ -325,19 +325,24 @@ class EstadoAplicacion:
             if fault.get("enabled") and str(fault.get("entity_id")) in seleccion
         }
         filas: list[dict[str, Any]] = []
+        source_timestamp = self._timestamp_fuente_simulacion(tick_seconds)
         for entity_id in seleccion:
             grupo = eventos[eventos["entity_id"].eq(entity_id)].sort_values("timestamp_dt")
             if grupo.empty:
                 continue
             entidad = entidades.get(entity_id, {})
-            fila = self._proyectar_siguiente_fila(grupo, entidad, timestamp)
+            fila = self._proyectar_siguiente_fila(grupo, entidad, timestamp, source_timestamp)
             fault = fallas.get(entity_id)
             if fault:
+                fault_context = {
+                    **fault,
+                    "fault_tick_count": self._conteo_falla_entidad(entity_id, str(fault.get("fault_type", "fault"))) + 1,
+                }
                 resultado = self.inyector_fallas.aplicar(
                     fila=fila,
                     grupo=self._grupo_historico_entidad(entity_id, grupo),
                     entidad=entidad,
-                    fault=fault,
+                    fault=fault_context,
                     tick_index=self.realtime_tick_index,
                     tick_seconds=tick_seconds,
                 )
@@ -357,24 +362,34 @@ class EstadoAplicacion:
             return pd.DataFrame(columns=eventos.columns)
         return pd.DataFrame(filas).reindex(columns=eventos.columns)
 
-    def _proyectar_siguiente_fila(self, grupo: pd.DataFrame, entidad: dict[str, Any], timestamp: pd.Timestamp) -> dict[str, Any]:
+    def _proyectar_siguiente_fila(
+        self,
+        grupo: pd.DataFrame,
+        entidad: dict[str, Any],
+        timestamp: pd.Timestamp,
+        source_timestamp: pd.Timestamp,
+    ) -> dict[str, Any]:
         ultima = grupo.tail(1).iloc[0].to_dict()
         fila = dict(ultima)
         fila["timestamp_dt"] = timestamp
         fila["timestamp"] = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
         tipo = str(entidad.get("sensor_kind") or ultima.get("sensor_kind") or "")
+        historico = self._grupo_historico_entidad(str(ultima.get("entity_id")), grupo)
+        fuente = self._fila_historica_cercana(historico, source_timestamp)
         if tipo == "continuous":
-            valores = pd.to_numeric(grupo["value"], errors="coerce").dropna()
-            deltas = valores.diff().dropna()
-            valor = float(valores.iloc[-1]) if not valores.empty else 0.0
-            tendencia = float(deltas.tail(8).median()) if not deltas.tail(8).empty else 0.0
-            valor = valor + tendencia
+            valor = pd.to_numeric(pd.Series([fuente.get("value")]), errors="coerce").iloc[0]
+            if pd.isna(valor):
+                valor = pd.to_numeric(pd.Series([ultima.get("value")]), errors="coerce").fillna(0.0).iloc[0]
+            valor = float(valor)
             fila["value"] = valor
             fila["state"] = f"{valor:.6f}"
         elif tipo == "binary":
-            valor = float(pd.to_numeric(pd.Series([ultima.get("value")]), errors="coerce").fillna(0.0).iloc[0])
+            valor = pd.to_numeric(pd.Series([fuente.get("value")]), errors="coerce").fillna(0.0).iloc[0]
             fila["value"] = 1.0 if valor >= 0.5 else 0.0
             fila["state"] = self._estado_binario(fila["value"])
+        else:
+            fila["state"] = str(fuente.get("state", ultima.get("state", "")))
+            fila["value"] = fuente.get("value")
         return fila
 
     def _registrar_falla_tick(
@@ -424,6 +439,70 @@ class EstadoAplicacion:
             return fallback
         grupo = self.historial.eventos[self.historial.eventos["entity_id"].eq(entity_id)]
         return grupo if not grupo.empty else fallback
+
+    def _timestamp_fuente_simulacion(self, tick_seconds: int) -> pd.Timestamp:
+        if self.historial is None or self.historial.eventos.empty:
+            return pd.Timestamp.now(tz="UTC")
+        tiempos = pd.to_datetime(self.historial.eventos["timestamp_dt"], errors="coerce", utc=True).dropna()
+        if tiempos.empty:
+            return pd.Timestamp.now(tz="UTC")
+        inicio = tiempos.min()
+        fin = tiempos.max()
+        duracion = max((fin - inicio).total_seconds(), float(max(10, tick_seconds)))
+        avance = ((max(1, self.realtime_tick_index) - 1) * max(10, int(tick_seconds))) % duracion
+        return inicio + pd.Timedelta(seconds=avance)
+
+    def _fila_historica_cercana(self, grupo: pd.DataFrame, source_timestamp: pd.Timestamp) -> dict[str, Any]:
+        if grupo.empty:
+            return {}
+        trabajo = grupo.copy()
+        tiempos = pd.to_datetime(trabajo["timestamp_dt"], errors="coerce", utc=True)
+        if tiempos.notna().any():
+            distancia = (tiempos - source_timestamp).abs()
+            indice = distancia.idxmin()
+            return trabajo.loc[indice].to_dict()
+        return trabajo.tail(1).iloc[0].to_dict()
+
+    def _valor_continuo_normal(self, grupo: pd.DataFrame, timestamp: pd.Timestamp) -> float:
+        valores = pd.to_numeric(grupo["value"], errors="coerce")
+        validos = grupo[valores.notna()].copy()
+        if validos.empty:
+            return 0.0
+        validos["value_numeric"] = valores[valores.notna()].astype(float)
+        ventana = self._ventana_por_hora_del_dia(validos, timestamp)
+        if ventana.empty:
+            ventana = validos.tail(min(48, len(validos)))
+        return round(float(ventana["value_numeric"].median()), 6)
+
+    def _valor_binario_normal(self, grupo: pd.DataFrame, timestamp: pd.Timestamp) -> float:
+        valores = pd.to_numeric(grupo["value"], errors="coerce")
+        validos = grupo[valores.notna()].copy()
+        if validos.empty:
+            return 0.0
+        validos["value_numeric"] = valores[valores.notna()].astype(float)
+        ventana = self._ventana_por_hora_del_dia(validos, timestamp)
+        if ventana.empty:
+            ventana = validos.tail(min(48, len(validos)))
+        return 1.0 if float(ventana["value_numeric"].mean()) >= 0.5 else 0.0
+
+    def _ventana_por_hora_del_dia(self, grupo: pd.DataFrame, timestamp: pd.Timestamp) -> pd.DataFrame:
+        tiempos = pd.to_datetime(grupo["timestamp_dt"], errors="coerce", utc=True)
+        objetivo = timestamp.hour * 3600 + timestamp.minute * 60 + timestamp.second
+        segundos = tiempos.dt.hour * 3600 + tiempos.dt.minute * 60 + tiempos.dt.second
+        distancia = (segundos - objetivo).abs()
+        distancia = pd.concat([distancia, 86400 - distancia], axis=1).min(axis=1)
+        for ventana_segundos in (30 * 60, 2 * 3600, 6 * 3600):
+            candidatos = grupo[distancia <= ventana_segundos]
+            if not candidatos.empty:
+                return candidatos
+        return grupo
+
+    def _conteo_falla_entidad(self, entity_id: str, fault_type: str) -> int:
+        return sum(
+            1
+            for evento in self.realtime_fault_ticks
+            if evento.get("entity_id") == entity_id and evento.get("fault_type") == fault_type
+        )
 
     def _estado_binario(self, value: float) -> str:
         return "on" if float(value) >= 0.5 else "off"
