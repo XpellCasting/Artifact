@@ -38,6 +38,8 @@ T_on,i(W) = tiempo acumulado en estado activo
 P_on,i(W) = T_on,i(W) / |W|
 G_i(t) = tiempo desde la ultima activacion 0 -> 1
 M_i(t) = tiempo entre el reporte actual y el reporte anterior
+D_off,i(W) = tiempo inactivo en la ventana, solo como lectura diagnostica
+TLC_i(t) = tiempo desde el ultimo cambio de estado
 ```
 
 En la salida del codigo esos valores aparecen como:
@@ -49,6 +51,8 @@ T_on,i(W) -> reading.active_seconds
 P_on,i(W) -> reading.active_ratio
 G_i(t)    -> reading.gap_seconds
 M_i(t)    -> reading.report_gap_seconds
+D_off,i(W)-> reading.inactive_seconds
+TLC_i(t)  -> reading.time_since_last_change_seconds
 ```
 
 ## Base de normalidad
@@ -65,6 +69,22 @@ p95
 p99
 ```
 
+Si la entidad tiene menos de 24 eventos historicos validos, el filtro no emite
+sospechas estadisticas para esa entidad. Con poco historial, los umbrales
+robustos aun no son confiables y se prioriza evitar falsos positivos en sensores
+recien instalados.
+
+Para eventos futuros se usan dos horizontes por sensor:
+
+```text
+base_larga    -> todo el historico valido, comportamiento general del sensor
+base_reciente -> ultimos 14 dias si hay al menos 24 eventos, rutina actual del hogar
+```
+
+Cada indicador se puntua contra ambas bases y se conserva el menor score. Asi
+un cambio reciente de rutina no se marca como anomalia solo por diferir de la
+base larga; si no hay suficiente base reciente, se usa solo la base larga.
+
 Cuando `MAD = 0`, el filtro usa pisos minimos para evitar divisiones explosivas
 o saturaciones artificiales:
 
@@ -76,8 +96,11 @@ gap/report_gap   -> piso MAD 60 segundos
 ```
 
 Para `G_i(t)` y `M_i(t)` se agregan umbrales robustos de alerta basados en
-percentiles. Esto evita marcar como falla cada periodo largo sin movimiento o
-sin apertura, que puede ser normal en sensores de estado.
+mediana y MAD escalado, con pisos minimos por tipo de sensor. No se usa `p99`
+como parte fuerte del umbral, porque el historico real puede contener valores
+atipicos internos que inflan demasiado el limite. Esto evita marcar como falla
+cada periodo largo sin movimiento o sin apertura, que puede ser normal en
+sensores de estado.
 
 ## Normalizacion de indicadores
 
@@ -89,7 +112,12 @@ s_C -> state_change_count
 s_P -> active_time_ratio
 s_G -> time_since_last_activation
 s_M -> report_gap
+s_TLC -> time_since_last_change
 ```
+
+`inactive_duration` se conserva en la lectura, pero no activa sospechas por si
+solo. En ventanas de una hora muchos sensores PIR estan inactivos casi toda la
+ventana, por lo que `D_off,i(W)` no es evidencia fuerte de anomalia.
 
 Para una metrica binaria `M_i(W)` se usa z-score robusto de cola superior:
 
@@ -111,6 +139,9 @@ El puntaje de evidencia sigue la forma de `Tesis.Tex`:
 ```text
 S_bin(W) = min(1, (s_A + s_C + s_P + s_G + s_M) / 5)
 ```
+
+El puntaje puede elevarse por `time_since_last_change` o por duracion activa
+inusualmente alta. La duracion inactiva no eleva el puntaje.
 
 En la salida:
 
@@ -134,6 +165,8 @@ state_change_count
 active_time_ratio
 time_since_last_activation
 report_gap
+time_since_last_change
+z_duration_score
 ```
 
 El patron reportado se interpreta asi:
@@ -143,6 +176,8 @@ activation_count o state_change_count -> activation_burst
 active_time_ratio                     -> state_persistence
 time_since_last_activation            -> absence_gap
 report_gap                            -> missing_gap
+time_since_last_change                -> state_persistence
+z_duration_score                      -> state_persistence
 ```
 
 ## Salida esperada

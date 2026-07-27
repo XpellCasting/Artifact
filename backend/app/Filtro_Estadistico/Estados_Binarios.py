@@ -14,6 +14,8 @@ INDICADORES_BINARIOS = {
     "active_time_ratio": "state_persistence",
     "time_since_last_activation": "absence_gap",
     "report_gap": "missing_gap",
+    "time_since_last_change": "state_persistence",
+    "z_duration_score": "state_persistence",
 }
 
 DETALLE_INDICADOR = {
@@ -22,6 +24,8 @@ DETALLE_INDICADOR = {
     "active_time_ratio": "Proporcion activa P_on,i(W)",
     "time_since_last_activation": "Tiempo desde ultima activacion G_i(t)",
     "report_gap": "Brecha temporal de reporte M_i(t)",
+    "time_since_last_change": "Tiempo desde ultimo cambio TLC_i(t)",
+    "z_duration_score": "Z-score de duracion Z_D_i",
 }
 
 
@@ -47,6 +51,8 @@ class FiltroEstadoBinarioEstadistico:
     zona_muerta_z = 2.5
     componente_minimo = 0.60
     supresion_segundos = 60 * 60
+    min_history_events = 24
+    recent_window_days = 14
 
     def analizar(self, eventos: pd.DataFrame, entidades: pd.DataFrame, suspicion_threshold: float) -> list[dict[str, Any]]:
         if eventos.empty or "sensor_kind" not in eventos.columns:
@@ -77,9 +83,11 @@ class FiltroEstadoBinarioEstadistico:
         suspicion_threshold: float,
     ) -> list[dict[str, Any]]:
         serie = grupo.sort_values("timestamp_dt").copy()
+        if "is_valid_value" in serie.columns:
+            serie = serie[serie["is_valid_value"].astype(bool)].copy()
         serie["value"] = pd.to_numeric(serie["value"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
         serie = serie[serie["timestamp_dt"].notna()].copy()
-        if len(serie) < 3:
+        if len(serie) < self.min_history_events:
             return []
 
         perfil = self._perfil_binario(entity_id, str(entidad.get("device_class", "")))
@@ -91,27 +99,7 @@ class FiltroEstadoBinarioEstadistico:
         resultados: list[dict[str, Any]] = []
 
         for fila in features.to_dict("records"):
-            raw_a, s_a = self._score_alto(fila["activations"], base["activations"])
-            raw_c, s_c = self._score_alto(fila["state_changes"], base["state_changes"])
-            raw_p, s_p = self._score_alto(fila["active_ratio"], base["active_ratio"])
-            raw_g, s_g = self._score_gap(fila["gap_seconds"], base["gap"], base["absence_alert_seconds"])
-            raw_m, s_m = self._score_gap(fila["report_gap_seconds"], base["report_gap"], base["report_gap_alert_seconds"])
-
-            componentes = {
-                "s_A": round(s_a, 6),
-                "s_C": round(s_c, 6),
-                "s_P": round(s_p, 6),
-                "s_G": round(s_g, 6),
-                "s_M": round(s_m, 6),
-            }
-            raw_componentes = {
-                "Z_A_i": round(raw_a, 6),
-                "Z_C_i": round(raw_c, 6),
-                "Z_P_on_i": round(raw_p, 6),
-                "Z_G_i": round(raw_g, 6),
-                "Z_M_i": round(raw_m, 6),
-            }
-            evidence_score = min(1.0, sum(componentes.values()) / 5.0)
+            raw_componentes, componentes, evidence_score = self._puntuar_doble_horizonte(fila, base)
             suspicion_score = self._score_a_probabilidad(evidence_score)
             indicadores = self._indicadores_activados(componentes)
 
@@ -142,8 +130,10 @@ class FiltroEstadoBinarioEstadistico:
                             "activations": int(fila["activations"]),
                             "state_changes": int(fila["state_changes"]),
                             "active_seconds": round(float(fila["active_seconds"]), 3),
+                            "inactive_seconds": round(float(fila["inactive_seconds"]), 3),
                             "active_ratio": round(float(fila["active_ratio"]), 6),
                             "gap_seconds": round(float(fila["gap_seconds"]), 3),
+                            "time_since_last_change_seconds": round(float(fila["time_since_last_change_seconds"]), 3),
                             "report_gap_seconds": round(float(fila["report_gap_seconds"]), 3),
                             "window_seconds": perfil.window_seconds,
                             "components": componentes,
@@ -175,15 +165,21 @@ class FiltroEstadoBinarioEstadistico:
         activo_acumulado = self._activo_acumulado_en_eventos(tiempos, valores)
 
         ultima_activacion: pd.Timestamp | None = None
+        ultimo_cambio: pd.Timestamp | None = None
         filas: list[dict[str, Any]] = []
         for indice, fila in trabajo.iterrows():
             timestamp = fila["timestamp_dt"]
             tiempo_actual = tiempos[indice]
             if int(fila["activation_event"]) == 1:
                 ultima_activacion = timestamp
+            if int(fila["state_change_event"]) == 1:
+                ultimo_cambio = timestamp
             gap_activacion = 0.0
             if ultima_activacion is not None:
                 gap_activacion = max(0.0, (timestamp - ultima_activacion).total_seconds())
+            gap_cambio = 0.0
+            if ultimo_cambio is not None:
+                gap_cambio = max(0.0, (timestamp - ultimo_cambio).total_seconds())
 
             window_start = timestamp - pd.Timedelta(seconds=perfil.window_seconds)
             inicio_segundos = tiempo_actual - perfil.window_seconds
@@ -198,6 +194,7 @@ class FiltroEstadoBinarioEstadistico:
                 fin=tiempo_actual,
                 indice_fin=indice,
             )
+            inactivo_segundos = max(0.0, perfil.window_seconds - activo_segundos)
             filas.append(
                 {
                     "entity_id": fila["entity_id"],
@@ -209,8 +206,10 @@ class FiltroEstadoBinarioEstadistico:
                     "activations": activaciones,
                     "state_changes": cambios,
                     "active_seconds": activo_segundos,
+                    "inactive_seconds": inactivo_segundos,
                     "active_ratio": max(0.0, min(1.0, activo_segundos / perfil.window_seconds)),
                     "gap_seconds": gap_activacion,
+                    "time_since_last_change_seconds": gap_cambio,
                     "report_gap_seconds": max(0.0, float(fila["report_gap_seconds"])),
                 }
             )
@@ -250,33 +249,122 @@ class FiltroEstadoBinarioEstadistico:
         return (timestamps - epoch).dt.total_seconds().to_numpy(dtype="float64")
 
     def _construir_base_normalidad(self, features: pd.DataFrame, perfil: PerfilBinario) -> dict[str, Any]:
+        base_larga = self._construir_base_horizonte(features, perfil)
+        recientes = self._features_recientes(features)
+        reciente_usable = len(recientes) >= self.min_history_events
+        base_reciente = self._construir_base_horizonte(recientes if reciente_usable else features, perfil)
+        base = dict(base_larga)
+        base.update(
+            {
+                "long_horizon": base_larga,
+                "recent_horizon": base_reciente,
+                "recent_horizon_usable": reciente_usable,
+                "recent_horizon_events": int(len(recientes)),
+                "recent_window_days": self.recent_window_days,
+            }
+        )
+        return base
+
+    def _construir_base_horizonte(self, features: pd.DataFrame, perfil: PerfilBinario) -> dict[str, Any]:
         activaciones = self._resumen_robusto(features["activations"], piso_mad=1.0)
         cambios = self._resumen_robusto(features["state_changes"], piso_mad=1.0)
         proporcion = self._resumen_robusto(features["active_ratio"], piso_mad=perfil.ratio_floor)
+        duracion_activa = self._resumen_robusto(features["active_seconds"], piso_mad=60.0)
+        duracion_inactiva = self._resumen_robusto(features["inactive_seconds"], piso_mad=60.0)
         gaps_activacion = features.loc[features["gap_seconds"].gt(0), "gap_seconds"]
+        gaps_cambio = features.loc[features["time_since_last_change_seconds"].gt(0), "time_since_last_change_seconds"]
         gaps_reporte = features.loc[features["report_gap_seconds"].gt(0), "report_gap_seconds"]
         gap = self._resumen_robusto(gaps_activacion, piso_mad=60.0)
+        last_change_gap = self._resumen_robusto(gaps_cambio, piso_mad=60.0)
         report_gap = self._resumen_robusto(gaps_reporte, piso_mad=60.0)
         absence_alert = max(
             perfil.min_absence_gap_seconds,
             gap["median"] + 8.0 * gap["scaled_mad"],
-            gap["p99"] * 1.5,
         )
         report_alert = max(
             perfil.min_report_gap_seconds,
             report_gap["median"] + 8.0 * report_gap["scaled_mad"],
-            report_gap["p99"] * 2.0,
+        )
+        last_change_alert = max(
+            perfil.min_absence_gap_seconds,
+            last_change_gap["median"] + 8.0 * last_change_gap["scaled_mad"],
         )
         return {
             "activations": activaciones,
             "state_changes": cambios,
             "active_ratio": proporcion,
+            "active_duration": duracion_activa,
+            "inactive_duration": duracion_inactiva,
             "gap": gap,
+            "last_change_gap": last_change_gap,
             "report_gap": report_gap,
             "absence_alert_seconds": absence_alert,
+            "last_change_alert_seconds": last_change_alert,
             "report_gap_alert_seconds": report_alert,
             "window_seconds": perfil.window_seconds,
         }
+
+    def _features_recientes(self, features: pd.DataFrame) -> pd.DataFrame:
+        if "timestamp_dt" not in features.columns:
+            return features
+        ultimo = features["timestamp_dt"].max()
+        if pd.isna(ultimo):
+            return features.iloc[0:0]
+        return features[features["timestamp_dt"].ge(ultimo - pd.Timedelta(days=self.recent_window_days))]
+
+    def _puntuar_doble_horizonte(self, fila: dict[str, Any], base: dict[str, Any]) -> tuple[dict[str, float], dict[str, float], float]:
+        raw_largo, comp_largo = self._puntuar_horizonte(fila, base["long_horizon"])
+        if not base["recent_horizon_usable"]:
+            return (
+                {clave: round(valor, 6) for clave, valor in raw_largo.items()},
+                {clave: round(valor, 6) for clave, valor in comp_largo.items()},
+                self._evidencia_componentes(comp_largo),
+            )
+
+        raw_reciente, comp_reciente = self._puntuar_horizonte(fila, base["recent_horizon"])
+        raw = {clave: min(raw_largo[clave], raw_reciente[clave]) for clave in raw_largo}
+        componentes = {clave: min(comp_largo[clave], comp_reciente[clave]) for clave in comp_largo}
+        return (
+            {clave: round(valor, 6) for clave, valor in raw.items()},
+            {clave: round(valor, 6) for clave, valor in componentes.items()},
+            self._evidencia_componentes(componentes),
+        )
+
+    def _puntuar_horizonte(self, fila: dict[str, Any], base: dict[str, Any]) -> tuple[dict[str, float], dict[str, float]]:
+        raw_a, s_a = self._score_alto(fila["activations"], base["activations"])
+        raw_c, s_c = self._score_alto(fila["state_changes"], base["state_changes"])
+        raw_p, s_p = self._score_alto(fila["active_ratio"], base["active_ratio"])
+        raw_g, s_g = self._score_gap(fila["gap_seconds"], base["gap"], base["absence_alert_seconds"])
+        raw_m, s_m = self._score_gap(fila["report_gap_seconds"], base["report_gap"], base["report_gap_alert_seconds"])
+        raw_off, s_off = self._score_alto(fila["inactive_seconds"], base["inactive_duration"])
+        raw_tlc, s_tlc = self._score_gap(fila["time_since_last_change_seconds"], base["last_change_gap"], base["last_change_alert_seconds"])
+        raw_d, s_d = self._score_duracion(fila["active_seconds"], base)
+        return (
+            {
+                "Z_A_i": raw_a,
+                "Z_C_i": raw_c,
+                "Z_P_on_i": raw_p,
+                "Z_G_i": raw_g,
+                "Z_M_i": raw_m,
+                "Z_D_off_i": raw_off,
+                "Z_TLC_i": raw_tlc,
+                "Z_D_i": raw_d,
+            },
+            {
+                "s_A": s_a,
+                "s_C": s_c,
+                "s_P": s_p,
+                "s_G": s_g,
+                "s_M": s_m,
+                "s_D_off": s_off,
+                "s_TLC": s_tlc,
+                "s_D": s_d,
+            },
+        )
+
+    def _evidencia_componentes(self, componentes: dict[str, float]) -> float:
+        evidencia_base = sum(componentes[clave] for clave in ["s_A", "s_C", "s_P", "s_G", "s_M"]) / 5.0
+        return min(1.0, max(evidencia_base, componentes["s_TLC"], componentes["s_D"]))
 
     def _score_alto(self, valor: float, resumen: dict[str, float]) -> tuple[float, float]:
         z = max(0.0, (float(valor) - resumen["median"]) / (resumen["scaled_mad"] + 1e-9))
@@ -288,6 +376,10 @@ class FiltroEstadoBinarioEstadistico:
         z = max(0.0, (float(valor) - resumen["median"]) / (resumen["scaled_mad"] + 1e-9))
         score = max(self._score_desde_z(z), min(1.0, float(valor) / alerta))
         return z, score
+
+    def _score_duracion(self, active_seconds: float, base: dict[str, Any]) -> tuple[float, float]:
+        z_active = max(0.0, (float(active_seconds) - base["active_duration"]["median"]) / (base["active_duration"]["scaled_mad"] + 1e-9))
+        return z_active, self._score_desde_z(z_active)
 
     def _score_desde_z(self, z_value: float) -> float:
         if not math.isfinite(z_value) or z_value <= self.zona_muerta_z:
@@ -301,6 +393,8 @@ class FiltroEstadoBinarioEstadistico:
             "s_P": "active_time_ratio",
             "s_G": "time_since_last_activation",
             "s_M": "report_gap",
+            "s_TLC": "time_since_last_change",
+            "s_D": "z_duration_score",
         }
         return [indicador for clave, indicador in mapa.items() if componentes.get(clave, 0.0) >= self.componente_minimo]
 
@@ -311,6 +405,8 @@ class FiltroEstadoBinarioEstadistico:
             "active_time_ratio": componentes.get("s_P", 0.0),
             "time_since_last_activation": componentes.get("s_G", 0.0),
             "report_gap": componentes.get("s_M", 0.0),
+            "time_since_last_change": componentes.get("s_TLC", 0.0),
+            "z_duration_score": componentes.get("s_D", 0.0),
         }
         return max(indicadores, key=lambda indicador: componente_por_indicador.get(indicador, 0.0))
 
@@ -321,6 +417,8 @@ class FiltroEstadoBinarioEstadistico:
             "active_time_ratio": "Z_P_on_i",
             "time_since_last_activation": "Z_G_i",
             "report_gap": "Z_M_i",
+            "time_since_last_change": "Z_TLC_i",
+            "z_duration_score": "Z_D_i",
         }
         return round(float(raw_componentes.get(mapa[indicador], 0.0)), 6)
 
@@ -374,8 +472,17 @@ class FiltroEstadoBinarioEstadistico:
             "activations_median": round(base["activations"]["median"], 6),
             "state_changes_median": round(base["state_changes"]["median"], 6),
             "active_ratio_median": round(base["active_ratio"]["median"], 6),
+            "active_duration_median": round(base["active_duration"]["median"], 6),
+            "inactive_duration_median": round(base["inactive_duration"]["median"], 6),
             "absence_alert_seconds": round(base["absence_alert_seconds"], 3),
+            "last_change_alert_seconds": round(base["last_change_alert_seconds"], 3),
             "report_gap_alert_seconds": round(base["report_gap_alert_seconds"], 3),
+            "horizon_model": "long_and_recent",
+            "recent_window_days": int(base["recent_window_days"]),
+            "recent_horizon_events": int(base["recent_horizon_events"]),
+            "recent_horizon_usable": bool(base["recent_horizon_usable"]),
+            "long_report_gap_alert_seconds": round(base["long_horizon"]["report_gap_alert_seconds"], 3),
+            "recent_report_gap_alert_seconds": round(base["recent_horizon"]["report_gap_alert_seconds"], 3),
         }
 
     def _perfil_binario(self, entity_id: str, device_class: str) -> PerfilBinario:

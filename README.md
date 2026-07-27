@@ -1,8 +1,9 @@
 # Artefacto estadistico para diagnostico de sensores
 
 Prototipo local para crear un historico canonico normal de 60 dias, simular
-eventos nuevos por tick manual y ejecutar el primer filtro estadistico-temporal
-definido en la tesis.
+eventos nuevos por tick manual y ejecutar en secuencia el filtro
+estadistico-temporal, el segundo filtro contextual espacio-temporal y el
+clasificador diagnostico definidos en la tesis.
 
 El alcance actual cubre:
 
@@ -17,6 +18,15 @@ El alcance actual cubre:
 - HU-16 deteccion temporal en entidades continuas.
 - HU-17 deteccion temporal en entidades de estado binarias y multivaloricas.
 - HU-22 visualizacion web de resultados del filtro estadistico.
+- Construccion reproducible del mapa de dependencias contextuales.
+- Relaciones continuas, de estado y mixtas con desfase temporal.
+- Validacion contextual con respaldo, contradiccion, no explicado y cobertura
+  insuficiente como estados separados.
+- Mapa de covarianza calculado y visible en la web.
+- Clasificador determinista y versionado con salida normal, anomalia ambiental,
+  posible falla de sensor o diagnostico indeterminado.
+- Evaluacion separada del clasificador condicional y del flujo extremo a
+  extremo, incluidos los falsos negativos descartados antes de clasificar.
 
 ## Ejecucion con Docker
 
@@ -32,6 +42,17 @@ Servicios:
 - Swagger UI: <http://localhost:8000/docs>
 - OpenAPI JSON: <http://localhost:8000/openapi.json>
 - Web: <http://localhost:5173>
+
+Smoke test post-Docker:
+
+```powershell
+python scripts/post_docker_test.py
+```
+
+El test espera la API, crea/carga el historico canonico, ejecuta analisis,
+simula ticks para cada tipo de falla soportado en entidades continuas y
+binarias, imprime si cada falla fue inyectada y si genero sospecha realtime, y
+verifica que la web responda.
 
 El endpoint `GET /health` queda documentado en Swagger UI bajo el grupo
 `health` para revisar rapidamente que la API este operativa y que rutas de
@@ -71,6 +92,11 @@ npm run dev
 4. `POST /realtime/tick`
 5. `GET /realtime/current`
 6. `GET /realtime/timeline`
+7. Abrir la pestana `Contextual` para consultar `GET /context/map` y
+   `GET /context/results`.
+8. Abrir la pestana `Clasificador` para revisar diagnosticos, trazabilidad,
+   especificacion congelada y disponibilidad de la evaluacion extremo a
+   extremo.
 
 Cada tick genera eventos nuevos despues del ultimo timestamp del historico
 estatico, aplica fallas solo a esos eventos nuevos y ejecuta automaticamente el
@@ -111,8 +137,10 @@ ticks de tiempo real. `missing` se representa como fila ausente en eventos y com
 registro en `ground_truth`.
 
 La web ejecuta este flujo desde botones y muestra entidades, linea temporal,
-zona real de falla, sospechas estadisticas y tiempo de ejecucion. El resultado
-aun no es diagnostico final: solo marca sospechas para filtros posteriores.
+zona real de falla, sospechas estadisticas, validaciones contextuales y tiempo
+de ejecucion. La pestana contextual muestra una matriz de covarianza cruda para
+entidades continuas y una matriz de asociacion normalizada que incorpora
+relaciones continuas, de estado y mixtas.
 
 El flujo de simulacion controlada compatible con endpoints `/simulation/*` usa
 72 horas minimas y una referencia de ciclos completos para entidades
@@ -128,3 +156,58 @@ La respuesta de `POST /filters/statistical/run` incluye `elapsed_ms`,
 `elapsed_seconds` y `timings_by_kind_ms`. Estos campos miden solo el tiempo de
 ejecucion del filtro estadistico sobre datos ya normalizados, por lo que sirven
 para estimar el costo del algoritmo de deteccion y no el costo de carga del CSV.
+
+## Filtro contextual espacio-temporal
+
+El mapa usa por defecto ventanas de una hora, desfases de 0 a 2 horas, un minimo
+de 30 observaciones pareadas, cobertura historica de 0.60, asociacion absoluta
+de 0.35, estabilidad en al menos 3 de 4 periodos y `top_k=5`. Todos estos
+valores, la regla de aceptacion y los motivos de rechazo se devuelven en
+`GET /context/map`.
+
+Endpoints:
+
+- `GET /context/map`
+- `POST /context/map/rebuild`
+- `POST /context/analyze`
+- `GET /context/results`
+
+La falta de una observacion relacionada reduce la cobertura y nunca se cuenta
+automaticamente como contradiccion. Un patron simultaneo en tres o mas
+entidades queda advertido como posible causa comun no identificable hasta
+contar con evidencia independiente sobre red, alimentacion o integracion; en
+ese estado el filtro conserva el puntaje estadistico sin ajustarlo.
+
+La especificacion, formulas, criterios de actualizacion y trazabilidad de las
+seis debilidades metodologicas estan en
+`Filtro_Contextual_Espacio_Temporal.MD`.
+
+## Clasificador diagnostico reproducible
+
+El tercer filtro implementa la lista de decision
+`diagnostic-rule-list-v1.0.0`. Sus variables proceden exclusivamente de los
+resultados estadisticos y contextuales; las etiquetas de verdad no son una
+entrada del diagnostico. La salida `indeterminate` representa abstencion cuando
+la cobertura no alcanza el minimo, el mapa esta obsoleto o una posible causa
+comun no puede distinguirse sin telemetria independiente.
+
+Endpoints:
+
+- `GET /classifier/specification`
+- `POST /classifier/analyze`
+- `GET /classifier/results`
+- `GET /classifier/evaluation`
+- `POST /classifier/evaluate`
+
+El artefacto opera provisionalmente sobre el mes real disponible en
+`data/datosreales/history.csv` y no usa una base simulada para seleccionar el
+modelo ni para atribuirle rendimiento. Las reglas y umbrales quedan fijados a
+priori, pero la validacion final permanece pendiente mientras no existan los
+cinco meses planificados y etiquetas reales suficientes. Si no existe
+`data/datosreales/ground_truth.csv` ni hay fallas controladas en tiempo real,
+la API informa que la evaluacion no esta disponible; no reemplaza la ausencia
+de verdad por metricas iguales a cero.
+
+La justificacion metodologica, la tabla de reglas y la forma de contabilizar
+los falsos negativos previos al clasificador se documentan en
+`Clasificador_Diagnostico_Reproducible.MD`.

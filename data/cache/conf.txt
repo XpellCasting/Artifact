@@ -1,0 +1,132 @@
+[continuous.sensor.bathroom_temp_bathroom_humidity]
+origen = calculado_desde_historial
+physical_low = 34.500011
+physical_high = 97.299995
+extreme_low = 49.350006
+extreme_high = 84.049995
+value_floor = 0.099998
+rate_floor_per_minute = 0.050003
+const_epsilon_floor = 0.025000
+min_constant_seconds = 1800.080000
+min_gap_seconds = 300.021410
+
+[continuous.sensor.bathroom_temp_bathroom_temperature]
+origen = calculado_desde_historial
+physical_low = 11.699999
+physical_high = 20.800002
+extreme_low = 13.650000
+extreme_high = 18.950001
+value_floor = 0.099998
+rate_floor_per_minute = 0.044445
+const_epsilon_floor = 0.025000
+min_constant_seconds = 12000.132000
+min_gap_seconds = 3060.050400
+
+[continuous.sensor.chargecontroller_battery_voltage]
+origen = calculado_desde_historial
+physical_low = 9.559999
+physical_high = 16.760000
+extreme_low = 10.849999
+extreme_high = 15.450000
+value_floor = 0.012320
+rate_floor_per_minute = 0.007524
+const_epsilon_floor = 0.002500
+min_constant_seconds = 2400.530000
+min_gap_seconds = 1320.127900
+
+[continuous.sensor.entertainment_room_sensor_temperature]
+origen = calculado_desde_historial
+physical_low = 3.600000
+physical_high = 23.700000
+extreme_low = 7.800000
+extreme_high = 19.300000
+value_floor = 0.100000
+rate_floor_per_minute = 0.010017
+const_epsilon_floor = 0.025000
+min_constant_seconds = 11983.094000
+min_gap_seconds = 1797.569360
+
+[continuous.sensor.foyer_motion_temperature]
+origen = calculado_desde_historial
+physical_low = 2.400000
+physical_high = 21.400000
+extreme_low = 6.000000
+extreme_high = 17.700000
+value_floor = 0.100000
+rate_floor_per_minute = 0.010016
+const_epsilon_floor = 0.025000
+min_constant_seconds = 11990.179000
+min_gap_seconds = 2096.468920
+
+[continuous.sensor.hall_sensor_temperature]
+origen = calculado_desde_historial
+physical_low = -0.600000
+physical_high = 36.000000
+extreme_low = 6.050000
+extreme_high = 27.650000
+value_floor = 0.100000
+rate_floor_per_minute = 0.010045
+const_epsilon_floor = 0.025000
+min_constant_seconds = 11971.430000
+min_gap_seconds = 1796.487200
+
+[continuous.sensor.office_sensor_temperature]
+origen = calculado_desde_historial
+physical_low = 7.600000
+physical_high = 29.706000
+extreme_low = 10.850000
+extreme_high = 21.780000
+value_floor = 0.100000
+rate_floor_per_minute = 0.010014
+const_epsilon_floor = 0.025000
+min_constant_seconds = 11987.718000
+min_gap_seconds = 2096.960760
+
+[continuous.sensor.weatherstation_humidity_in_2]
+origen = calculado_desde_historial
+physical_low = 41.000000
+physical_high = 78.000000
+extreme_low = 48.000000
+extreme_high = 71.000000
+value_floor = 1.000000
+rate_floor_per_minute = 0.487532
+const_epsilon_floor = 0.250000
+min_constant_seconds = 61650.400000
+min_gap_seconds = 15749.954750
+
+[continuous.sensor.weatherstation_inside_temp_2]
+origen = calculado_desde_historial
+physical_low = 9.388889
+physical_high = 25.000000
+extreme_low = 12.388889
+extreme_high = 21.222222
+value_floor = 0.055556
+rate_floor_per_minute = 0.039732
+const_epsilon_floor = 0.013889
+min_constant_seconds = 3599.620000
+min_gap_seconds = 540.139600
+
+[continuous.sensor.living_humidity]
+origen = calculado_desde_historial
+physical_low = 34.000000
+physical_high = 90.000000
+extreme_low = 46.000000
+extreme_high = 78.000000
+value_floor = 8.000000
+rate_floor_per_minute = 0.133333
+const_epsilon_floor = 2.000000
+min_constant_seconds = 36000.000000
+min_gap_seconds = 3600.000000
+
+[continuous.sensor.living_temperature]
+origen = calculado_desde_historial
+physical_low = 6.500000
+physical_high = 34.500000
+extreme_low = 12.500000
+extreme_high = 28.500000
+value_floor = 1.500000
+rate_floor_per_minute = 0.025000
+const_epsilon_floor = 0.375000
+min_constant_seconds = 36000.000000
+min_gap_seconds = 3600.000000
+

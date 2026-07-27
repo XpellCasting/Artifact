@@ -6,11 +6,14 @@ services:
       MULTISTATE_FIXTURE_DIR: /app/fixtures
       STATIC_HISTORY_DIR: /app/data/static_history
       REAL_HISTORY_PATH: /app/data/datosreales/history.csv
+      CONTINUOUS_CONF_PATH: /app/data/cache/conf.txt
+      CONTEXT_MAP_CACHE_PATH: /app/data/cache/contextual_map.json
+      GROUND_TRUTH_PATH: /app/data/datosreales/ground_truth.csv
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     volumes:
       - ./data/fixtures:/app/fixtures:ro
       - ./data/static_history:/app/data/static_history
-      - ./data/datosreales:/app/data/datosreales:ro
+      - ./data/datosreales:/app/data/datosreales
       - ./data/cache:/app/data/cache
     ports:
       - "8000:8000"

@@ -61,11 +61,7 @@ class CargadorHistorial:
         return resultado
 
     def crear_canonico_minimo(self, directorio: Path, dias: int = 60) -> ResultadoHistorial:
-        """Crea un historial canonico simple si no existe.
-
-        Este generador es solo el punto de partida de carga. No inyecta fallas y
-        no reemplaza el simulador estadistico que se implementara despues.
-        """
+        """Crea un historial canonico simple si no existe."""
         directorio.mkdir(parents=True, exist_ok=True)
         eventos_path = directorio / "events.csv"
         entidades_path = directorio / "entities.csv"
@@ -157,11 +153,43 @@ class CargadorHistorial:
         trabajo = trabajo[
             trabajo["entity_id"].ne("")
             & trabajo["timestamp_dt"].notna()
-            & ~trabajo["state"].str.lower().isin(ESTADOS_INVALIDOS)
         ].copy()
+        trabajo["is_valid_value"] = ~trabajo["state"].str.lower().isin(ESTADOS_INVALIDOS)
         trabajo["timestamp"] = trabajo["timestamp_dt"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        trabajo["domain"] = trabajo.get("domain", trabajo["entity_id"].str.split(".").str[0])
-        trabajo["sensor_kind"] = trabajo.apply(self._clasificar_fila, axis=1)
+        if "domain" in trabajo.columns:
+            trabajo["domain"] = trabajo["domain"].astype(str).str.strip()
+        else:
+            trabajo["domain"] = trabajo["entity_id"].str.split(".").str[0]
+        dominio = trabajo["domain"].str.lower()
+        dominio = dominio.mask(dominio.eq(""), trabajo["entity_id"].str.split(".").str[0].str.lower())
+        estado = trabajo["state"].str.lower()
+        valores_numericos = pd.to_numeric(estado, errors="coerce")
+        if "sensor_kind" in trabajo.columns:
+            sensor_kind_declarado = trabajo["sensor_kind"].astype(str).str.strip()
+        else:
+            sensor_kind_declarado = pd.Series("", index=trabajo.index)
+        sensor_kind_base = pd.Series("multistate", index=trabajo.index, dtype="object")
+        declarado_valido = sensor_kind_declarado.isin({"continuous", "binary", "multistate"})
+        sensor_kind_base.loc[declarado_valido] = sensor_kind_declarado.loc[declarado_valido]
+        sin_declarar = ~declarado_valido
+        sensor_kind_base.loc[sin_declarar & dominio.eq("binary_sensor")] = "binary"
+        sensor_kind_base.loc[sin_declarar & dominio.isin({"select", "input_select", "climate"})] = "multistate"
+        pendiente = sin_declarar & ~dominio.eq("binary_sensor") & ~dominio.isin({"select", "input_select", "climate"})
+        sensor_kind_base.loc[pendiente & valores_numericos.notna()] = "continuous"
+        sensor_kind_base.loc[pendiente & valores_numericos.isna() & estado.isin(ESTADOS_ACTIVOS | ESTADOS_INACTIVOS)] = "binary"
+        trabajo["_sensor_kind_candidate"] = sensor_kind_base.where(trabajo["is_valid_value"], "")
+        tipo_por_entidad = (
+            trabajo[trabajo["_sensor_kind_candidate"].ne("")]
+            .groupby("entity_id")["_sensor_kind_candidate"]
+            .first()
+            .to_dict()
+        )
+        trabajo["sensor_kind"] = trabajo["_sensor_kind_candidate"]
+        trabajo["sensor_kind"] = trabajo["sensor_kind"].mask(
+            trabajo["sensor_kind"].eq(""),
+            trabajo["entity_id"].map(tipo_por_entidad),
+        )
+        trabajo["sensor_kind"] = trabajo["sensor_kind"].fillna(sensor_kind_base)
         trabajo["tipo_interno"] = trabajo["sensor_kind"].map(
             {
                 "continuous": "continua",
@@ -169,9 +197,25 @@ class CargadorHistorial:
                 "multistate": "estado_multivalor",
             }
         )
-        trabajo["value"] = trabajo.apply(self._valor_numerico, axis=1)
-        trabajo["unit_of_measurement"] = trabajo.get("unit_of_measurement", "")
-        trabajo["device_class"] = trabajo.apply(self._device_class, axis=1)
+        trabajo["value"] = None
+        es_valido = trabajo["is_valid_value"].astype(bool)
+        es_continuo = trabajo["sensor_kind"].eq("continuous") & es_valido
+        es_binario = trabajo["sensor_kind"].eq("binary") & es_valido
+        trabajo.loc[es_continuo, "value"] = valores_numericos.loc[es_continuo].astype(float)
+        trabajo.loc[es_binario, "value"] = estado.loc[es_binario].isin(ESTADOS_ACTIVOS).astype(float)
+        if "unit_of_measurement" in trabajo.columns:
+            trabajo["unit_of_measurement"] = trabajo["unit_of_measurement"].astype(str).str.strip()
+        else:
+            trabajo["unit_of_measurement"] = ""
+        if "device_class" in trabajo.columns:
+            trabajo["device_class"] = trabajo["device_class"].astype(str).str.strip()
+        else:
+            trabajo["device_class"] = ""
+        entity_lower = trabajo["entity_id"].str.lower()
+        trabajo.loc[trabajo["device_class"].eq("") & entity_lower.str.contains("humidity", regex=False), "device_class"] = "humidity"
+        trabajo.loc[trabajo["device_class"].eq("") & (entity_lower.str.contains("temperature", regex=False) | entity_lower.str.contains("temp", regex=False)), "device_class"] = "temperature"
+        trabajo.loc[trabajo["device_class"].eq("") & (entity_lower.str.contains("motion", regex=False) | entity_lower.str.contains("pir", regex=False)), "device_class"] = "motion"
+        trabajo.loc[trabajo["device_class"].eq("") & (entity_lower.str.contains("door", regex=False) | entity_lower.str.contains("contact", regex=False) | entity_lower.str.contains("window", regex=False)), "device_class"] = "door"
         trabajo = trabajo.sort_values(["entity_id", "timestamp_dt"]).reset_index(drop=True)
 
         entidades = self._construir_entidades(trabajo)
@@ -262,6 +306,7 @@ class CargadorHistorial:
             "value",
             "unit_of_measurement",
             "device_class",
+            "is_valid_value",
         ]
         muestras = []
         for entity_id, grupo in normalizado.groupby("entity_id", sort=True):
@@ -297,9 +342,8 @@ class CargadorHistorial:
         for columna in declaradas.columns:
             if columna not in base.columns:
                 base[columna] = ""
-            base.loc[base.index.intersection(declaradas.index), columna] = declaradas.loc[
-                base.index.intersection(declaradas.index), columna
-            ]
+            indices = base.index.intersection(declaradas.index)
+            base.loc[indices, columna] = declaradas.loc[indices, columna]
         return base.reset_index()
 
     def _evento(self, entidad: dict[str, str], timestamp: pd.Timestamp, state: str) -> dict[str, str]:
