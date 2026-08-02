@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -62,6 +63,9 @@ class FiltroContextualEspacioTemporal:
     def __init__(self, config: ConfiguracionContextual | None = None) -> None:
         self.config = config or ConfiguracionContextual()
 
+    def implementation_sha256(self) -> str:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
     def fingerprint(self, eventos: pd.DataFrame, entidades: pd.DataFrame) -> dict[str, Any]:
         trabajo = self._preparar_eventos(eventos)
         catalogo = self._catalogo(entidades, trabajo)
@@ -103,6 +107,11 @@ class FiltroContextualEspacioTemporal:
         razones: list[str] = []
         if mapa.get("map_version") != self.MAP_VERSION:
             razones.append("map_version_changed")
+        if (
+            mapa.get("implementation_sha256")
+            != self.implementation_sha256()
+        ):
+            razones.append("implementation_changed")
         if mapa.get("config") != self.config.como_dict():
             razones.append("configuration_changed")
         actual = self.fingerprint(eventos, entidades)
@@ -197,6 +206,7 @@ class FiltroContextualEspacioTemporal:
 
         result = {
             "map_version": self.MAP_VERSION,
+            "implementation_sha256": self.implementation_sha256(),
             "built_at": pd.Timestamp.now(tz="UTC").isoformat(),
             "source_range": {"start": fingerprint["start"], "end": fingerprint["end"]},
             "source_fingerprint": fingerprint,

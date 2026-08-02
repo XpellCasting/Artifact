@@ -372,6 +372,9 @@ class ClasificadorDiagnostico:
             "pipeline": {
                 "statistical": {
                     "score": s_stat,
+                    "evidence_score": statistical.get("evidence_score"),
+                    "score_version": statistical.get("score_version"),
+                    "score_kind": statistical.get("score_kind"),
                     "threshold": self.config.statistical_threshold,
                     "passed": bool(
                         statistical.get("passed_to_contextual_filter", True)

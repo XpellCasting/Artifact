@@ -30,45 +30,45 @@ const BINARY_FAULT_TYPES = ["random", "malfunction", "bias", "missing"];
 const EQUATIONS = [
   {
     id: "hampel",
-    title: "Filtro Hampel",
+    title: "Hampel / limite operacional",
     pattern: "isolated_spike",
     equation: "H_i(t) = |x_i(t) - mediana(W)| / (1.4826 * MAD(W) + epsilon)",
-    score: "s_H = min(1, H_i(t) / 3.5)",
+    score: "s_H = max(phi_z(H_i), phi_z(Z_F_i))",
   },
   {
     id: "robust_rate_change",
     title: "Tasa de cambio robusta",
     pattern: "abrupt_change",
     equation: "R_i(t) = |x_i(t) - x_i(t-Delta t)| / Delta t",
-    score: "s_R = min(1, Z_R_i(t) / 3.5)",
+    score: "s_R = phi_z(Z_R_i(t))",
   },
   {
     id: "cusum_residual",
     title: "CUSUM sobre residuales",
     pattern: "persistent_shift",
     equation: "r_i(t) = x_i(t) - pEWMA_i(t-Delta t); C+ y C- acumulan residuales",
-    score: "s_C = min(1, max(C+, C-) / theta_C)",
+    score: "s_C = phi_ratio(max(C+, C-) / theta_C)",
   },
   {
     id: "constant_persistence",
     title: "Persistencia constante",
     pattern: "stuck_value",
     equation: "D_const mide el tiempo consecutivo con |x_i(t)-x_i(t-Delta t)| <= epsilon_const",
-    score: "s_D_const = min(1, Z_D_const / 3.5)",
+    score: "s_D_const = max(phi_z(Z_D_const), phi_ratio(D_const / T_const))",
   },
   {
     id: "reading_gap",
     title: "Brecha temporal",
     pattern: "missing_gap",
     equation: "M_i(t) = t - t_i_last",
-    score: "s_M = min(1, Z_M / 3.5)",
+    score: "s_M = max(phi_z(Z_M), phi_ratio(M_i / T_M))",
   },
   {
     id: "dspot_extreme",
     title: "DSPOT extremo",
     pattern: "extreme_value",
     equation: "Z_DSPOT = distancia del valor contra el umbral extremo robusto",
-    score: "s_DSPOT = min(1, Z_DSPOT / 3.5)",
+    score: "s_DSPOT = phi_z(Z_DSPOT)",
   },
 ];
 
@@ -4289,6 +4289,11 @@ function CalculationModal({ result, onClose }) {
           <SummaryRow label="Score sospecha" value={formatNumber(result.suspicion_score)} />
           <SummaryRow label="Raw dominante" value={formatNumber(result.raw_score)} />
           <SummaryRow label="Evidencia" value={formatNumber(result.evidence_score)} />
+          <SummaryRow label="Version score" value={result.score_version || "-"} />
+          <SummaryRow
+            label="Naturaleza"
+            value={result.score_kind === "statistical_evidence_strength_not_probability" ? "fuerza de evidencia" : (result.score_kind || "-")}
+          />
           <SummaryRow label="Consistencia temporal" value={temporalConsistencyText(temporalContext.temporal_consistency)} />
           <SummaryRow label="Paso contextual" value={result.passed_to_contextual_filter ? "si" : "no"} />
         </div>
@@ -4934,38 +4939,38 @@ function continuousEquationWithValues(equation, result) {
 
   if (equation.id === "hampel") {
     return {
-      equation: `H_i(t) = |${formatCalc(value)} - mediana(W)| / (1.4826 * MAD(W) + epsilon) = ${formatCalc(raw.H_i)}`,
-      score: `s_H = min(1, ${formatCalc(raw.H_i)} / 3.5) = ${formatCalc(components.s_H)}`,
+      equation: `H_i(t) = |${formatCalc(value)} - mediana(W)| / (1.4826 * MAD(W) + epsilon) = ${formatCalc(raw.H_i)}; Z_F_i = ${formatCalc(raw.Z_F_i)}`,
+      score: `s_H = max(phi_z(${formatCalc(raw.H_i)}), phi_z(${formatCalc(raw.Z_F_i)})) = ${formatCalc(components.s_H)}`,
     };
   }
   if (equation.id === "robust_rate_change") {
     return {
       equation: `R_i(t) = |${formatCalc(delta)}| / ${formatCalc(deltaMinutes)}min = ${formatCalc(rate)}/min; Z_R_i(t) = ${formatCalc(raw.Z_R_i)}`,
-      score: `s_R = min(1, ${formatCalc(raw.Z_R_i)} / 3.5) = ${formatCalc(components.s_R)}`,
+      score: `s_R = phi_z(${formatCalc(raw.Z_R_i)}) = ${formatCalc(components.s_R)}`,
     };
   }
   if (equation.id === "cusum_residual") {
     return {
       equation: `r_i(t) = ${formatCalc(value)} - ${formatCalc(prediction)} = ${formatCalc(residual)}; max(C+, C-) = ${formatCalc(raw.C_residual)}`,
-      score: `s_C = min(1, ${formatCalc(raw.C_residual)} / ${formatCalc(base.cusum_theta)}) = ${formatCalc(components.s_C)}`,
+      score: `s_C = phi_ratio(${formatCalc(raw.C_residual)} / ${formatCalc(base.cusum_theta)}) = ${formatCalc(components.s_C)}`,
     };
   }
   if (equation.id === "constant_persistence") {
     return {
       equation: `D_const = ${formatCalc(reading.constant_duration_seconds)}s con epsilon_const = ${formatCalc(base.epsilon_const)}; Z_D_const = ${formatCalc(raw.Z_D_const)}`,
-      score: `s_D_const = min(1, ${formatCalc(raw.Z_D_const)} / 3.5) = ${formatCalc(components.s_D_const)}`,
+      score: `s_D_const = max(phi_z(${formatCalc(raw.Z_D_const)}), phi_ratio(${formatCalc(reading.constant_duration_seconds)} / ${formatCalc(base.constant_alert_seconds)})) = ${formatCalc(components.s_D_const)}`,
     };
   }
   if (equation.id === "reading_gap") {
     return {
       equation: `M_i(t) = t - t_i_last = ${formatCalc(gapSeconds)}s; Z_M = ${formatCalc(raw.Z_M)}`,
-      score: `s_M = min(1, ${formatCalc(raw.Z_M)} / 3.5) = ${formatCalc(components.s_M)}`,
+      score: `s_M = max(phi_z(${formatCalc(raw.Z_M)}), phi_ratio(${formatCalc(gapSeconds)} / ${formatCalc(base.gap_alert_seconds)})) = ${formatCalc(components.s_M)}`,
     };
   }
   if (equation.id === "dspot_extreme") {
     return {
       equation: `Z_DSPOT = distancia de ${formatCalc(value)} contra [${formatCalc(base.dspot_lower)}, ${formatCalc(base.dspot_upper)}] = ${formatCalc(raw.Z_DSPOT)}`,
-      score: `s_DSPOT = min(1, ${formatCalc(raw.Z_DSPOT)} / 3.5) = ${formatCalc(components.s_DSPOT)}`,
+      score: `s_DSPOT = phi_z(${formatCalc(raw.Z_DSPOT)}) = ${formatCalc(components.s_DSPOT)}`,
     };
   }
   return { equation: equation.equation, score: equation.score };
@@ -5068,7 +5073,7 @@ function calculationSummary(result) {
   if (result?.sensor_kind === "binary") {
     return `S_bin(W) usa doble horizonte: base larga y base reciente. El score mostrado es el menor entre ambas para evitar falsos positivos por cambios de rutina = ${formatNumber(result.evidence_score)}. Luego P_sos = S_bin / (S_bin + tau_i) = ${formatNumber(result.suspicion_score)}.`;
   }
-  return `Evidencia continua = max(s_H, s_R, s_C, s_D_const, s_M) = ${formatNumber(result.evidence_score)}. Luego P_sos = evidencia / (evidencia + tau_i) = ${formatNumber(result.suspicion_score)}.`;
+  return `Version ${result.score_version || "v2"}: phi(u)=ln(1+u)/(ln(1+u)+lambda), con phi(1)=0.60. Evidencia continua = max(s_H, s_R, s_C, s_D_const, s_M, s_DSPOT) = ${formatNumber(result.evidence_score)}. El score de sospecha conserva ese mismo valor; expresa fuerza de evidencia, no una probabilidad = ${formatNumber(result.suspicion_score)}.`;
 }
 
 function readingRows(result) {
@@ -5094,6 +5099,11 @@ function readingRows(result) {
     { label: "Brecha", value: formatSeconds(reading.gap_seconds) },
     { label: "Residual", value: formatNumber(reading.residual) },
     { label: "Duracion constante", value: formatSeconds(reading.constant_duration_seconds) },
+    {
+      label: "Fuente s_H",
+      value: reading.component_sources?.s_H === "operational_limit" ? "limite operacional" : "Hampel",
+    },
+    { label: "Score limite operacional", value: formatNumber(reading.operational_limit_score) },
   ];
 }
 

@@ -1259,16 +1259,59 @@ class EstadoAplicacion:
         if not self._es_historial_real_activo() or not self.real_history_path.exists():
             return None
         stat = self.real_history_path.stat()
-        conf_path = Path(os.getenv("CONTINUOUS_CONF_PATH", ""))
+        conf_path = self.filtro_estadistico.continuos.conf_path
         classifier_specification = self.filtro_clasificacion.especificacion()
+        contextual_map_path = self._ruta_cache_contextual()
+        contextual_map_expired: bool | None = None
+        if (
+            contextual_map_path is not None
+            and contextual_map_path.is_file()
+        ):
+            try:
+                with contextual_map_path.open("r", encoding="utf-8") as archivo:
+                    contextual_map_payload = json.load(archivo)
+                built_at = pd.to_datetime(
+                    contextual_map_payload.get("built_at"),
+                    errors="coerce",
+                    utc=True,
+                )
+                contextual_map_expired = bool(
+                    pd.isna(built_at)
+                    or (
+                        pd.Timestamp.now(tz="UTC") - built_at
+                    ).total_seconds()
+                    > (
+                        self.filtro_contextual.config.max_map_age_days
+                        * 86400.0
+                    )
+                )
+            except (OSError, json.JSONDecodeError):
+                contextual_map_expired = True
         return {
-            "cache_version": 15,
+            "cache_version": 16,
             "source_path": str(self.real_history_path),
             "source_size": int(stat.st_size),
             "source_mtime_ns": int(stat.st_mtime_ns),
             "source_sha256": self._sha256_archivo(self.real_history_path),
             "continuous_conf_sha256": self._sha256_archivo(conf_path) if conf_path.is_file() else "",
             "suspicion_threshold": round(float(suspicion_threshold), 6),
+            "continuous_score_specification": (
+                self.filtro_estadistico.continuos.especificacion_puntaje()
+            ),
+            "contextual_filter_version": self.filtro_contextual.MAP_VERSION,
+            "contextual_configuration": (
+                self.filtro_contextual.config.como_dict()
+            ),
+            "contextual_implementation_sha256": (
+                self.filtro_contextual.implementation_sha256()
+            ),
+            "contextual_map_sha256": (
+                self._sha256_archivo(contextual_map_path)
+                if contextual_map_path is not None
+                and contextual_map_path.is_file()
+                else ""
+            ),
+            "contextual_map_expired": contextual_map_expired,
             "classifier_version": classifier_specification.get("model_version"),
             "classifier_implementation_sha256": (
                 classifier_specification.get("artifacts", {}).get(

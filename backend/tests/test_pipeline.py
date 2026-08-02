@@ -1,5 +1,6 @@
-from pathlib import Path
+from dataclasses import replace
 import json
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -154,7 +155,20 @@ class CargaHistorialTest(unittest.TestCase):
                 self.assertGreaterEqual(item["evidence_score"], 0.0)
                 self.assertLessEqual(item["evidence_score"], 1.0)
                 self.assertGreaterEqual(item["suspicion_score"], 0.0)
-                self.assertLessEqual(item["suspicion_score"], 1.0)
+                self.assertLess(item["suspicion_score"], 1.0)
+                self.assertEqual(item["evidence_score"], item["suspicion_score"])
+                self.assertEqual(
+                    item["score_version"],
+                    "statistical-continuous-score-v2.0.0",
+                )
+                self.assertEqual(
+                    item["score_kind"],
+                    "statistical_evidence_strength_not_probability",
+                )
+                self.assertLess(
+                    item["temporal_context"]["hour_of_day_score"],
+                    1.0,
+                )
                 self.assertTrue(set(item["triggered_indicators"]).issubset(indicadores_validos))
             self.assertTrue(any(item["raw_score"] > 1.0 for item in resultado["results"]))
 
@@ -392,6 +406,40 @@ class CargaHistorialTest(unittest.TestCase):
             self.assertFalse(primero["summary"]["cache_hit"])
             self.assertTrue(segundo["summary"]["cache_hit"])
             self.assertEqual(primero["results"], segundo["results"])
+            with estado.analysis_cache_path.open("r", encoding="utf-8") as archivo:
+                cache = json.load(archivo)
+            self.assertEqual(cache["identity"]["cache_version"], 16)
+            self.assertEqual(
+                cache["identity"]["continuous_score_specification"]["version"],
+                "statistical-continuous-score-v2.0.0",
+            )
+            self.assertTrue(cache["identity"]["continuous_conf_sha256"])
+            self.assertEqual(
+                cache["identity"]["contextual_filter_version"],
+                "contextual-spatiotemporal-v1",
+            )
+            self.assertTrue(
+                cache["identity"]["contextual_implementation_sha256"]
+            )
+            self.assertTrue(cache["identity"]["contextual_map_sha256"])
+            self.assertFalse(cache["identity"]["contextual_map_expired"])
+            config_contextual_original = estado.filtro_contextual.config
+            estado.filtro_contextual.config = replace(
+                config_contextual_original,
+                decision_threshold=0.36,
+            )
+            self.assertIsNone(estado._leer_cache_analisis_real(0.6))
+            estado.filtro_contextual.config = config_contextual_original
+
+            mapa_path = estado._ruta_cache_contextual()
+            with mapa_path.open("r", encoding="utf-8") as archivo:
+                mapa = json.load(archivo)
+            mapa["built_at"] = "2000-01-01T00:00:00+00:00"
+            with mapa_path.open("w", encoding="utf-8") as archivo:
+                json.dump(mapa, archivo)
+            identidad_vencida = estado._identidad_historial_real(0.6)
+            self.assertTrue(identidad_vencida["contextual_map_expired"])
+            self.assertIsNone(estado._leer_cache_analisis_real(0.6))
 
     def test_tick_realtime_aplica_falla_y_reanaliza(self):
         with tempfile.TemporaryDirectory() as tmp:

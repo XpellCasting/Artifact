@@ -147,10 +147,14 @@ El flujo de simulacion controlada compatible con endpoints `/simulation/*` usa
 multivaloricas. Esto evita que estados normales que aparecen solo despues del
 mediodia queden fuera del baseline.
 
-El campo `raw_score` conserva la suma ponderada calculada por las ecuaciones del
-filtro. El campo `suspicion_score` es la version normalizada entre `0` y `1` para
-visualizacion: `0` representa comportamiento cercano a la normalidad historica y
-valores cercanos a `1` representan sospecha estadistica alta.
+En entidades continuas, `raw_score` conserva la magnitud cruda del indicador
+dominante. La version `statistical-continuous-score-v2.0.0` transforma cada
+indicador con una curva logaritmica suave y agrega mediante el maximo. Los
+campos `evidence_score` y `suspicion_score` contienen la misma fuerza de
+evidencia en `[0,1)`; no son una probabilidad de falla. Esta correccion se
+verifico solo con el mes real disponible y no usa la base simulada. La
+especificacion y el contraste antes/despues estan en
+`Puntaje_Estadistico_Continuo_v2.MD`.
 
 La respuesta de `POST /filters/statistical/run` incluye `elapsed_ms`,
 `elapsed_seconds` y `timings_by_kind_ms`. Estos campos miden solo el tiempo de

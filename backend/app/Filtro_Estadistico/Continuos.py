@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from configparser import ConfigParser, Error
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -50,11 +51,18 @@ class FiltroContinuoEstadistico:
     Implementa los indicadores de tesis y suma DSPOT solo para extremos.
     """
 
+    SCORE_VERSION = "statistical-continuous-score-v2.0.0"
+    SCORE_KIND = "statistical_evidence_strength_not_probability"
     window_hampel = 12
     alpha_ewma = 0.2
-    tau_probabilidad = 0.4
-    umbral_z = 3.5
     zona_muerta_z = 2.5
+    ancla_activacion_z = 3.1
+    score_ancla_activacion = 0.6
+    lambda_log = (
+        math.log(2.0)
+        * (1.0 - score_ancla_activacion)
+        / score_ancla_activacion
+    )
     supresion_segundos = 15 * 60
 
     def __init__(self, conf_path: Path | None = None) -> None:
@@ -63,6 +71,30 @@ class FiltroContinuoEstadistico:
         self.config.optionxform = str
         if self.conf_path.exists():
             self.config.read(self.conf_path, encoding="utf-8")
+
+    def especificacion_puntaje(self) -> dict[str, Any]:
+        return {
+            "version": self.SCORE_VERSION,
+            "kind": self.SCORE_KIND,
+            "scope": "continuous_entities_only",
+            "range": "[0,1)",
+            "dead_zone_z": self.zona_muerta_z,
+            "activation_anchor_z": self.ancla_activacion_z,
+            "activation_score": self.score_ancla_activacion,
+            "lambda_log": round(self.lambda_log, 12),
+            "z_formula": (
+                "r=max(0,(z-2.5)/(3.1-2.5)); "
+                "s=ln(1+r)/(ln(1+r)+lambda)"
+            ),
+            "ratio_formula": "s=ln(1+ratio)/(ln(1+ratio)+lambda)",
+            "aggregation": "maximum_component",
+            "suspicion_score": "identity(evidence_score)",
+            "hour_context_score": "same_soft_z_curve",
+            "realtime_cusum": "persistent_state_same_update_as_batch",
+            "operational_limits": "empirical_unless_user_edited",
+            "isolated_reading_gap_cap": 0.5,
+            "uses_simulated_dataset": False,
+        }
 
     def analizar(self, eventos: pd.DataFrame, entidades: pd.DataFrame, suspicion_threshold: float) -> list[dict[str, Any]]:
         if eventos.empty:
@@ -107,12 +139,10 @@ class FiltroContinuoEstadistico:
         perfil = base["perfil"]
 
         serie = self._preparar_variables_temporales(serie, base)
-        raw_threshold = self._probabilidad_a_raw(suspicion_threshold)
+        evidence_threshold = self._umbral_evidencia(suspicion_threshold)
         resultados: list[dict[str, Any]] = []
 
-        c_pos = 0.0
-        c_neg = 0.0
-        ewma = None
+        estado_cusum = self._estado_cusum_vacio()
         duracion_constante = 0.0
         valor_previo = None
         brecha_reportada = False
@@ -124,32 +154,27 @@ class FiltroContinuoEstadistico:
             rate_per_minute = self._numero(fila.get("rate_per_minute"), 0.0)
             base_fila = self._base_horaria(base, fila)
 
-            if ewma is None or gap_seconds > base_fila["cusum_reset_gap_seconds"]:
-                ewma = valor
-                c_pos = 0.0
-                c_neg = 0.0
+            if (
+                estado_cusum["ewma"] is None
+                or gap_seconds > base_fila["cusum_reset_gap_seconds"]
+            ):
                 duracion_constante = 0.0
-            prediccion = ewma
-            residual = valor - prediccion
 
-            fisico = self._score_fisico(valor, perfil)
+            raw_fisico, s_fisico = self._score_fisico(valor, perfil)
             dentro_banda = base_fila["normal_lower"] <= valor <= base_fila["normal_upper"]
 
             raw_r, s_r = self._score_tasa_robusta(rate_per_minute, base_fila)
-            if dentro_banda and fisico <= 0 and abs(delta_value) < base_fila["normal_delta_for_rate"]:
+            if dentro_banda and s_fisico <= 0 and abs(delta_value) < base_fila["normal_delta_for_rate"]:
                 s_r = 0.0
 
-            z_residual = residual / base_fila["residual_scale"]
-            if dentro_banda and abs(z_residual) < 1.5:
-                c_pos = 0.0
-                c_neg = 0.0
-            else:
-                c_pos = max(0.0, c_pos + z_residual - base_fila["cusum_k"])
-                c_neg = max(0.0, c_neg - z_residual - base_fila["cusum_k"])
-            raw_c = max(c_pos, c_neg)
-            s_c = min(1.0, raw_c / base_fila["cusum_theta"])
-            if dentro_banda and fisico <= 0:
-                s_c = 0.0
+            estado_cusum, raw_c, s_c, residual = self._actualizar_cusum(
+                valor=valor,
+                gap_seconds=gap_seconds,
+                base=base_fila,
+                dentro_banda=dentro_banda,
+                score_limite_operacional=s_fisico,
+                estado=estado_cusum,
+            )
 
             if valor_previo is not None and abs(valor - valor_previo) <= base_fila["epsilon_const"] and gap_seconds <= base_fila["gap_alert_seconds"]:
                 duracion_constante += max(gap_seconds, 0.0)
@@ -166,11 +191,12 @@ class FiltroContinuoEstadistico:
                 brecha_reportada = False
             raw_dspot, s_dspot = self._score_dspot_extremo(valor, base_fila)
             raw_h, s_h = self._score_hampel(fila, base_fila)
-            if dentro_banda and fisico <= 0 and s_r <= 0.0 and s_dspot <= 0.0:
+            if dentro_banda and s_fisico <= 0 and s_r <= 0.0 and s_dspot <= 0.0:
                 s_h = 0.0
-            if fisico > s_h:
-                raw_h = max(raw_h, fisico * self.umbral_z)
-                s_h = fisico
+            fuente_h = "hampel"
+            if s_fisico > s_h:
+                s_h = s_fisico
+                fuente_h = "operational_limit"
 
             componentes = {
                 "s_H": round(s_h, 6),
@@ -187,12 +213,14 @@ class FiltroContinuoEstadistico:
                 "Z_D_const": round(raw_d_const, 6),
                 "Z_M": round(raw_m, 6),
                 "Z_DSPOT": round(raw_dspot, 6),
+                "Z_F_i": round(raw_fisico, 6),
             }
-            indicadores = self._indicadores_activados(componentes, raw_threshold)
-            evidence_score = max(componentes.values()) if componentes else 0.0
-            if indicadores == ["reading_gap"]:
-                evidence_score = min(evidence_score, 0.5)
-            suspicion_score = self._score_a_probabilidad(evidence_score)
+            indicadores = self._indicadores_activados(
+                componentes,
+                evidence_threshold,
+            )
+            evidence_score = self._evidencia_continua(componentes, indicadores)
+            suspicion_score = self._score_sospecha(evidence_score)
 
             if indicadores and suspicion_score >= suspicion_threshold:
                 indicador_principal = self._indicador_principal(componentes, indicadores)
@@ -210,6 +238,8 @@ class FiltroContinuoEstadistico:
                         "raw_score": self._raw_dominante(raw_componentes, indicador_principal),
                         "evidence_score": round(evidence_score, 6),
                         "suspicion_score": round(suspicion_score, 6),
+                        "score_version": self.SCORE_VERSION,
+                        "score_kind": self.SCORE_KIND,
                         "is_suspicious": True,
                         "pattern": patron,
                         "suspected_pattern": patron,
@@ -226,6 +256,8 @@ class FiltroContinuoEstadistico:
                             "residual": round(residual, 6),
                             "components": componentes,
                             "raw_components": raw_componentes,
+                            "component_sources": {"s_H": fuente_h},
+                            "operational_limit_score": round(s_fisico, 6),
                         },
                         "baseline_summary": self._resumen_base_para_salida(base_fila),
                         "ground_truth_label": None,
@@ -233,8 +265,6 @@ class FiltroContinuoEstadistico:
                     }
                 )
 
-            peso_pewma = self._peso_pewma(residual, base_fila)
-            ewma = peso_pewma * valor + (1.0 - peso_pewma) * ewma
             valor_previo = valor
 
         return resultados
@@ -411,6 +441,126 @@ class FiltroContinuoEstadistico:
         mezclada["hour"] = hora
         return mezclada
 
+    def _estado_cusum_vacio(self) -> dict[str, float | None]:
+        return {
+            "ewma": None,
+            "c_pos": 0.0,
+            "c_neg": 0.0,
+            "last_raw": 0.0,
+            "last_score": 0.0,
+            "last_residual": 0.0,
+        }
+
+    def construir_estado_cusum(
+        self,
+        serie: pd.DataFrame,
+        base: dict[str, Any],
+    ) -> dict[str, float | None]:
+        """Reconstruye el estado CUSUM para continuar el flujo incremental."""
+        estado = self._estado_cusum_vacio()
+        if serie.empty:
+            return estado
+        trabajo = serie.sort_values("timestamp_dt").copy()
+        trabajo["value"] = pd.to_numeric(trabajo["value"], errors="coerce")
+        trabajo = trabajo[
+            trabajo["value"].notna() & trabajo["timestamp_dt"].notna()
+        ]
+        timestamp_previo: pd.Timestamp | None = None
+        for fila in trabajo.to_dict("records"):
+            timestamp = pd.to_datetime(
+                fila.get("timestamp_dt"),
+                errors="coerce",
+                utc=True,
+            )
+            if pd.isna(timestamp):
+                continue
+            gap_seconds = (
+                0.0
+                if timestamp_previo is None
+                else max(0.0, (timestamp - timestamp_previo).total_seconds())
+            )
+            fila_base = {
+                **fila,
+                "timestamp": str(
+                    fila.get("timestamp") or timestamp.isoformat()
+                ),
+            }
+            base_fila = self._base_horaria(base, fila_base)
+            valor = float(fila["value"])
+            _, score_limite = self._score_fisico(
+                valor,
+                base_fila["perfil"],
+            )
+            dentro_banda = (
+                base_fila["normal_lower"]
+                <= valor
+                <= base_fila["normal_upper"]
+            )
+            estado, _, _, _ = self._actualizar_cusum(
+                valor=valor,
+                gap_seconds=gap_seconds,
+                base=base_fila,
+                dentro_banda=dentro_banda,
+                score_limite_operacional=score_limite,
+                estado=estado,
+            )
+            timestamp_previo = timestamp
+        return estado
+
+    def _actualizar_cusum(
+        self,
+        *,
+        valor: float,
+        gap_seconds: float,
+        base: dict[str, Any],
+        dentro_banda: bool,
+        score_limite_operacional: float,
+        estado: dict[str, float | None],
+    ) -> tuple[dict[str, float | None], float, float, float]:
+        ewma_anterior = estado.get("ewma")
+        c_pos = float(estado.get("c_pos") or 0.0)
+        c_neg = float(estado.get("c_neg") or 0.0)
+        if (
+            ewma_anterior is None
+            or gap_seconds > base["cusum_reset_gap_seconds"]
+        ):
+            ewma_anterior = valor
+            c_pos = 0.0
+            c_neg = 0.0
+
+        residual = valor - float(ewma_anterior)
+        z_residual = residual / (float(base["residual_scale"]) + 1e-9)
+        if dentro_banda and abs(z_residual) < 1.5:
+            c_pos = 0.0
+            c_neg = 0.0
+        else:
+            c_pos = max(
+                0.0,
+                c_pos + z_residual - float(base["cusum_k"]),
+            )
+            c_neg = max(
+                0.0,
+                c_neg - z_residual - float(base["cusum_k"]),
+            )
+        raw_c = max(c_pos, c_neg)
+        s_c = self._score_desde_ratio(
+            raw_c / max(float(base["cusum_theta"]), 1e-9)
+        )
+        if dentro_banda and score_limite_operacional <= 0.0:
+            s_c = 0.0
+
+        peso_pewma = self._peso_pewma(residual, base)
+        ewma = peso_pewma * valor + (1.0 - peso_pewma) * float(ewma_anterior)
+        nuevo_estado: dict[str, float | None] = {
+            "ewma": ewma,
+            "c_pos": c_pos,
+            "c_neg": c_neg,
+            "last_raw": raw_c,
+            "last_score": s_c,
+            "last_residual": residual,
+        }
+        return nuevo_estado, raw_c, s_c, residual
+
     def _score_hampel(self, fila: dict[str, Any], base: dict[str, Any]) -> tuple[float, float]:
         local_median = self._numero(fila.get("local_median"), base["median"])
         local_mad = max(self._numero(fila.get("local_mad"), base["mad"]), base["perfil"].value_floor)
@@ -427,7 +577,12 @@ class FiltroContinuoEstadistico:
             return 0.0, 0.0
         resumen = base["const_summary"]
         z_const = abs(duracion_segundos - resumen["median"]) / (resumen["scaled_mad"] + 1e-9)
-        score = max(self._score_desde_z(z_const), min(1.0, duracion_segundos / base["constant_alert_seconds"]))
+        score = max(
+            self._score_desde_z(z_const),
+            self._score_desde_ratio(
+                duracion_segundos / base["constant_alert_seconds"]
+            ),
+        )
         return z_const, score
 
     def _score_brecha_temporal(self, gap_seconds: float, base: dict[str, Any]) -> tuple[float, float]:
@@ -435,7 +590,10 @@ class FiltroContinuoEstadistico:
             return 0.0, 0.0
         resumen = base["gap_summary"]
         z_gap = abs(gap_seconds - resumen["median"]) / (resumen["scaled_mad"] + 1e-9)
-        score = max(self._score_desde_z(z_gap), min(1.0, gap_seconds / base["gap_alert_seconds"]))
+        score = max(
+            self._score_desde_z(z_gap),
+            self._score_desde_ratio(gap_seconds / base["gap_alert_seconds"]),
+        )
         return z_gap, score
 
     def _score_dspot_extremo(self, valor: float, base: dict[str, Any]) -> tuple[float, float]:
@@ -458,21 +616,92 @@ class FiltroContinuoEstadistico:
     def _score_desde_z(self, z_value: float) -> float:
         if not math.isfinite(z_value) or z_value <= self.zona_muerta_z:
             return 0.0
-        return max(0.0, min(1.0, (z_value - self.zona_muerta_z) / (self.umbral_z - self.zona_muerta_z)))
+        ratio = (
+            (z_value - self.zona_muerta_z)
+            / (self.ancla_activacion_z - self.zona_muerta_z)
+        )
+        return self._score_desde_ratio(ratio)
 
-    def _score_fisico(self, valor: float, perfil: PerfilContinuo) -> float:
+    def _score_desde_ratio(self, ratio_value: float) -> float:
+        """Curva logaritmica suave: ratio=1 produce evidencia 0.60."""
+        try:
+            ratio = float(ratio_value)
+        except (TypeError, ValueError):
+            return 0.0
+        if math.isnan(ratio) or ratio <= 0.0:
+            return 0.0
+        if math.isinf(ratio):
+            ratio = sys.float_info.max
+        log_exceso = math.log1p(ratio)
+        score = log_exceso / (log_exceso + self.lambda_log)
+        return max(0.0, min(math.nextafter(1.0, 0.0), score))
+
+    def _score_fisico(
+        self,
+        valor: float,
+        perfil: PerfilContinuo,
+    ) -> tuple[float, float]:
+        """Puntua limites operacionales, empiricos salvo edicion del usuario."""
+        ratios: list[float] = []
+        amplitud_extrema = max(
+            (
+                float(perfil.extreme_high) - float(perfil.extreme_low)
+                if perfil.extreme_low is not None
+                and perfil.extreme_high is not None
+                else 0.0
+            ),
+            perfil.value_floor,
+        )
         if perfil.extreme_low is not None and valor <= perfil.extreme_low:
-            return 1.0
+            referencia = (
+                perfil.physical_low
+                if perfil.physical_low is not None
+                and perfil.physical_low < perfil.extreme_low
+                else perfil.extreme_low - amplitud_extrema
+            )
+            escala = max(perfil.extreme_low - referencia, perfil.value_floor)
+            ratios.append(1.0 + (perfil.extreme_low - valor) / escala)
         if perfil.extreme_high is not None and valor >= perfil.extreme_high:
-            return 1.0
-        limite_bajo = perfil.physical_low if perfil.physical_low is not None else valor
-        limite_alto = perfil.physical_high if perfil.physical_high is not None else valor
-        amplitud = max(limite_alto - limite_bajo, perfil.value_floor)
-        if perfil.physical_low is not None and valor < perfil.physical_low:
-            return min(1.0, 0.75 + abs(valor - perfil.physical_low) / amplitud)
-        if perfil.physical_high is not None and valor > perfil.physical_high:
-            return min(1.0, 0.75 + abs(valor - perfil.physical_high) / amplitud)
-        return 0.0
+            referencia = (
+                perfil.physical_high
+                if perfil.physical_high is not None
+                and perfil.physical_high > perfil.extreme_high
+                else perfil.extreme_high + amplitud_extrema
+            )
+            escala = max(referencia - perfil.extreme_high, perfil.value_floor)
+            ratios.append(1.0 + (valor - perfil.extreme_high) / escala)
+
+        limite_bajo = (
+            perfil.physical_low
+            if perfil.physical_low is not None
+            else valor
+        )
+        limite_alto = (
+            perfil.physical_high
+            if perfil.physical_high is not None
+            else valor
+        )
+        amplitud_fisica = max(
+            limite_alto - limite_bajo,
+            amplitud_extrema,
+            perfil.value_floor,
+        )
+        if not ratios and perfil.physical_low is not None and valor < perfil.physical_low:
+            ratios.append(
+                1.0 + abs(valor - perfil.physical_low) / amplitud_fisica
+            )
+        if not ratios and perfil.physical_high is not None and valor > perfil.physical_high:
+            ratios.append(
+                1.0 + abs(valor - perfil.physical_high) / amplitud_fisica
+            )
+        if not ratios:
+            return 0.0, 0.0
+
+        ratio = max(ratios)
+        z_equivalente = self.zona_muerta_z + ratio * (
+            self.ancla_activacion_z - self.zona_muerta_z
+        )
+        return z_equivalente, self._score_desde_ratio(ratio)
 
     def _perfil_desde_historial(self, entity_id: str, valores: pd.Series, temporal: pd.DataFrame) -> PerfilContinuo:
         q25 = float(valores.quantile(0.25))
@@ -622,7 +851,11 @@ class FiltroContinuoEstadistico:
         with self.conf_path.open("w", encoding="utf-8") as archivo:
             self.config.write(archivo)
 
-    def _indicadores_activados(self, componentes: dict[str, float], raw_threshold: float) -> list[str]:
+    def _indicadores_activados(
+        self,
+        componentes: dict[str, float],
+        evidence_threshold: float,
+    ) -> list[str]:
         mapa = {
             "s_H": "hampel",
             "s_R": "robust_rate_change",
@@ -631,7 +864,11 @@ class FiltroContinuoEstadistico:
             "s_M": "reading_gap",
             "s_DSPOT": "dspot_extreme",
         }
-        return [indicador for clave, indicador in mapa.items() if componentes.get(clave, 0.0) >= raw_threshold]
+        return [
+            indicador
+            for clave, indicador in mapa.items()
+            if componentes.get(clave, 0.0) >= evidence_threshold
+        ]
 
     def _indicador_principal(self, componentes: dict[str, float], indicadores: list[str]) -> str:
         componente_por_indicador = {
@@ -653,6 +890,14 @@ class FiltroContinuoEstadistico:
             "reading_gap": "Z_M",
             "dspot_extreme": "Z_DSPOT",
         }
+        if indicador == "hampel":
+            return round(
+                max(
+                    float(raw_componentes.get("H_i", 0.0)),
+                    float(raw_componentes.get("Z_F_i", 0.0)),
+                ),
+                6,
+            )
         return round(float(raw_componentes.get(mapa[indicador], 0.0)), 6)
 
     def _agrupar_resultados(self, resultados: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -765,13 +1010,28 @@ class FiltroContinuoEstadistico:
             "cusum_theta": round(base["cusum_theta"], 6),
         }
 
-    def _score_a_probabilidad(self, raw_score: float) -> float:
-        raw = max(0.0, min(1.0, float(raw_score)))
-        return raw / (raw + self.tau_probabilidad) if raw > 0 else 0.0
+    def _evidencia_continua(
+        self,
+        componentes: dict[str, float],
+        indicadores: list[str],
+    ) -> float:
+        evidencia = max(componentes.values()) if componentes else 0.0
+        if indicadores == ["reading_gap"]:
+            evidencia = min(evidencia, 0.5)
+        return max(0.0, min(math.nextafter(1.0, 0.0), float(evidencia)))
 
-    def _probabilidad_a_raw(self, suspicion_threshold: float) -> float:
-        umbral = max(0.01, min(0.99, float(suspicion_threshold)))
-        return min(1.0, (umbral * self.tau_probabilidad) / (1.0 - umbral))
+    def _score_sospecha(self, evidence_score: float) -> float:
+        """Compatibilidad de esquema: el score es evidencia, no probabilidad."""
+        return max(
+            0.0,
+            min(math.nextafter(1.0, 0.0), float(evidence_score)),
+        )
+
+    def _umbral_evidencia(self, suspicion_threshold: float) -> float:
+        return max(
+            0.0,
+            min(math.nextafter(1.0, 0.0), float(suspicion_threshold)),
+        )
 
     def _severidad(self, suspicion_score: float) -> str:
         if suspicion_score >= 0.85:

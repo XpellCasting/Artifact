@@ -89,6 +89,10 @@ class ContextualFilterTests(unittest.TestCase):
 
         mapa = self.filtro.construir_mapa(eventos, entidades)
 
+        self.assertEqual(
+            mapa["implementation_sha256"],
+            self.filtro.implementation_sha256(),
+        )
         self.assertEqual(mapa["config"]["top_k"], 2)
         self.assertEqual(mapa["config"]["window_seconds"], 3600)
         self.assertEqual(mapa["config"]["min_observations"], 30)

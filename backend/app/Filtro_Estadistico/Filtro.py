@@ -73,6 +73,9 @@ class FiltroEstadistico:
             "pending_kinds": ["multistate"],
             "temporal_windows": ["local", "hour_of_day", "month_repetition"],
             "temporal_activation_threshold": self.umbral_activacion_lapsos,
+            "continuous_score_specification": (
+                self.continuos.especificacion_puntaje()
+            ),
         }
         return {
             **resumen,
@@ -98,6 +101,9 @@ class FiltroEstadistico:
             serie = serie[serie["value"].notna() & serie["timestamp_dt"].notna()].copy()
             base = self.continuos._construir_base_normalidad(serie, str(entity_id))
             if base:
+                base["realtime_cusum_state"] = (
+                    self.continuos.construir_estado_cusum(serie, base)
+                )
                 baseline["continuous"][str(entity_id)] = base
 
         for entity_id, grupo in trabajo[trabajo["sensor_kind"].eq("binary")].groupby("entity_id", sort=False):
@@ -170,6 +176,9 @@ class FiltroEstadistico:
             "pending_kinds": ["multistate"],
             "temporal_windows": ["local", "hour_of_day", "month_repetition"],
             "temporal_activation_threshold": self.umbral_activacion_lapsos,
+            "continuous_score_specification": (
+                self.continuos.especificacion_puntaje()
+            ),
             "incremental": True,
         }
         return {
@@ -194,6 +203,9 @@ class FiltroEstadistico:
             "first_detection_delay_seconds": None,
             "implemented_kinds": ["continuous", "binary"],
             "pending_kinds": ["multistate"],
+            "continuous_score_specification": (
+                self.continuos.especificacion_puntaje()
+            ),
             "incremental": True,
             "skipped_analysis": True,
         }
@@ -209,7 +221,9 @@ class FiltroEstadistico:
         nuevos = nuevos_eventos[nuevos_eventos.get("sensor_kind", "").eq("continuous")] if "sensor_kind" in nuevos_eventos else pd.DataFrame()
         if nuevos.empty:
             return []
-        raw_threshold = self.continuos._probabilidad_a_raw(suspicion_threshold)
+        evidence_threshold = self.continuos._umbral_evidencia(
+            suspicion_threshold
+        )
         resultados: list[dict[str, Any]] = []
         bases = baseline.get("continuous", {})
         for entity_id, filas_nuevas in nuevos.groupby("entity_id", sort=False):
@@ -219,6 +233,10 @@ class FiltroEstadistico:
             grupo = eventos[eventos["entity_id"].eq(entity_id)].sort_values("timestamp_dt").copy()
             grupo["value"] = pd.to_numeric(grupo["value"], errors="coerce")
             grupo = grupo[grupo["value"].notna() & grupo["timestamp_dt"].notna()]
+            estado_cusum = dict(
+                base.get("realtime_cusum_state")
+                or self.continuos._estado_cusum_vacio()
+            )
             for fila in filas_nuevas.sort_values("timestamp_dt").to_dict("records"):
                 timestamp = pd.to_datetime(fila.get("timestamp_dt"), errors="coerce", utc=True)
                 if pd.isna(timestamp):
@@ -240,22 +258,33 @@ class FiltroEstadistico:
                     "local_mad": local_mad,
                 }
                 base_fila = self.continuos._base_horaria(base, fila_score)
-                fisico = self.continuos._score_fisico(valor, base_fila["perfil"])
+                raw_fisico, s_fisico = self.continuos._score_fisico(
+                    valor,
+                    base_fila["perfil"],
+                )
                 dentro_banda = base_fila["normal_lower"] <= valor <= base_fila["normal_upper"]
                 raw_h, s_h = self.continuos._score_hampel(fila_score, base_fila)
                 raw_r, s_r = self.continuos._score_tasa_robusta(rate_per_minute, base_fila)
                 raw_m, s_m = self.continuos._score_brecha_temporal(gap_seconds, base_fila)
                 raw_dspot, s_dspot = self.continuos._score_dspot_extremo(valor, base_fila)
-                residual = valor - float(base_fila["median"])
-                raw_c = abs(residual) / (float(base_fila["residual_scale"]) + 1e-9)
-                s_c = 0.0 if dentro_banda else self.continuos._score_desde_z(raw_c)
-                if dentro_banda and fisico <= 0 and abs(delta_value) < base_fila["normal_delta_for_rate"]:
+                estado_cusum, raw_c, s_c, residual = (
+                    self.continuos._actualizar_cusum(
+                        valor=valor,
+                        gap_seconds=gap_seconds,
+                        base=base_fila,
+                        dentro_banda=dentro_banda,
+                        score_limite_operacional=s_fisico,
+                        estado=estado_cusum,
+                    )
+                )
+                if dentro_banda and s_fisico <= 0 and abs(delta_value) < base_fila["normal_delta_for_rate"]:
                     s_r = 0.0
-                if dentro_banda and fisico <= 0 and s_r <= 0.0 and s_dspot <= 0.0:
+                if dentro_banda and s_fisico <= 0 and s_r <= 0.0 and s_dspot <= 0.0:
                     s_h = 0.0
-                if fisico > s_h:
-                    raw_h = max(raw_h, fisico * self.continuos.umbral_z)
-                    s_h = fisico
+                fuente_h = "hampel"
+                if s_fisico > s_h:
+                    s_h = s_fisico
+                    fuente_h = "operational_limit"
                 componentes = {
                     "s_H": round(s_h, 6),
                     "s_R": round(s_r, 6),
@@ -271,10 +300,19 @@ class FiltroEstadistico:
                     "Z_D_const": 0.0,
                     "Z_M": round(raw_m, 6),
                     "Z_DSPOT": round(raw_dspot, 6),
+                    "Z_F_i": round(raw_fisico, 6),
                 }
-                indicadores = self.continuos._indicadores_activados(componentes, raw_threshold)
-                evidence_score = max(componentes.values()) if componentes else 0.0
-                suspicion_score = self.continuos._score_a_probabilidad(evidence_score)
+                indicadores = self.continuos._indicadores_activados(
+                    componentes,
+                    evidence_threshold,
+                )
+                evidence_score = self.continuos._evidencia_continua(
+                    componentes,
+                    indicadores,
+                )
+                suspicion_score = self.continuos._score_sospecha(
+                    evidence_score
+                )
                 if indicadores and suspicion_score >= suspicion_threshold:
                     indicador_principal = self.continuos._indicador_principal(componentes, indicadores)
                     patron = INDICADORES_CONTINUOS[indicador_principal]
@@ -291,6 +329,8 @@ class FiltroEstadistico:
                             "raw_score": self.continuos._raw_dominante(raw_componentes, indicador_principal),
                             "evidence_score": round(evidence_score, 6),
                             "suspicion_score": round(suspicion_score, 6),
+                            "score_version": self.continuos.SCORE_VERSION,
+                            "score_kind": self.continuos.SCORE_KIND,
                             "is_suspicious": True,
                             "pattern": patron,
                             "suspected_pattern": patron,
@@ -307,12 +347,15 @@ class FiltroEstadistico:
                                 "residual": round(residual, 6),
                                 "components": componentes,
                                 "raw_components": raw_componentes,
+                                "component_sources": {"s_H": fuente_h},
+                                "operational_limit_score": round(s_fisico, 6),
                             },
                             "baseline_summary": self.continuos._resumen_base_para_salida(base_fila),
                             "ground_truth_label": None,
                             "severity": self.continuos._severidad(suspicion_score),
                         }
                     )
+            base["realtime_cusum_state"] = estado_cusum
         return resultados
 
     def _analizar_binarios_realtime(
@@ -582,15 +625,15 @@ class FiltroEstadistico:
             base = continuos[clave]
             valor = float(resultado.get("value") or 0.0)
             z = abs(valor - base["median"]) / (base["scaled_mad"] + 1e-9)
-            return self._score_desde_z(z)
+            return self.continuos._score_desde_z(z)
         if resultado.get("sensor_kind") == "binary" and clave in binarios:
             base = binarios[clave]
             ratio = float((resultado.get("reading") or {}).get("active_ratio") or resultado.get("value") or 0.0)
             z = abs(ratio - base["mean"]) / (base["std"] + 1e-9)
-            return self._score_desde_z(z)
+            return self._score_contexto_binario_desde_z(z)
         return 0.0
 
-    def _score_desde_z(self, z_value: float) -> float:
+    def _score_contexto_binario_desde_z(self, z_value: float) -> float:
         if z_value <= 2.5:
             return 0.0
         return max(0.0, min(1.0, (z_value - 2.5) / 1.0))
