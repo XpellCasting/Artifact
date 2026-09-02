@@ -4,17 +4,18 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
+  Clock3,
   Download,
-  Droplets,
   X,
   Database,
   Eye,
   FlaskConical,
   Loader2,
+  Pause,
   Play,
-  Power,
   RotateCcw,
-  Thermometer,
+  SkipForward,
+  Upload,
   Zap,
 } from "lucide-react";
 import { downloadCsv } from "./csv.js";
@@ -23,9 +24,6 @@ import "./styles.css";
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 const RED_SUSPICION_SCORE = 0.60;
 const MARKER_GROUP_GAP_MS = 15 * 60 * 1000;
-
-const CONTINUOUS_FAULT_TYPES = ["random", "malfunction", "bias", "drift", "missing"];
-const BINARY_FAULT_TYPES = ["random", "malfunction", "bias", "missing"];
 
 const EQUATIONS = [
   {
@@ -124,7 +122,43 @@ const STATE_EQUATIONS = [
   },
 ];
 
-const ALL_EQUATIONS = [...EQUATIONS, ...STATE_EQUATIONS];
+const MULTISTATE_EQUATIONS = [
+  {
+    id: "state_change_count",
+    title: "Cambios multivalor",
+    pattern: "transition_burst",
+    equation: "C_i(W) = sum 1[s_i(t_j-1) != s_i(t_j)]",
+    score: "s_C = min(1, Z_C / tau_C)",
+  },
+  {
+    id: "state_probability",
+    title: "Rareza del estado",
+    pattern: "rare_state",
+    equation: "P(s) = frecuencia historica del estado observado",
+    score: "s_estado = max(0, (p_min - P(s)) / p_min)",
+  },
+  {
+    id: "transition_probability",
+    title: "Rareza de la transicion",
+    pattern: "rare_transition",
+    equation: "P(s_j|s_i) = N(s_i -> s_j) / N(s_i -> *)",
+    score: "s_trans = max(0, (p_min - P(s_j|s_i)) / p_min)",
+  },
+  {
+    id: "state_duration",
+    title: "Persistencia del estado",
+    pattern: "state_persistence",
+    equation: "D_s(t) = t - instante del ultimo cambio de estado",
+    score: "s_D = min(1, Z_D / tau_D)",
+  },
+  {
+    id: "report_gap",
+    title: "Brecha multivalor",
+    pattern: "missing_gap",
+    equation: "M_i(t) = t - t_i_last",
+    score: "s_M = min(1, Z_M / tau_M)",
+  },
+];
 
 async function api(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -138,6 +172,70 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+function startHistoryUpload(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", `${API_BASE_URL}/history/real/upload/start`);
+    request.setRequestHeader("Content-Type", "text/csv");
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress(event.loaded, event.total);
+      }
+    };
+    request.onerror = () => reject(new Error("No se pudo conectar con la API para subir el historico."));
+    request.onload = () => {
+      const payload = (() => {
+        try {
+          return JSON.parse(request.responseText || "{}");
+        } catch {
+          return {};
+        }
+      })();
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(payload.detail || `HTTP ${request.status}`));
+        return;
+      }
+      resolve(payload);
+    };
+    request.send(file);
+  });
+}
+
+function startValidationUpload(file, onProgress, onProcessing) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", `${API_BASE_URL}/validation/replay/upload`);
+    request.setRequestHeader("Content-Type", "text/csv");
+    request.setRequestHeader("X-Filename", encodeURIComponent(file.name));
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress(event.loaded, event.total);
+      }
+    };
+    request.upload.onload = () => onProcessing?.();
+    request.onerror = () => reject(new Error("No se pudo conectar con la API para subir Evaluacion."));
+    request.onload = () => {
+      const payload = (() => {
+        try {
+          return JSON.parse(request.responseText || "{}");
+        } catch {
+          return {};
+        }
+      })();
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(payload.detail || `HTTP ${request.status}`));
+        return;
+      }
+      resolve(payload);
+    };
+    request.send(file);
+  });
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 function downloadResultsCsv(results) {
   downloadCsv([
     ["Entidad", "Tiempo mayor-menor", "Score", "Raw", "Lectura", "Patron", "Indicadores", "Ecuacion"],
@@ -149,7 +247,7 @@ function downloadResultsCsv(results) {
       formatReading(result),
       [result.suspected_pattern || result.pattern || "-", timeWindowLabel(result.time_window)].filter(Boolean).join(" / "),
       (result.triggered_indicators || []).join(", ") || "-",
-      equationNames(result.triggered_indicators),
+      equationNames(result.triggered_indicators, result.sensor_kind),
     ]),
   ], "resultados_filtro_estadistico.csv");
 }
@@ -158,29 +256,20 @@ function App() {
   const [health, setHealth] = useState(null);
   const [historyStatus, setHistoryStatus] = useState(null);
   const [entities, setEntities] = useState([]);
-  const [selectedEntityIds, setSelectedEntityIds] = useState([]);
-  const [faults, setFaults] = useState([]);
   const [timelines, setTimelines] = useState([]);
   const [historicalResults, setHistoricalResults] = useState([]);
-  const [realtime, setRealtime] = useState(null);
   const [runSummary, setRunSummary] = useState(null);
-  const [tickSeconds, setTickSeconds] = useState(60);
-  const [iterationCount, setIterationCount] = useState(10);
-  const [iterationsDone, setIterationsDone] = useState(0);
   const [suspicionThreshold, setSuspicionThreshold] = useState(RED_SUSPICION_SCORE);
   const [chartStart, setChartStart] = useState("");
   const [chartEnd, setChartEnd] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const [isIterating, setIsIterating] = useState(false);
+  const [historyLoad, setHistoryLoad] = useState(null);
   const [selectedResult, setSelectedResult] = useState(null);
   const [normalizationPreview, setNormalizationPreview] = useState(null);
   const [activeModule, setActiveModule] = useState("estadistico");
   const [resultEntityFilterIds, setResultEntityFilterIds] = useState(null);
   const [continuousConfig, setContinuousConfig] = useState([]);
-  const [manualStates, setManualStates] = useState({});
-  const [isManualRunning, setIsManualRunning] = useState(false);
-  const [manualTickSeconds, setManualTickSeconds] = useState(3600);
   const [contextMap, setContextMap] = useState(null);
   const [contextResults, setContextResults] = useState([]);
   const [contextSummary, setContextSummary] = useState(null);
@@ -190,8 +279,10 @@ function App() {
   const [classifierEvaluation, setClassifierEvaluation] = useState(null);
   const [classifierSpecification, setClassifierSpecification] = useState(null);
   const [classifierError, setClassifierError] = useState("");
-  const isSimulatorRoute = window.location.pathname.startsWith("/simulador");
-
+  const [validationReplay, setValidationReplay] = useState(null);
+  const [validationUpload, setValidationUpload] = useState(null);
+  const [validationAutoRunning, setValidationAutoRunning] = useState(false);
+  const [validationBatchSize, setValidationBatchSize] = useState(1000);
   const continuousEntities = useMemo(
     () => entities.filter((entity) => entity.sensor_kind === "continuous"),
     [entities],
@@ -203,34 +294,14 @@ function App() {
   );
 
   const analyzableEntities = useMemo(
-    () => entities.filter((entity) => ["continuous", "binary"].includes(entity.sensor_kind)),
+    () => entities.filter((entity) => ["continuous", "binary", "multistate"].includes(entity.sensor_kind)),
     [entities],
   );
 
-  const selectedAnalyzable = useMemo(
-    () => selectedEntityIds.filter((entityId) => analyzableEntities.some((entity) => entity.entity_id === entityId)),
-    [selectedEntityIds, analyzableEntities],
-  );
-
-  const temperatureEntities = useMemo(
-    () => continuousEntities.filter(isTemperatureEntity),
-    [continuousEntities],
-  );
-
-  const humidityEntities = useMemo(
-    () => continuousEntities.filter(isHumidityEntity),
-    [continuousEntities],
-  );
-
-  const manualEntities = useMemo(
-    () => [...temperatureEntities, ...humidityEntities, ...binaryEntities],
-    [temperatureEntities, humidityEntities, binaryEntities],
-  );
-
   const allAnalyzedResults = useMemo(() => {
-    return [...historicalResults, ...(realtime?.results || [])]
-      .filter((result) => ["continuous", "binary"].includes(result.sensor_kind));
-  }, [historicalResults, realtime]);
+    return historicalResults
+      .filter((result) => ["continuous", "binary", "multistate"].includes(result.sensor_kind));
+  }, [historicalResults]);
 
   const resultEntityOptions = useMemo(() => {
     return [...new Set(allAnalyzedResults.map((result) => result.entity_id).filter(Boolean))]
@@ -252,47 +323,51 @@ function App() {
   }, [filteredAnalyzedResults]);
 
   const suspiciousCount = allAnalyzedResults.filter(isRedSuspicion).length;
-  const activeFaults = faults.filter((fault) => fault.enabled && selectedAnalyzable.includes(fault.entity_id));
 
   useEffect(() => {
     runStep("init", async () => {
       setHealth(await api("/health"));
-      const status = await api("/history/static/status");
-      applyHistoryStatus(status, { keepSelection: false });
+      const status = await api("/history/static/status?autoload=false");
+      applyHistoryStatus(status);
+      applyValidationPipeline(await api("/validation/replay/status"));
     });
   }, []);
 
   useEffect(() => {
-    setManualStates((current) => syncManualStates(manualEntities, current));
-  }, [manualEntities]);
-
-  useEffect(() => {
-    if (!isManualRunning) {
-      return undefined;
-    }
-    const interval = window.setInterval(() => {
-      sendManualPulse({ quiet: true });
-    }, 1000);
-    return () => window.clearInterval(interval);
-  }, [isManualRunning, manualStates, manualTickSeconds, suspicionThreshold, historyStatus, entities]);
-
-  useEffect(() => {
-    if (isSimulatorRoute && historyStatus?.exists && manualEntities.length && !timelines.length) {
-      loadTimeline("", "");
-    }
-  }, [isSimulatorRoute, historyStatus?.exists, manualEntities.length, timelines.length]);
-
-  useEffect(() => {
-    if (!isSimulatorRoute && activeModule === "contextual") {
+    if (activeModule === "contextual") {
       loadContextualData();
     }
-  }, [activeModule, isSimulatorRoute]);
+  }, [activeModule]);
 
   useEffect(() => {
-    if (!isSimulatorRoute && activeModule === "clasificador") {
+    if (activeModule === "clasificador") {
       loadClassifierData();
     }
-  }, [activeModule, isSimulatorRoute]);
+  }, [activeModule]);
+
+  useEffect(() => {
+    if (
+      !validationAutoRunning
+      || Boolean(busy)
+      || validationReplay?.status === "completed"
+    ) {
+      return undefined;
+    }
+    const timer = window.setTimeout(async () => {
+      const payload = await advanceValidationReplay();
+      if (!payload || payload.status === "completed") {
+        setValidationAutoRunning(false);
+      }
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [
+    validationAutoRunning,
+    validationReplay?.cursor,
+    validationReplay?.status,
+    validationBatchSize,
+    suspicionThreshold,
+    busy,
+  ]);
 
   async function runStep(label, action) {
     setBusy(label);
@@ -307,15 +382,10 @@ function App() {
     }
   }
 
-  function applyHistoryStatus(status, { keepSelection = false } = {}) {
+  function applyHistoryStatus(status) {
     setHistoryStatus(status);
     const nextEntities = status?.entities || [];
     setEntities(nextEntities);
-    const nextAnalyzable = nextEntities.filter((entity) => ["continuous", "binary"].includes(entity.sensor_kind));
-    if (!keepSelection) {
-      setSelectedEntityIds(nextAnalyzable.map((entity) => entity.entity_id));
-    }
-    setFaults((current) => syncFaultRows(nextAnalyzable, current));
   }
 
   function clearContextualData({ keepMap = false } = {}) {
@@ -401,32 +471,12 @@ function App() {
     }
   }
 
-  async function loadStaticHistory() {
-    await runStep("static-history", async () => {
-      const status = await api("/history/static/ensure", { method: "POST" });
-      applyHistoryStatus(status);
-      setHistoricalResults([]);
-      setContinuousConfig([]);
-      setRealtime(null);
-      clearContextualData();
-      setChartStart("");
-      setChartEnd("");
-      await loadTimeline("", "");
-    });
-  }
-
   async function loadRealHistory() {
     await runStep("real-history", async () => {
-      const status = await api("/history/real/load", { method: "POST" });
-      applyHistoryStatus(status);
-      setHistoricalResults([]);
-      setContinuousConfig([]);
-      setRunSummary(null);
-      setRealtime(null);
-      clearContextualData();
-      setChartStart("");
-      setChartEnd("");
-      await loadTimeline("", "");
+      setHistoryLoad(null);
+      const job = await api("/history/real/load/start", { method: "POST" });
+      const completed = await monitorHistoryLoad(job);
+      await finishHistoryLoad(completed);
     });
   }
 
@@ -436,22 +486,78 @@ function App() {
       return;
     }
     await runStep("real-upload", async () => {
-      const status = await api("/history/real/upload", {
-        method: "POST",
-        headers: { "Content-Type": "text/csv" },
-        body: await file.arrayBuffer(),
+      setHistoryLoad({
+        status: "uploading",
+        phase: "uploading",
+        progress: 0,
+        message: `Subiendo ${file.name}`,
+        file_size_bytes: file.size,
       });
-      applyHistoryStatus(status);
-      setHistoricalResults([]);
-      setContinuousConfig([]);
-      setRunSummary(null);
-      setRealtime(null);
-      clearContextualData();
-      setChartStart("");
-      setChartEnd("");
-      await loadTimeline("", "");
+      const job = await startHistoryUpload(file, (loaded, total) => {
+        setHistoryLoad({
+          status: "uploading",
+          phase: "uploading",
+          progress: Math.min(8, (loaded / Math.max(1, total)) * 8),
+          message: `Subiendo ${file.name}`,
+          file_size_bytes: total,
+          uploaded_bytes: loaded,
+        });
+      });
+      const completed = await monitorHistoryLoad(job, { uploadOffset: true });
+      await finishHistoryLoad(completed);
     });
     event.target.value = "";
+  }
+
+  async function monitorHistoryLoad(initialJob, { uploadOffset = false } = {}) {
+    let current = initialJob;
+    while (true) {
+      const displayed = uploadOffset
+        ? { ...current, progress: 8 + Math.min(91, Number(current.progress || 0) * 0.91) }
+        : current;
+      if (current.status === "failed") {
+        setHistoryLoad(displayed);
+        throw new Error(current.error || current.message || "La carga del historico fallo.");
+      }
+      if (current.status === "completed") {
+        return displayed;
+      }
+      setHistoryLoad(displayed);
+      await wait(750);
+      current = await api(`/history/real/load/jobs/${current.job_id}`);
+    }
+  }
+
+  async function finishHistoryLoad(completedJob) {
+    const status = completedJob.history;
+    if (!status?.exists) {
+      throw new Error("La API finalizo la carga sin entregar un historico valido.");
+    }
+    applyHistoryStatus(status);
+    setHistoricalResults([]);
+    setValidationReplay(null);
+    setValidationUpload(null);
+    setValidationAutoRunning(false);
+    setContinuousConfig([]);
+    setRunSummary(null);
+    clearContextualData();
+    setChartStart("");
+    setChartEnd("");
+    setHistoryLoad({
+      ...completedJob,
+      status: "running",
+      phase: "building_timeline",
+      progress: 99,
+      message: "Preparando la vista temporal",
+    });
+    await loadTimeline("", "");
+    setHistoryLoad({
+      ...completedJob,
+      status: "completed",
+      phase: "ready",
+      progress: 100,
+      message: "Historico listo para utilizar",
+    });
   }
 
   async function analyzeHistory() {
@@ -460,7 +566,7 @@ function App() {
         method: "POST",
         body: JSON.stringify({ suspicion_threshold: suspicionThreshold }),
       });
-      setHistoricalResults((payload.results || []).filter((result) => ["continuous", "binary"].includes(result.sensor_kind)));
+      setHistoricalResults((payload.results || []).filter((result) => ["continuous", "binary", "multistate"].includes(result.sensor_kind)));
       setRunSummary(payload.summary || {});
       applyContextualPayload(payload);
       applyClassifierPayload(payload, { replaceResults: true, source: "historical" });
@@ -602,113 +708,15 @@ function App() {
     );
   }
 
-  async function resetRealtime() {
-    await runStep("reset", async () => {
-      const payload = await api("/realtime/reset", { method: "POST" });
-      setRealtime(payload);
-      setRunSummary(null);
-      setIterationsDone(0);
-      clearClassifierData();
-      await loadTimeline(chartStart, chartEnd);
-    });
-  }
-
-  async function generateOneTick({ quiet = false } = {}) {
-    const action = async () => {
-      if (!historyStatus?.exists || historyStatus?.valid === false) {
-        const status = await api("/history/static/ensure", { method: "POST" });
-        applyHistoryStatus(status, { keepSelection: true });
-      }
-      const payload = await api("/realtime/tick", {
-        method: "POST",
-        body: JSON.stringify({
-          selected_entities: selectedAnalyzable,
-          tick_seconds: tickSeconds,
-          faults: faults.map((fault) => ({
-            ...fault,
-            enabled: fault.enabled && selectedAnalyzable.includes(fault.entity_id),
-          })),
-          suspicion_threshold: suspicionThreshold,
-        }),
-      });
-      setRealtime(payload);
-      setRunSummary(payload.summary || {});
-      applyContextualPayload(payload);
-      applyClassifierPayload(payload, { source: "realtime" });
-      await loadTimeline(chartStart, chartEnd);
-      return payload;
-    };
-    if (quiet) {
-      return action();
-    }
-    return runStep("tick", action);
-  }
-
-  async function runIterations() {
-    if (!selectedAnalyzable.length) {
-      setError("Selecciona al menos una entidad continua o binaria para generar iteraciones.");
-      return;
-    }
-    setIsIterating(true);
-    setBusy("iterations");
-    setError("");
-    setIterationsDone(0);
-    try {
-      const target = Math.max(1, Number(iterationCount) || 1);
-      const payload = await api("/realtime/iterations", {
-        method: "POST",
-        body: JSON.stringify({
-          selected_entities: selectedAnalyzable,
-          tick_seconds: tickSeconds,
-          iteration_count: target,
-          faults: faults.map((fault) => ({
-            ...fault,
-            enabled: fault.enabled && selectedAnalyzable.includes(fault.entity_id),
-          })),
-          suspicion_threshold: suspicionThreshold,
-        }),
-      });
-      setRealtime(payload);
-      setRunSummary(payload.summary || {});
-      applyContextualPayload(payload);
-      applyClassifierPayload(payload, { source: "realtime" });
-      setIterationsDone(payload.summary?.iterations_done || target);
-      await loadTimeline(chartStart, chartEnd);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setIsIterating(false);
-      setBusy("");
-    }
-  }
-
   async function loadTimeline(startValue = chartStart, endValue = chartEnd) {
-    const payload = await api(`/realtime/timeline${timelineQueryString(startValue, endValue)}`);
-    const nextTimelines = (payload.entities || []).filter((timeline) => ["continuous", "binary"].includes(timeline.sensor_kind));
+    const payload = await api(`/history/timeline${timelineQueryString(startValue, endValue)}`);
+    const nextTimelines = (payload.entities || []).filter((timeline) => ["continuous", "binary", "multistate"].includes(timeline.sensor_kind));
     setTimelines(nextTimelines);
     if (!startValue || !endValue) {
       const range = timelineDateRange(nextTimelines);
       setChartStart(range.start);
       setChartEnd(range.end);
     }
-  }
-
-  function toggleEntity(entityId) {
-    setSelectedEntityIds((current) =>
-      current.includes(entityId)
-        ? current.filter((item) => item !== entityId)
-        : [...current, entityId],
-    );
-  }
-
-  function updateFault(entityId, patch) {
-    setFaults((current) =>
-      current.map((fault) => (fault.entity_id === entityId ? { ...fault, ...patch } : fault)),
-    );
-  }
-
-  function clearFaults() {
-    setFaults((current) => current.map((fault) => ({ ...fault, enabled: false })));
   }
 
   function toggleResultEntityFilter(entityId) {
@@ -723,189 +731,96 @@ function App() {
     });
   }
 
-  function updateManualState(entityId, value) {
-    setManualStates((current) => ({ ...current, [entityId]: value }));
+  function applyValidationPipeline(payload) {
+    setValidationReplay(payload);
+    if (!payload?.loaded) {
+      return;
+    }
+    setHistoricalResults(payload.results || []);
+    setContextResults(payload.contextual_results || []);
+    setContextSummary(payload.contextual_summary || null);
+    setClassifierResults(payload.classification_results || []);
+    setClassifierSummary(payload.classification_summary || null);
+    if (payload.last_batch) {
+      setRunSummary({
+        elapsed_ms: payload.last_batch.processing_elapsed_ms,
+        timings_by_kind_ms: payload.last_batch.timings_by_kind_ms || {},
+        cache_hit: false,
+        source: "evaluation_replay",
+      });
+    }
   }
 
-  async function sendManualPulse({ quiet = false } = {}) {
-    const action = async () => {
-      let sourceEntities = entities;
-      if (!historyStatus?.exists || historyStatus?.valid === false) {
-        const status = await api("/history/static/ensure", { method: "POST" });
-        applyHistoryStatus(status, { keepSelection: true });
-        sourceEntities = status.entities || [];
-      }
-      const controllable = controlledEntities(sourceEntities);
-      if (!controllable.length) {
-        throw new Error("No hay sensores de temperatura, humedad o binarios para simular.");
-      }
-      const states = syncManualStates(controllable, manualStates);
-      setManualStates(states);
-      const payload = await api("/manual/tick", {
+  async function uploadValidationHistory(event) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    setValidationAutoRunning(false);
+    const completedUpload = await runStep("validation-upload", async () => {
+      setValidationUpload({
+        status: "uploading",
+        progress: 0,
+        message: `Subiendo ${file.name}`,
+        file_size_bytes: file.size,
+      });
+      const payload = await startValidationUpload(
+        file,
+        (loaded, total) => setValidationUpload({
+          status: "uploading",
+          progress: Math.min(90, (loaded / Math.max(total, 1)) * 90),
+          message: `Subiendo ${file.name}`,
+          file_size_bytes: total,
+          uploaded_bytes: loaded,
+        }),
+        () => setValidationUpload({
+          status: "processing",
+          progress: 94,
+          message: "Archivo recibido; validando y ordenando eventos de Evaluacion",
+          file_size_bytes: file.size,
+          uploaded_bytes: file.size,
+        }),
+      );
+      applyValidationPipeline(payload);
+      setValidationUpload({
+        status: "completed",
+        progress: 100,
+        message: "Evaluacion lista para reproducir",
+        file_size_bytes: file.size,
+      });
+      return payload;
+    });
+    if (!completedUpload) {
+      setValidationUpload((current) => ({
+        ...(current || {}),
+        status: "failed",
+        message: "No se pudo cargar el CSV de Evaluacion",
+      }));
+    }
+    event.target.value = "";
+  }
+
+  async function advanceValidationReplay() {
+    return runStep("validation-advance", async () => {
+      const payload = await api("/validation/replay/advance", {
         method: "POST",
         body: JSON.stringify({
-          selected_entities: controllable.map((entity) => entity.entity_id),
-          sensor_states: Object.fromEntries(controllable.map((entity) => [entity.entity_id, states[entity.entity_id]])),
-          tick_seconds: manualTickSeconds,
+          batch_size: validationBatchSize,
           suspicion_threshold: suspicionThreshold,
         }),
       });
-      setRealtime(payload);
-      setRunSummary(payload.summary || {});
-      applyContextualPayload(payload);
-      applyClassifierPayload(payload, { source: "realtime" });
-      await loadTimeline("", "");
+      applyValidationPipeline(payload);
       return payload;
-    };
-    if (quiet) {
-      try {
-        return await action();
-      } catch (err) {
-        setError(err.message);
-        setIsManualRunning(false);
-        return null;
-      }
-    }
-    return runStep("manual-pulse", action);
+    });
   }
 
-  if (isSimulatorRoute) {
-    return (
-      <main className="app-shell">
-        <header className="app-header">
-          <div>
-            <span className="eyebrow">Simulador Home Assistant</span>
-            <h1>Sensores detectados enviando senales al filtro estadistico</h1>
-            <p>
-              Ajusta temperatura, humedad y sensores binarios. El envio respeta la cadencia historica estimada por entidad.
-            </p>
-          </div>
-          <div className="header-actions">
-            <a className="secondary-action" href="/" target="_blank" rel="noreferrer">Abrir filtro</a>
-            <button className="primary-action" onClick={() => sendManualPulse()} disabled={Boolean(busy) || !manualEntities.length}>
-              {busy === "manual-pulse" ? <Loader2 className="spin" size={18} /> : <Zap size={18} />}
-              Enviar pulso
-            </button>
-            <button
-              className="secondary-action"
-              onClick={() => setIsManualRunning((running) => !running)}
-              disabled={!manualEntities.length}
-            >
-              {isManualRunning ? <RotateCcw size={18} /> : <Play size={18} />}
-              {isManualRunning ? "Pausar" : "Iniciar envio"}
-            </button>
-          </div>
-        </header>
-
-        {error && (
-          <section className="alert">
-            <AlertTriangle size={18} />
-            <span>{error}</span>
-          </section>
-        )}
-
-        <section className="metric-grid simulator-metrics">
-          <Metric icon={<Database />} label="Historico" value={formatCount(historyStatus?.rows)} detail={formatHistoryRange(historyStatus)} />
-          <Metric icon={<Thermometer />} label="Temperatura" value={temperatureEntities.length} detail="sensores continuos" />
-          <Metric icon={<Droplets />} label="Humedad" value={humidityEntities.length} detail="sensores continuos" />
-          <Metric icon={<Power />} label="Binarios" value={binaryEntities.length} detail="sensores de estado" />
-          <Metric icon={<Zap />} label="Realtime" value={formatCount(realtime?.events)} detail={`${realtime?.tick_index || 0} pulsos`} />
-          <Metric icon={<BarChart3 />} label="Sospechas" value={suspiciousCount} detail={`rojo score >= ${RED_SUSPICION_SCORE.toFixed(2)}`} />
-        </section>
-
-        <section className="workspace-grid simulator-grid">
-          <Panel title="Controles manuales">
-            <div className="control-grid simulator-controls">
-              <label>
-                Segundos por pulso simulado
-                <input type="number" min="10" step="10" value={manualTickSeconds} onChange={(event) => setManualTickSeconds(Number(event.target.value))} />
-              </label>
-              <label>
-                Umbral sospecha: {Math.round(suspicionThreshold * 100)}%
-                <input
-                  type="range"
-                  min="1"
-                  max="99"
-                  value={Math.round(suspicionThreshold * 100)}
-                  onChange={(event) => setSuspicionThreshold(Number(event.target.value) / 100)}
-                />
-              </label>
-            </div>
-            <div className="button-row">
-              <StepButton id="static-history" busy={busy} onClick={loadStaticHistory} icon={<Database size={17} />} label="Crear/cargar historico" />
-              <button className="secondary-action inline" onClick={resetRealtime} disabled={Boolean(busy)}>
-                <RotateCcw size={17} />
-                Reset realtime
-              </button>
-            </div>
-            <ManualControlGroup
-              title="Temperatura"
-              icon={<Thermometer size={17} />}
-              entities={temperatureEntities}
-              states={manualStates}
-              step={0.5}
-              unit="C"
-              onChange={updateManualState}
-            />
-            <ManualControlGroup
-              title="Humedad"
-              icon={<Droplets size={17} />}
-              entities={humidityEntities}
-              states={manualStates}
-              step={1}
-              unit="%"
-              onChange={updateManualState}
-            />
-            <ManualBinaryGroup entities={binaryEntities} states={manualStates} onChange={updateManualState} />
-          </Panel>
-
-          <Panel title="Resultados realtime">
-            <div className="summary-strip">
-              <SummaryRow label="Insertadas ultimo pulso" value={runSummary?.manual_inserted ?? "-"} />
-              <SummaryRow label="Omitidas por cadencia" value={runSummary?.manual_skipped_by_cadence ?? "-"} />
-              <SummaryRow label="Tiempo total filtro" value={formatElapsed(runSummary?.elapsed_ms)} />
-              <SummaryRow label="Sospechas visibles" value={formatCount(displayResults.length)} />
-              <button className="secondary-action inline" onClick={() => downloadResultsCsv(displayResults)} disabled={!displayResults.length}>
-                <Download size={17} />
-                Descargar tabla en CSV
-              </button>
-            </div>
-            <ResultsTable results={displayResults} onResultClick={setSelectedResult} />
-          </Panel>
-        </section>
-
-        <section className="charts-panel">
-          <div className="section-heading">
-            <div>
-              <h2>Charts en tiempo real</h2>
-              <span>{timelines.length} entidades graficadas</span>
-            </div>
-            <button type="button" className="secondary-action inline" onClick={() => loadTimeline()} disabled={Boolean(busy)}>
-              Actualizar charts
-            </button>
-          </div>
-          <div className="chart-grid">
-            {timelines.map((timeline) => (
-              <TimelineChart
-                key={timeline.entity_id}
-                timeline={timeline}
-                results={allAnalyzedResults}
-                faults={realtime?.faults || []}
-                onResultClick={setSelectedResult}
-              />
-            ))}
-            {!timelines.length && <Empty text="Carga un historico y envia un pulso para ver los charts." />}
-          </div>
-        </section>
-
-        {selectedResult && (
-          <CalculationModal
-            result={selectedResult}
-            onClose={() => setSelectedResult(null)}
-          />
-        )}
-      </main>
-    );
+  async function resetValidationReplay() {
+    setValidationAutoRunning(false);
+    return runStep("validation-reset", async () => {
+      const payload = await api("/validation/replay/reset", { method: "POST" });
+      applyValidationPipeline(payload);
+      return payload;
+    });
   }
 
   return (
@@ -915,27 +830,9 @@ function App() {
           <span className="eyebrow">Artefacto de tesis</span>
           <h1>Filtro estadistico-temporal para entidades continuas y de estado</h1>
           <p>
-            Flujo actual: cargar historico, seleccionar sensores continuos o binarios, inyectar fallas,
-            generar iteraciones de tiempo real y revisar sospechas con sus ecuaciones.
+            Flujo actual: cargar un conjunto de datos reales, respetar su orden temporal y revisar
+            las sospechas detectadas por los tres filtros con sus ecuaciones.
           </p>
-        </div>
-        <div className="header-actions">
-          <a className="secondary-action" href="/simulador" target="_blank" rel="noreferrer">Abrir simulador</a>
-          <button className="primary-action" onClick={() => generateOneTick()} disabled={Boolean(busy) || !selectedAnalyzable.length}>
-            {busy === "tick" ? <Loader2 className="spin" size={18} /> : <Zap size={18} />}
-            Generar tick
-          </button>
-          {isIterating ? (
-            <button className="secondary-action" disabled>
-              <Loader2 className="spin" size={18} />
-              Ejecutando
-            </button>
-          ) : (
-            <button className="secondary-action" onClick={runIterations} disabled={Boolean(busy) || !selectedAnalyzable.length}>
-              <Play size={18} />
-              Ejecutar iteraciones
-            </button>
-          )}
         </div>
       </header>
 
@@ -973,13 +870,11 @@ function App() {
             <Metric icon={<Database />} label="Datos historicos" value={formatCount(historyStatus?.rows)} detail={formatHistoryRange(historyStatus)} />
             <Metric icon={<Activity />} label="Entidades historico" value={formatCount(historyStatus?.entity_count || entities.length)} detail={`${continuousEntities.length} continuas / ${binaryEntities.length} binarias`} />
             <Metric icon={<Database />} label="Base normalidad" value={formatCount(historyStatus?.normality_history?.rows)} detail={normalityDetail(historyStatus?.normality_history)} />
-            <Metric icon={<Zap />} label="Estado realtime" value={formatCount(realtime?.events)} detail={`${realtime?.tick_index || 0} ticks generados`} />
-            <Metric icon={<FlaskConical />} label="Fallas activas" value={activeFaults.length} detail={activeFaults.map((fault) => fault.fault_type).join(", ") || "sin fallas"} />
             <Metric icon={<BarChart3 />} label="Sospechas estadisticas" value={suspiciousCount} detail={`rojo score >= ${RED_SUSPICION_SCORE.toFixed(2)}`} />
           </section>
 
-          <section className="workspace-grid">
-            <Panel title="Historico">
+          <section className="workspace-grid lower single">
+            <Panel title="Conjunto de datos real">
               <div className="history-summary">
                 <SummaryRow label="API" value={health?.status || "-"} />
                 <SummaryRow label="Origen" value={historyStatus?.source_type || "-"} />
@@ -988,17 +883,29 @@ function App() {
                 <SummaryRow label="Entidades" value={formatCount(historyStatus?.entity_count || entities.length)} />
                 <SummaryRow label="Rango" value={formatHistoryRange(historyStatus)} />
               </div>
+              <div className="control-grid">
+                <label>
+                  Umbral de sospecha: {Math.round(suspicionThreshold * 100)}%
+                  <input
+                    type="range"
+                    min="1"
+                    max="99"
+                    value={Math.round(suspicionThreshold * 100)}
+                    onChange={(event) => setSuspicionThreshold(Number(event.target.value) / 100)}
+                  />
+                </label>
+              </div>
               <div className="button-row">
                 <StepButton id="real-history" busy={busy} onClick={loadRealHistory} icon={<Database size={17} />} label="Cargar historico real" />
                 <label className="file-action">
                   Subir historico real
                   <input type="file" accept=".csv,text/csv" onChange={uploadRealHistory} disabled={Boolean(busy)} />
                 </label>
-                <StepButton id="static-history" busy={busy} onClick={loadStaticHistory} icon={<Database size={17} />} label="Crear/cargar historico canonico" />
                 <StepButton id="analyze-history" busy={busy} onClick={analyzeHistory} icon={<BarChart3 size={17} />} label="Analizar historico" disabled={!historyStatus?.exists} />
                 <StepButton id="normalization-preview" busy={busy} onClick={openNormalizationPreview} icon={<Eye size={17} />} label="Ver normalizacion" disabled={!historyStatus?.exists} />
                 <StepButton id="continuous-config" busy={busy} onClick={loadContinuousConfig} icon={<Eye size={17} />} label="Parametros continuos" disabled={!historyStatus?.exists} />
               </div>
+              {historyLoad && <HistoryLoadProgress job={historyLoad} />}
               {continuousConfig.length > 0 && (
                 <ContinuousConfigEditor
                   configs={continuousConfig}
@@ -1009,98 +916,40 @@ function App() {
               )}
               <div className="entity-list compact">
                 {analyzableEntities.map((entity) => (
-                  <label className="entity-row" key={entity.entity_id}>
-                    <input type="checkbox" checked={selectedAnalyzable.includes(entity.entity_id)} onChange={() => toggleEntity(entity.entity_id)} />
+                  <div className="entity-row" key={entity.entity_id}>
                     <span>
                       <strong>{entity.entity_id}</strong>
                       <small>{entityLabel(entity)} / {entity.unit_of_measurement || entity.unit || "sin unidad"}</small>
                     </span>
-                  </label>
+                  </div>
                 ))}
-                {!analyzableEntities.length && <Empty text="No hay entidades continuas o binarias cargadas." />}
-              </div>
-            </Panel>
-
-            <Panel title="Tiempo real e inyeccion">
-              <div className="control-grid">
-                <label>
-                  Segundos por tick
-                  <input type="number" min="10" step="10" value={tickSeconds} onChange={(event) => setTickSeconds(Number(event.target.value))} />
-                </label>
-                <label>
-                  Iteraciones a ejecutar
-                  <input type="number" min="1" value={iterationCount} onChange={(event) => setIterationCount(Number(event.target.value))} />
-                </label>
-                <label>
-                  Umbral sospecha: {Math.round(suspicionThreshold * 100)}%
-                  <input
-                    type="range"
-                    min="1"
-                    max="99"
-                    value={Math.round(suspicionThreshold * 100)}
-                    onChange={(event) => setSuspicionThreshold(Number(event.target.value) / 100)}
-                  />
-                </label>
-              </div>
-              <div className="iteration-bar">
-                <div>
-                  <span>Iteraciones realizadas</span>
-                  <strong>{iterationsDone} / {Math.max(1, Number(iterationCount) || 1)}</strong>
-                </div>
-                <div className="progress-track">
-                  <span style={{ width: `${iterationProgress(iterationsDone, iterationCount)}%` }} />
-                </div>
-              </div>
-              <div className="button-row">
-                <StepButton id="tick" busy={busy} onClick={() => generateOneTick()} icon={<Zap size={17} />} label="Generar 1 tick" disabled={!selectedAnalyzable.length} />
-                <button className="secondary-action inline" onClick={resetRealtime} disabled={Boolean(busy)}>
-                  <RotateCcw size={17} />
-                  Reset realtime
-                </button>
-                <button className="secondary-action inline" onClick={clearFaults} disabled={Boolean(busy)}>
-                  <RotateCcw size={17} />
-                  Desactivar fallas
-                </button>
-              </div>
-              <div className="fault-list">
-                {faults.map((fault) => {
-                  const selected = selectedAnalyzable.includes(fault.entity_id);
-                  const entity = entityById(analyzableEntities, fault.entity_id);
-                  const allowedFaults = faultOptionsForEntity(entity);
-                  return (
-                    <div className={`fault-row ${selected ? "" : "muted"}`} key={fault.entity_id}>
-                      <label className="switch-row">
-                        <input
-                          type="checkbox"
-                          checked={fault.enabled && selected}
-                          disabled={!selected}
-                          onChange={(event) => updateFault(fault.entity_id, { enabled: event.target.checked })}
-                        />
-                        <span>
-                          <strong>{fault.entity_id}</strong>
-                          <small>{selected ? `falla aplicable a ${kindText(entity?.sensor_kind)}` : "entidad no seleccionada"}</small>
-                        </span>
-                      </label>
-                      <select
-                        value={fault.fault_type}
-                        disabled={!selected}
-                        onChange={(event) => updateFault(fault.entity_id, { fault_type: event.target.value })}
-                      >
-                        {allowedFaults.map((faultType) => (
-                          <option key={faultType} value={faultType}>{faultType}</option>
-                        ))}
-                      </select>
-                    </div>
-                  );
-                })}
+                {!analyzableEntities.length && <Empty text="No hay entidades continuas, binarias o multivaloricas cargadas." />}
               </div>
             </Panel>
           </section>
 
+          <FutureEvaluationControl
+            replay={validationReplay}
+            upload={validationUpload}
+            historyReady={Boolean(
+              historyStatus?.exists && historyStatus?.future_evaluation_ready
+            )}
+            busy={busy}
+            autoRunning={validationAutoRunning}
+            batchSize={validationBatchSize}
+            suspicionThreshold={suspicionThreshold}
+            onUpload={uploadValidationHistory}
+            onAdvance={advanceValidationReplay}
+            onReset={resetValidationReplay}
+            onToggleAuto={() => setValidationAutoRunning((current) => !current)}
+            onBatchSize={setValidationBatchSize}
+            onOpenModule={setActiveModule}
+          />
+
           <section className="charts-panel">
             <div className="section-heading">
               <div>
-                <h2>Charts del historico y realtime</h2>
+                <h2>Datos reales por fecha</h2>
                 <span>{timelines.length} entidades graficadas</span>
               </div>
               <div className="date-controls">
@@ -1123,11 +972,10 @@ function App() {
                   key={timeline.entity_id}
                   timeline={timeline}
                   results={allAnalyzedResults}
-                  faults={realtime?.faults || []}
                   onResultClick={setSelectedResult}
                 />
               ))}
-              {!timelines.length && <Empty text="Carga un historico o genera un tick para ver los charts." />}
+              {!timelines.length && <Empty text="Carga un conjunto de datos real para ver los charts." />}
             </div>
           </section>
 
@@ -1137,6 +985,11 @@ function App() {
                 <SummaryRow label="Tiempo total filtro" value={formatElapsed(runSummary?.elapsed_ms)} />
                 <SummaryRow label="Tiempo continuas" value={formatElapsed(runSummary?.timings_by_kind_ms?.continuous)} />
                 <SummaryRow label="Tiempo binarias" value={formatElapsed(runSummary?.timings_by_kind_ms?.binary)} />
+                <SummaryRow label="Tiempo multistate" value={formatElapsed(runSummary?.timings_by_kind_ms?.multistate)} />
+                <SummaryRow
+                  label="Multistate elegibles"
+                  value={runSummary ? `${runSummary.multistate_eligibility?.eligible_entities || 0} / ${runSummary.multistate_eligibility?.entities || 0}` : "-"}
+                />
                 <SummaryRow label="Cache analisis" value={runSummary ? (runSummary.cache_hit ? "reutilizado" : "nuevo") : "-"} />
                 <SummaryRow label="Paso a contextual" value={allAnalyzedResults.filter(isRedSuspicion).length} />
                 <SummaryRow label="Resultados visibles" value={`${formatCount(displayResults.length)} / ${formatCount(allAnalyzedResults.length)}`} />
@@ -1226,6 +1079,166 @@ function ProcessWindow({ title, description }) {
       </div>
     </section>
   );
+}
+
+function FutureEvaluationControl({
+  replay,
+  upload,
+  historyReady,
+  busy,
+  autoRunning,
+  batchSize,
+  suspicionThreshold,
+  onUpload,
+  onAdvance,
+  onReset,
+  onToggleAuto,
+  onBatchSize,
+  onOpenModule,
+}) {
+  const loaded = Boolean(replay?.loaded);
+  const completed = replay?.status === "completed";
+  const progress = Math.min(100, Math.max(0, Number(replay?.progress || 0)));
+  const uploadProgress = Math.min(100, Math.max(0, Number(upload?.progress || 0)));
+  const lastBatch = replay?.last_batch || null;
+  const pipeline = replay?.pipeline_summary || {};
+
+  return (
+    <section className="workspace-grid lower single future-evaluation-control">
+      <Panel title="Evaluacion con eventos futuros">
+        <div className="future-evaluation-heading">
+          <div className="validation-replay-icon"><Clock3 size={22} /></div>
+          <div>
+            <span className="eyebrow">Continuacion causal del historico cargado</span>
+            <p>
+              Sube los eventos posteriores al historico. Al avanzar, las sospechas pasan por los
+              filtros Estadistico, Contextual y Clasificador que ya existen en el artefacto.
+            </p>
+          </div>
+          <span className="validation-replay-badge">
+            {loaded ? replayStatusText(replay.status) : "sin evaluacion"}
+          </span>
+        </div>
+
+        <div className="validation-upload-row">
+          <label className="file-action validation-file-action">
+            <Upload size={17} />
+            Subir eventos de Evaluacion
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              onChange={onUpload}
+              disabled={!historyReady || Boolean(busy) || autoRunning}
+            />
+          </label>
+          <span>
+            {loaded
+              ? `${replay.filename} · ${formatCount(replay.rows)} eventos futuros`
+              : historyReady
+                ? "Deben comenzar despues del ultimo timestamp del historico cargado"
+                : "Espera a que el historico termine de preparar el estado del detector"}
+          </span>
+        </div>
+
+        {upload && (
+          <div className={`validation-upload-progress ${upload.status === "completed" ? "ready" : ""}`}>
+            <div className="history-load-heading">
+              <span>{upload.message}</span>
+              <strong>{Math.round(uploadProgress)}%</strong>
+            </div>
+            <div className="progress-track"><span style={{ width: `${uploadProgress}%` }} /></div>
+            <small>{formatBytes(upload.file_size_bytes)}</small>
+          </div>
+        )}
+
+        {loaded && (
+          <>
+            <div className="future-evaluation-status">
+              <SummaryRow label="Historico disponible hasta" value={shortDate(replay.development_end)} />
+              <SummaryRow label="Reloj de Evaluacion" value={shortDate(replay.current_timestamp)} />
+              <SummaryRow label="Procesados" value={`${formatCount(replay.processed_rows)} / ${formatCount(replay.rows)}`} />
+              <SummaryRow label="Rendimiento ultimo lote" value={lastBatch ? `${formatCount(Math.round(lastBatch.events_per_second))} eventos/s` : "-"} />
+            </div>
+
+            <div className="validation-progress-wrap future-evaluation-progress">
+              <div className="progress-track" role="progressbar" aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100">
+                <span style={{ width: `${progress}%` }} />
+              </div>
+              <strong>{progress.toFixed(2)}%</strong>
+            </div>
+
+            <div className="validation-controls future-evaluation-actions">
+              <label>
+                Eventos por avance
+                <select value={batchSize} onChange={(event) => onBatchSize(Number(event.target.value))} disabled={autoRunning || Boolean(busy)}>
+                  <option value="100">100 · detallado</option>
+                  <option value="500">500</option>
+                  <option value="1000">1.000 · normal</option>
+                  <option value="5000">5.000 · rapido</option>
+                  <option value="10000">10.000 · maximo</option>
+                </select>
+              </label>
+              <div className="validation-control-buttons">
+                <button className="primary-action" type="button" onClick={onToggleAuto} disabled={completed || (Boolean(busy) && !autoRunning)}>
+                  {autoRunning ? <Pause size={17} /> : <Play size={17} />}
+                  {autoRunning ? "Pausar" : "Reproducir"}
+                </button>
+                <button className="secondary-action" type="button" onClick={onAdvance} disabled={completed || autoRunning || Boolean(busy)}>
+                  {busy === "validation-advance" ? <Loader2 className="spin" size={17} /> : <SkipForward size={17} />}
+                  Un avance
+                </button>
+                <button className="secondary-action" type="button" onClick={onReset} disabled={autoRunning || Boolean(busy)}>
+                  <RotateCcw size={17} />
+                  Reiniciar
+                </button>
+              </div>
+            </div>
+
+            <div className="future-pipeline-strip" aria-label="Avance por el pipeline existente">
+              <button type="button" onClick={() => onOpenModule("estadistico")}>
+                <span>1 · Estadistico</span>
+                <strong>{formatCount(pipeline.statistical || 0)}</strong>
+                <small>sospechas</small>
+              </button>
+              <i aria-hidden="true">→</i>
+              <button type="button" onClick={() => onOpenModule("contextual")}>
+                <span>2 · Contextual</span>
+                <strong>{formatCount(pipeline.contextual || 0)}</strong>
+                <small>evaluadas</small>
+              </button>
+              <i aria-hidden="true">→</i>
+              <button type="button" onClick={() => onOpenModule("clasificador")}>
+                <span>3 · Clasificador</span>
+                <strong>{formatCount(pipeline.classifier || 0)}</strong>
+                <small>diagnosticos</small>
+              </button>
+            </div>
+            <p className="validation-results-note">
+              Los números abren las vistas existentes. No se crea una tabla paralela para Evaluacion.
+              Umbral estadistico actual: {Math.round(suspicionThreshold * 100)}%.
+            </p>
+          </>
+        )}
+
+        {!loaded && !upload && (
+          <Empty text="Carga primero el historico de Desarrollo y luego sube sus eventos futuros de Evaluacion." />
+        )}
+      </Panel>
+    </section>
+  );
+}
+
+function replayStatusText(status) {
+  if (status === "ready") {
+    return "listo para iniciar";
+  }
+  if (status === "running") {
+    return "reproduccion en curso";
+  }
+  if (status === "completed") {
+    return "reproduccion completada";
+  }
+  return status || "sin archivo";
 }
 
 function ContextualWorkspace({ mapData, results, summary, busy, error, onReload, onRebuild }) {
@@ -2331,7 +2344,6 @@ function ClassifierWorkspace({ results, summary, evaluation, specification, mapD
 
 function ClassifierDiagnosticsView({ results = [], summary = {}, fallbackMapStale = false }) {
   const [classFilter, setClassFilter] = useState("all");
-  const [sourceFilter, setSourceFilter] = useState("all");
   const [entityQuery, setEntityQuery] = useState("");
   const [minimumConfidence, setMinimumConfidence] = useState(0);
   const [selectedDiagnosis, setSelectedDiagnosis] = useState(null);
@@ -2341,11 +2353,7 @@ function ClassifierDiagnosticsView({ results = [], summary = {}, fallbackMapStal
     return (results || []).filter((result) => {
       const diagnosticClass = classifierResultClass(result);
       const confidence = classifierConfidence(result);
-      const source = String(result.source || result.origin || "unknown").toLowerCase();
       if (classFilter !== "all" && diagnosticClass !== classFilter) {
-        return false;
-      }
-      if (sourceFilter !== "all" && source !== sourceFilter) {
         return false;
       }
       if (query && !String(result.entity_id || "").toLowerCase().includes(query)) {
@@ -2356,7 +2364,7 @@ function ClassifierDiagnosticsView({ results = [], summary = {}, fallbackMapStal
       }
       return true;
     });
-  }, [results, classFilter, sourceFilter, entityQuery, minimumConfidence]);
+  }, [results, classFilter, entityQuery, minimumConfidence]);
   const evaluated = contextNumber(summary?.evaluated, summary?.classified, results.length);
   const lowConfidence = contextNumber(summary?.low_confidence, results.filter(classifierIsLowConfidence).length);
   const meanConfidence = contextNumber(summary?.confidence_mean, classifierMeanConfidence(results));
@@ -2422,14 +2430,6 @@ function ClassifierDiagnosticsView({ results = [], summary = {}, fallbackMapStal
             </select>
           </label>
           <label>
-            Origen
-            <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)}>
-              <option value="all">Historico y realtime</option>
-              <option value="historical">Historico</option>
-              <option value="realtime">Realtime</option>
-            </select>
-          </label>
-          <label>
             Buscar entidad
             <input
               type="search"
@@ -2453,7 +2453,6 @@ function ClassifierDiagnosticsView({ results = [], summary = {}, fallbackMapStal
             className="secondary-action inline"
             onClick={() => {
               setClassFilter("all");
-              setSourceFilter("all");
               setEntityQuery("");
               setMinimumConfidence(0);
             }}
@@ -2775,7 +2774,8 @@ function ClassifierEvaluationView({ evaluation }) {
         <strong>Pendiente: 1 mes disponible de 5 y sin etiquetas reales suficientes</strong>
         <p>
           No se calculan matriz de confusion, precision, recall, F1 ni falsos negativos con denominadores
-          incompletos. La evaluacion se habilitara con fallas controladas en realtime o con futura verdad real suficiente.
+          incompletos. La evaluacion se habilitara cuando los conjuntos de validacion o prueba incorporen
+          etiquetas reales suficientes.
         </p>
         <div className="classifier-validation-facts">
           <SummaryRow label="Fuente actual" value="Mes real" />
@@ -3129,7 +3129,7 @@ function ClassifierSpecificationView({ specification }) {
             { label: "Umbrales congelados", value: protocol.fixed_thresholds === undefined ? "-" : protocol.fixed_thresholds ? "si" : "no" },
           ]} />
           <p className="classifier-method-note">
-            La validacion cuantitativa se habilitara con fallas controladas en realtime o futura verdad real suficiente.
+            La validacion cuantitativa se habilitara con etiquetas reales suficientes en los conjuntos de validacion o prueba.
           </p>
         </Panel>
       </section>
@@ -4101,61 +4101,36 @@ function StepButton({ id, busy, onClick, icon, label, disabled = false }) {
   );
 }
 
-function ManualControlGroup({ title, icon, entities, states, step, unit, onChange }) {
+function HistoryLoadProgress({ job }) {
+  const progress = Math.min(100, Math.max(0, Number(job?.progress || 0)));
+  const ready = job?.status === "completed";
+  const failed = job?.status === "failed";
   return (
-    <div className="manual-group">
-      <h3>{icon}{title}</h3>
-      {entities.map((entity) => {
-        const value = Number(states[entity.entity_id] ?? defaultManualValue(entity));
-        return (
-          <div className="manual-row" key={entity.entity_id}>
-            <div>
-              <strong>{entity.entity_id}</strong>
-              <small>{entityLabel(entity)}</small>
-            </div>
-            <div className="manual-stepper">
-              <button type="button" onClick={() => onChange(entity.entity_id, roundManual(value - step))}>-</button>
-              <input
-                type="number"
-                step={step}
-                value={value}
-                onChange={(event) => onChange(entity.entity_id, Number(event.target.value))}
-              />
-              <button type="button" onClick={() => onChange(entity.entity_id, roundManual(value + step))}>+</button>
-              <span>{unit}</span>
-            </div>
-          </div>
-        );
-      })}
-      {!entities.length && <Empty text={`No hay sensores de ${title.toLowerCase()} detectados.`} />}
-    </div>
-  );
-}
-
-function ManualBinaryGroup({ entities, states, onChange }) {
-  return (
-    <div className="manual-group">
-      <h3><Power size={17} />Sensores binarios</h3>
-      {entities.map((entity) => {
-        const active = Boolean(states[entity.entity_id]);
-        return (
-          <div className="manual-row" key={entity.entity_id}>
-            <div>
-              <strong>{entity.entity_id}</strong>
-              <small>{entityLabel(entity)}</small>
-            </div>
-            <button
-              type="button"
-              className={`manual-toggle ${active ? "active" : ""}`}
-              onClick={() => onChange(entity.entity_id, !active)}
-            >
-              {active ? "on" : "off"}
-            </button>
-          </div>
-        );
-      })}
-      {!entities.length && <Empty text="No hay sensores binarios detectados." />}
-    </div>
+    <section
+      className={`history-load-progress ${ready ? "ready" : ""} ${failed ? "failed" : ""}`}
+      aria-live="polite"
+    >
+      <div className="history-load-heading">
+        <span>{ready ? "Historico listo" : failed ? "Carga fallida" : historyLoadPhaseLabel(job?.phase)}</span>
+        <strong>{Math.round(progress)}%</strong>
+      </div>
+      <div
+        className="progress-track"
+        role="progressbar"
+        aria-label="Progreso de carga del historico"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={Math.round(progress)}
+      >
+        <span style={{ width: `${progress}%` }} />
+      </div>
+      <p>{job?.error || job?.message || "Preparando carga"}</p>
+      <div className="history-load-meta">
+        <span>Transcurrido: {formatDuration(job?.elapsed_seconds)}</span>
+        <span>Restante: {ready ? "0 s" : formatDuration(job?.eta_seconds, "estimando")}</span>
+        <span>Archivo: {formatBytes(job?.file_size_bytes)}</span>
+      </div>
+    </section>
   );
 }
 
@@ -4230,10 +4205,13 @@ function ResultsTable({ results, onResultClick }) {
           <span>{formatReading(result)}</span>
           <span>
             {result.suspected_pattern || result.pattern || "-"}
-            <small>{timeWindowLabel(result.time_window)}</small>
+            <small>
+              {timeWindowLabel(result.time_window)}
+              {result.replay ? ` / retraso ${formatDuration(result.replay.detection_delay_seconds)}` : ""}
+            </small>
           </span>
           <span>{(result.triggered_indicators || []).join(", ") || "-"}</span>
-          <span>{equationNames(result.triggered_indicators)}</span>
+          <span>{equationNames(result.triggered_indicators, result.sensor_kind)}</span>
         </button>
       ))}
       {!results.length && <Empty text="No hay sospechas estadisticas para mostrar." />}
@@ -4476,13 +4454,16 @@ function KeyValueGrid({ rows }) {
   );
 }
 
-function TimelineChart({ timeline, results, faults, onResultClick }) {
+function TimelineChart({ timeline, results, onResultClick }) {
   const width = 720;
   const height = 240;
   const padding = { top: 18, right: 24, bottom: 34, left: 58 };
   const basePoints = timeline.points || [];
   const points = mergeTimelineWithSuspiciousPoints(basePoints, results, timeline);
   const isBinary = timeline.sensor_kind === "binary" || timeline.chart_kind === "active_percentage";
+  const isMultistate = timeline.sensor_kind === "multistate" || timeline.chart_kind === "categorical_state";
+  const categoryEntries = Object.entries(timeline.categories || {})
+    .sort((left, right) => Number(left[1]) - Number(right[1]));
   const values = points.map((point) => numericPointValue(point.value)).filter(Number.isFinite);
   const min = isBinary ? 0 : (values.length ? Math.min(...values) : 0);
   const max = isBinary ? 100 : (values.length ? Math.max(...values) : 1);
@@ -4538,19 +4519,6 @@ function TimelineChart({ timeline, results, faults, onResultClick }) {
     })
     .filter(Boolean);
   const markers = groupConsecutiveMarkers(markerCandidates);
-  const faultBands = (faults || [])
-    .filter((fault) => fault.entity_id === timeline.entity_id)
-    .map((fault) => {
-      const start = Date.parse(fault.start);
-      const end = Date.parse(fault.end);
-      if (!validTimes || !Number.isFinite(start) || !Number.isFinite(end) || end < firstTime || start > lastTime) {
-        return null;
-      }
-      const x1 = Math.max(padding.left, xForTime(Math.max(start, firstTime)));
-      const x2 = Math.min(width - padding.right, xForTime(Math.min(end, lastTime)));
-      return { x: x1, width: Math.max(2, x2 - x1), label: fault.fault_type };
-    })
-    .filter(Boolean);
   const gapBands = (timeline.gaps || [])
     .map((gap) => {
       const start = Date.parse(gap.start);
@@ -4563,6 +4531,17 @@ function TimelineChart({ timeline, results, faults, onResultClick }) {
       return { x: x1, width: Math.max(2, x2 - x1), label: gap.label || "sin lectura valida" };
     })
     .filter(Boolean);
+  const axisTicks = isMultistate && categoryEntries.length > 0 && categoryEntries.length <= 6
+    ? categoryEntries.map(([label, value]) => ({
+      key: `state-${label}`,
+      y: yFor(Number(value)),
+      label,
+    }))
+    : [0, 0.5, 1].map((tick) => ({
+      key: `tick-${tick}`,
+      y: padding.top + tick * plotHeight,
+      label: isBinary ? `${Math.round(max - tick * range)}%` : formatAxisValue(max - tick * range),
+    }));
 
   return (
     <article className="chart-card">
@@ -4571,23 +4550,20 @@ function TimelineChart({ timeline, results, faults, onResultClick }) {
           <strong>{timeline.entity_id}</strong>
           <small>{kindText(timeline.sensor_kind)} / {timeline.area_id || "sin area"}</small>
         </div>
-        <span>{isBinary ? "activacion 0-100%" : `${formatAxisValue(min)} - ${formatAxisValue(max)}`}</span>
+        <span>
+          {isBinary
+            ? "activacion 0-100%"
+            : isMultistate
+              ? (categoryEntries.length ? categoryEntries.map(([state]) => state).join(" / ") : "alta cardinalidad")
+              : `${formatAxisValue(min)} - ${formatAxisValue(max)}`}
+        </span>
       </div>
       <svg className="timeline-svg" viewBox={`0 0 ${width} ${height}`}>
-        {[0, 0.5, 1].map((tick) => {
-          const y = padding.top + tick * plotHeight;
-          const label = max - tick * range;
-          return (
-            <React.Fragment key={tick}>
-              <line className="grid" x1={padding.left} y1={y} x2={width - padding.right} y2={y} />
-              <text x="8" y={y + 4}>{isBinary ? `${Math.round(label)}%` : formatAxisValue(label)}</text>
-            </React.Fragment>
-          );
-        })}
-        {faultBands.map((band, index) => (
-          <rect className="fault-band" key={`${band.label}-${index}`} x={band.x} y={padding.top} width={band.width} height={plotHeight}>
-            <title>{band.label}</title>
-          </rect>
+        {axisTicks.map((tick) => (
+          <React.Fragment key={tick.key}>
+            <line className="grid" x1={padding.left} y1={tick.y} x2={width - padding.right} y2={tick.y} />
+            <text x="8" y={tick.y + 4}>{tick.label}</text>
+          </React.Fragment>
         ))}
         {gapBands.map((band, index) => (
           <rect className="gap-band" key={`${band.label}-${index}`} x={band.x} y={padding.top} width={band.width} height={plotHeight}>
@@ -4642,23 +4618,13 @@ function TimelineChart({ timeline, results, faults, onResultClick }) {
       <div className="chart-legend">
         <span>{basePoints.length} puntos</span>
         {isBinary && <span>bucket: {formatBucketSeconds(timeline.bucket_seconds)}</span>}
+        {isMultistate && <span>{multistateStatusText(timeline.analysis_status)}</span>}
         {points.length > basePoints.length && <span>{points.length - basePoints.length} sospechas encontradas</span>}
         <span>{`rojo: score >= ${RED_SUSPICION_SCORE.toFixed(2)} agrupado`}</span>
-        {faultBands.length > 0 && <span>zona roja suave: falla activa</span>}
         {gapBands.length > 0 && <span>zona punteada: sin lectura valida</span>}
       </div>
     </article>
   );
-}
-
-function syncFaultRows(entities, currentFaults) {
-  const currentById = Object.fromEntries(currentFaults.map((fault) => [fault.entity_id, fault]));
-  return entities.map((entity) => ({
-    entity_id: entity.entity_id,
-    fault_type: validFaultTypeForEntity(entity, currentById[entity.entity_id]?.fault_type),
-    enabled: Boolean(currentById[entity.entity_id]?.enabled),
-    label: "sensor_fault",
-  }));
 }
 
 function isRedSuspicion(result) {
@@ -4735,6 +4701,17 @@ function resultChartValue(result, timeline) {
     const state = String(result.observed_state ?? result.value ?? "").toLowerCase();
     return ["on", "open", "home", "active", "detected", "1", "true"].includes(state) ? 100 : 0;
   }
+  if (timeline?.sensor_kind === "multistate" || timeline?.chart_kind === "categorical_state") {
+    const categories = timeline?.categories || {};
+    const state = String(reading.state ?? result.observed_state ?? "");
+    if (Object.prototype.hasOwnProperty.call(categories, state)) {
+      return Number(categories[state]);
+    }
+    const matched = Object.entries(categories).find(
+      ([candidate]) => candidate.toLocaleLowerCase() === state.toLocaleLowerCase(),
+    );
+    return matched ? Number(matched[1]) : NaN;
+  }
   return Number(reading.value ?? result.value ?? result.observed_state);
 }
 
@@ -4771,73 +4748,6 @@ function groupConsecutiveMarkers(markers) {
   });
 }
 
-function defaultFaultType(entity) {
-  if (entity?.sensor_kind === "binary") {
-    return "random";
-  }
-  if (entity?.device_class === "humidity") {
-    return "drift";
-  }
-  return "random/spike";
-}
-
-function faultOptionsForEntity(entity) {
-  if (entity?.sensor_kind === "binary") {
-    return BINARY_FAULT_TYPES;
-  }
-  return CONTINUOUS_FAULT_TYPES;
-}
-
-function validFaultTypeForEntity(entity, faultType) {
-  const options = faultOptionsForEntity(entity);
-  return options.includes(faultType) ? faultType : defaultFaultType(entity);
-}
-
-function controlledEntities(entities) {
-  return (entities || []).filter((entity) =>
-    entity.sensor_kind === "binary"
-    || isTemperatureEntity(entity)
-    || isHumidityEntity(entity)
-  );
-}
-
-function syncManualStates(entities, current) {
-  return Object.fromEntries(
-    controlledEntities(entities).map((entity) => [
-      entity.entity_id,
-      current[entity.entity_id] ?? defaultManualValue(entity),
-    ]),
-  );
-}
-
-function defaultManualValue(entity) {
-  if (entity?.sensor_kind === "binary") {
-    return false;
-  }
-  if (isHumidityEntity(entity)) {
-    return 55;
-  }
-  return 20;
-}
-
-function isTemperatureEntity(entity) {
-  const text = `${entity?.entity_id || ""} ${entity?.device_class || ""}`.toLowerCase();
-  return entity?.sensor_kind === "continuous" && (text.includes("temperature") || text.includes("temp"));
-}
-
-function isHumidityEntity(entity) {
-  const text = `${entity?.entity_id || ""} ${entity?.device_class || ""}`.toLowerCase();
-  return entity?.sensor_kind === "continuous" && text.includes("humidity");
-}
-
-function roundManual(value) {
-  return Math.round(Number(value) * 100) / 100;
-}
-
-function entityById(entities, entityId) {
-  return entities.find((entity) => entity.entity_id === entityId);
-}
-
 function entityLabel(entity) {
   return `${kindText(entity.sensor_kind)} / ${entity.device_class || "estado"}`;
 }
@@ -4849,7 +4759,26 @@ function kindText(kind) {
   if (kind === "binary") {
     return "estado binario";
   }
+  if (kind === "multistate") {
+    return "estado multivalor";
+  }
   return kind || "entidad";
+}
+
+function multistateStatusText(status) {
+  if (status === "eligible") {
+    return "multistate analizable";
+  }
+  if (status === "high_cardinality") {
+    return "no analizable: alta cardinalidad";
+  }
+  if (status === "insufficient_states") {
+    return "no analizable: falta variedad de estados";
+  }
+  if (status === "insufficient_history") {
+    return "no analizable: historial insuficiente";
+  }
+  return "multistate";
 }
 
 function timelineDateRange(timelines) {
@@ -4902,24 +4831,37 @@ function toDatetimeLocalValue(timestamp) {
   return local.toISOString().slice(0, 16);
 }
 
-function equationNames(indicators = []) {
+function equationNames(indicators = [], sensorKind = "") {
+  const catalogue = sensorKind === "binary"
+    ? STATE_EQUATIONS
+    : sensorKind === "multistate"
+      ? MULTISTATE_EQUATIONS
+      : EQUATIONS;
   const names = indicators
-    .map((indicator) => ALL_EQUATIONS.find((equation) => equation.id === indicator)?.title)
+    .map((indicator) => catalogue.find((equation) => equation.id === indicator)?.title)
     .filter(Boolean);
   return names.join(", ") || "-";
 }
 
 function equationsForResult(result) {
   const ids = result?.triggered_indicators || [];
+  const catalogue = result?.sensor_kind === "binary"
+    ? STATE_EQUATIONS
+    : result?.sensor_kind === "multistate"
+      ? MULTISTATE_EQUATIONS
+      : EQUATIONS;
   const found = ids
-    .map((indicator) => ALL_EQUATIONS.find((equation) => equation.id === indicator))
+    .map((indicator) => catalogue.find((equation) => equation.id === indicator))
     .filter(Boolean);
-  return found.length ? found : ALL_EQUATIONS.filter((equation) => equation.pattern === (result?.suspected_pattern || result?.pattern));
+  return found.length ? found : catalogue.filter((equation) => equation.pattern === (result?.suspected_pattern || result?.pattern));
 }
 
 function equationWithCalculationValues(equation, result) {
   if (result?.sensor_kind === "binary") {
     return binaryEquationWithValues(equation, result);
+  }
+  if (result?.sensor_kind === "multistate") {
+    return multistateEquationWithValues(equation, result);
   }
   return continuousEquationWithValues(equation, result);
 }
@@ -5034,6 +4976,43 @@ function binaryEquationWithValues(equation, result) {
   return { equation: equation.equation, score: equation.score };
 }
 
+function multistateEquationWithValues(equation, result) {
+  const reading = result?.reading || {};
+  const raw = reading.raw_components || {};
+  const components = reading.components || {};
+  if (equation.id === "state_change_count") {
+    return {
+      equation: `C_i(W) = ${reading.state_changes ?? "-"} cambios en ${formatSeconds(reading.window_seconds)}; Z_C = ${formatCalc(raw.state_change_count)}`,
+      score: `s_C = ${formatCalc(components.state_change_count)}`,
+    };
+  }
+  if (equation.id === "state_probability") {
+    return {
+      equation: `P(${reading.state ?? result.observed_state ?? "s"}) = ${formatCalc(reading.state_probability)}; sorpresa = ${formatCalc(raw.state_probability)}`,
+      score: `s_estado = ${formatCalc(components.state_probability)}`,
+    };
+  }
+  if (equation.id === "transition_probability") {
+    return {
+      equation: `P(${reading.state ?? "s_j"}|${reading.previous_state ?? "s_i"}) = ${formatCalc(reading.transition_probability)}; sorpresa = ${formatCalc(raw.transition_probability)}`,
+      score: `s_trans = ${formatCalc(components.transition_probability)}`,
+    };
+  }
+  if (equation.id === "state_duration") {
+    return {
+      equation: `D_s(t) = ${formatSeconds(reading.state_duration_seconds)}; Z_D = ${formatCalc(raw.state_duration)}`,
+      score: `s_D = ${formatCalc(components.state_duration)}`,
+    };
+  }
+  if (equation.id === "report_gap") {
+    return {
+      equation: `M_i(t) = ${formatSeconds(reading.report_gap_seconds)}; Z_M = ${formatCalc(raw.report_gap)}`,
+      score: `s_M = ${formatCalc(components.report_gap)}`,
+    };
+  }
+  return { equation: equation.equation, score: equation.score };
+}
+
 function calculationRows(result) {
   if (result?.sensor_kind === "binary") {
     return [
@@ -5044,6 +5023,15 @@ function calculationRows(result) {
       calculationRow(result, "report_gap", "Brecha M_i(t)", "Z_M_i", "s_M"),
       calculationRow(result, "time_since_last_change", "Tiempo TLC_i(t)", "Z_TLC_i", "s_TLC"),
       calculationRow(result, "z_duration_score", "Z-score duracion Z_D_i", "Z_D_i", "s_D"),
+    ];
+  }
+  if (result?.sensor_kind === "multistate") {
+    return [
+      calculationRow(result, "state_change_count", "Cambios C_i(W)", "state_change_count", "state_change_count"),
+      calculationRow(result, "state_probability", "Rareza P(s)", "state_probability", "state_probability"),
+      calculationRow(result, "transition_probability", "Rareza P(s_j|s_i)", "transition_probability", "transition_probability"),
+      calculationRow(result, "state_duration", "Duracion D_s(t)", "state_duration", "state_duration"),
+      calculationRow(result, "report_gap", "Brecha M_i(t)", "report_gap", "report_gap"),
     ];
   }
   return [
@@ -5073,6 +5061,9 @@ function calculationSummary(result) {
   if (result?.sensor_kind === "binary") {
     return `S_bin(W) usa doble horizonte: base larga y base reciente. El score mostrado es el menor entre ambas para evitar falsos positivos por cambios de rutina = ${formatNumber(result.evidence_score)}. Luego P_sos = S_bin / (S_bin + tau_i) = ${formatNumber(result.suspicion_score)}.`;
   }
+  if (result?.sensor_kind === "multistate") {
+    return `Version ${result.score_version || "multistate-v1"}: evidencia = max(s_C, s_estado, s_trans, s_D, s_M) = ${formatNumber(result.evidence_score)}. Solo usa estados y transiciones observados; las series de alta cardinalidad se excluyen antes del puntaje.`;
+  }
   return `Version ${result.score_version || "v2"}: phi(u)=ln(1+u)/(ln(1+u)+lambda), con phi(1)=0.60. Evidencia continua = max(s_H, s_R, s_C, s_D_const, s_M, s_DSPOT) = ${formatNumber(result.evidence_score)}. El score de sospecha conserva ese mismo valor; expresa fuerza de evidencia, no una probabilidad = ${formatNumber(result.suspicion_score)}.`;
 }
 
@@ -5088,6 +5079,18 @@ function readingRows(result) {
       { label: "P_on,i(W)", value: formatPercent(reading.active_ratio) },
       { label: "G_i(t)", value: formatSeconds(reading.gap_seconds) },
       { label: "TLC_i(t)", value: formatSeconds(reading.time_since_last_change_seconds) },
+      { label: "M_i(t)", value: formatSeconds(reading.report_gap_seconds) },
+      { label: "Ventana", value: formatSeconds(reading.window_seconds) },
+    ];
+  }
+  if (result?.sensor_kind === "multistate") {
+    return [
+      { label: "Estado observado", value: reading.state ?? result.observed_state ?? "-" },
+      { label: "Estado anterior", value: reading.previous_state ?? "-" },
+      { label: "C_i(W)", value: reading.state_changes ?? "-" },
+      { label: "P(s)", value: formatNumber(reading.state_probability) },
+      { label: "P(s_j|s_i)", value: formatNumber(reading.transition_probability) },
+      { label: "D_s(t)", value: formatSeconds(reading.state_duration_seconds) },
       { label: "M_i(t)", value: formatSeconds(reading.report_gap_seconds) },
       { label: "Ventana", value: formatSeconds(reading.window_seconds) },
     ];
@@ -5116,7 +5119,7 @@ function objectRows(object) {
 
 function temporalContextRows(result) {
   const context = result.temporal_context || {};
-  return [
+  const rows = [
     { label: "Lapso observado", value: timeWindowLabel(result.time_window) || "local" },
     { label: "Consistencia temporal", value: temporalConsistencyText(context.temporal_consistency) },
     { label: "Score local", value: formatNumber(context.local_score) },
@@ -5124,6 +5127,14 @@ function temporalContextRows(result) {
     { label: "Patron repetido", value: context.repeated_pattern ? "si" : "no" },
     { label: "Dias similares", value: context.similar_days_in_month ?? "-" },
   ];
+  if (result.replay) {
+    rows.push(
+      { label: "Reloj de deteccion simulado", value: shortDate(result.replay.detected_at_simulated) },
+      { label: "Retraso por lote", value: formatDuration(result.replay.detection_delay_seconds) },
+      { label: "Evaluacion causal", value: result.replay.causal ? "si, sin filas futuras" : "no" },
+    );
+  }
+  return rows;
 }
 
 function temporalConsistencyText(value) {
@@ -5202,7 +5213,7 @@ function standardDeviation(values, mean = average(values)) {
 function formatReading(result) {
   const reading = result.reading || {};
   if (reading.missing_ticks !== undefined) {
-    return `missing ${reading.missing_ticks} ticks / M=${formatSeconds(reading.report_gap_seconds ?? reading.gap_seconds)}`;
+    return `missing ${reading.missing_ticks} lecturas / M=${formatSeconds(reading.report_gap_seconds ?? reading.gap_seconds)}`;
   }
   if (result.sensor_kind === "binary") {
     return [
@@ -5213,6 +5224,16 @@ function formatReading(result) {
       `TLC=${formatSeconds(reading.time_since_last_change_seconds)}`,
       `M=${formatSeconds(reading.report_gap_seconds)}`,
     ].join(" ");
+  }
+  if (result.sensor_kind === "multistate") {
+    return [
+      `estado ${reading.state ?? result.observed_state ?? "-"}`,
+      `C=${reading.state_changes ?? "-"}`,
+      `P(s)=${formatNumber(reading.state_probability)}`,
+      `P(trans)=${formatNumber(reading.transition_probability)}`,
+      `D=${formatSeconds(reading.state_duration_seconds)}`,
+      `M=${formatSeconds(reading.report_gap_seconds)}`,
+    ].join(" / ");
   }
   const parts = [`valor ${reading.value ?? result.value ?? result.observed_state ?? "-"}`];
   if (reading.delta_value !== undefined) {
@@ -5243,6 +5264,62 @@ function normalityDetail(normality) {
     return "sin generar";
   }
   return normality.mode === "persisted" ? "persistida en cache" : "en memoria";
+}
+
+function historyLoadPhaseLabel(phase) {
+  const labels = {
+    queued: "Carga en espera",
+    uploading: "Subiendo archivo",
+    saving_upload: "Guardando archivo",
+    upload_saved: "Archivo recibido",
+    preparing: "Preparando carga",
+    reading_csv: "Leyendo CSV",
+    validating_columns: "Validando columnas",
+    normalizing: "Normalizando estructura",
+    normalizing_timestamps: "Normalizando fechas",
+    classifying_entities: "Clasificando entidades",
+    normalizing_values: "Normalizando valores",
+    sorting_history: "Ordenando historico",
+    building_catalog: "Construyendo catalogo",
+    history_ready: "Historico normalizado",
+    resetting_state: "Reiniciando estado",
+    persisting_normality: "Persistiendo normalidad",
+    finalizing: "Finalizando carga",
+    building_timeline: "Preparando visualizacion",
+    ready: "Historico listo",
+    failed: "Carga fallida",
+  };
+  return labels[phase] || "Procesando historico";
+}
+
+function formatDuration(value, fallback = "-") {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return fallback;
+  }
+  if (seconds < 60) {
+    return `${Math.round(seconds)} s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes} min ${remainingSeconds} s`;
+}
+
+function formatBytes(value) {
+  if (value === undefined || value === null || value === "") {
+    return "-";
+  }
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "-";
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KiB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function formatElapsed(ms) {
@@ -5335,11 +5412,6 @@ function splitDateTime(value) {
   }
   const [date, time = ""] = formatted.split(" ");
   return { date, time: time.replace("Z", "") || "-" };
-}
-
-function iterationProgress(done, target) {
-  const total = Math.max(1, Number(target) || 1);
-  return Math.min(100, Math.max(0, (Number(done) / total) * 100));
 }
 
 createRoot(document.getElementById("root")).render(<App />);

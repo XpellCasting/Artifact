@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 
 import pandas as pd
@@ -17,6 +18,66 @@ from app.main import EstadoAplicacion  # noqa: E402
 
 
 class CargaHistorialTest(unittest.TestCase):
+    def test_carga_asincrona_reporta_progreso_y_resultado(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ruta = base / "history.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "entity_id": "sensor.progress_temperature",
+                        "state": str(18 + index * 0.1),
+                        "last_changed": f"2026-05-01T18:{index:02d}:00.000Z",
+                    }
+                    for index in range(10)
+                ]
+            ).to_csv(ruta, index=False)
+            filtro = FiltroEstadistico()
+            filtro.continuos.conf_path = base / "conf.txt"
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=filtro,
+                static_history_dir=base / "static_history",
+                real_history_path=ruta,
+                analysis_cache_path=base / "cache" / "analysis.json",
+            )
+
+            job = estado.iniciar_carga_real()
+            limite = time.monotonic() + 10
+            while job["status"] in {"queued", "running"} and time.monotonic() < limite:
+                time.sleep(0.01)
+                job = estado.estado_carga_real(job["job_id"])
+
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["phase"], "ready")
+            self.assertEqual(job["progress"], 100.0)
+            self.assertEqual(job["history"]["rows"], 10)
+            self.assertEqual(job["eta_seconds"], 0.0)
+
+    def test_status_sin_autoload_informa_archivo_disponible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ruta = base / "history.csv"
+            ruta.write_text(
+                "entity_id,state,last_changed\n"
+                "sensor.available_temperature,20,2026-05-01T18:00:00.000Z\n",
+                encoding="utf-8",
+            )
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=FiltroEstadistico(),
+                static_history_dir=base / "static_history",
+                real_history_path=ruta,
+                analysis_cache_path=base / "cache" / "analysis.json",
+            )
+
+            status = estado.status(autoload=False)
+
+            self.assertFalse(status["exists"])
+            self.assertTrue(status["real_history_available"])
+            self.assertGreater(status["real_history_size_bytes"], 0)
+            self.assertIsNone(estado.historial)
+
     def test_carga_historial_real_y_clasifica_entidades(self):
         with tempfile.TemporaryDirectory() as tmp:
             ruta = Path(tmp) / "history.csv"
@@ -55,6 +116,84 @@ class CargaHistorialTest(unittest.TestCase):
             self.assertEqual(tipos["sensor.bathroom_temperature"], "continuous")
             self.assertEqual(tipos["binary_sensor.bathroom_motion"], "binary")
             self.assertEqual(tipos["select.home_mode"], "multistate")
+
+    def test_timeline_historial_usa_solo_las_filas_cargadas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ruta = base / "history.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "entity_id": "sensor.real_temperature",
+                        "state": "18.5",
+                        "last_changed": "2026-05-01T18:00:00.000Z",
+                    },
+                    {
+                        "entity_id": "sensor.real_temperature",
+                        "state": "19.0",
+                        "last_changed": "2026-05-01T19:00:00.000Z",
+                    },
+                ]
+            ).to_csv(ruta, index=False)
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=FiltroEstadistico(),
+                static_history_dir=base / "static_history",
+                real_history_path=ruta,
+                analysis_cache_path=base / "cache" / "analysis.json",
+            )
+            estado.historial = estado.cargador.cargar_real(ruta)
+
+            payload = estado.timeline_historial(start=None, end=None, max_points=100)
+            timestamps = [
+                point["timestamp"]
+                for entity in payload["entities"]
+                for point in entity["points"]
+            ]
+
+            self.assertEqual(len(timestamps), 2)
+            self.assertNotIn("faults", payload)
+
+    def test_timeline_multistate_codifica_solo_estados_observados(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ruta = base / "history.csv"
+            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
+            pd.DataFrame(
+                [
+                    {
+                        "entity_id": "sensor.review_status",
+                        "state": "ALERT" if indice % 3 == 0 else "DETECTION",
+                        "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
+                    }
+                    for indice in range(30)
+                ]
+            ).to_csv(ruta, index=False)
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=FiltroEstadistico(),
+                static_history_dir=base / "static_history",
+                real_history_path=ruta,
+                analysis_cache_path=base / "cache" / "analysis.json",
+            )
+            estado.historial = estado.cargador.cargar_real(ruta)
+
+            timeline = estado.timeline_historial(
+                start=None,
+                end=None,
+                max_points=100,
+            )["entities"][0]
+
+            self.assertEqual(timeline["sensor_kind"], "multistate")
+            self.assertEqual(timeline["chart_kind"], "categorical_state")
+            self.assertEqual(set(timeline["categories"]), {"ALERT", "DETECTION"})
+            self.assertEqual(timeline["analysis_status"], "eligible")
+            self.assertTrue(
+                all(
+                    point["value"] in timeline["categories"].values()
+                    for point in timeline["points"]
+                )
+            )
 
     def test_crea_historial_canonico_minimo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -287,6 +426,226 @@ class CargaHistorialTest(unittest.TestCase):
                 self.assertIn("time_since_last_change_seconds", item["reading"])
                 self.assertTrue(set(item["triggered_indicators"]).issubset(indicadores_validos))
 
+    def test_filtro_multistate_analiza_transiciones_y_excluye_alta_cardinalidad(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "history.csv"
+            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
+            filas = []
+            for indice in range(480):
+                estado = "DETECTION"
+                if indice in {60, 61, 180, 181, 360, 361}:
+                    estado = "ALERT"
+                if 240 <= indice < 270:
+                    estado = "ALERT" if indice % 2 else "DETECTION"
+                filas.append(
+                    {
+                        "entity_id": "sensor.sittingroom_review_status",
+                        "state": estado,
+                        "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
+                    }
+                )
+            filas.extend(
+                {
+                    "entity_id": "sensor.weatherstation_last_rain_2",
+                    "state": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
+                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
+                }
+                for indice in range(60)
+            )
+            pd.DataFrame(filas).to_csv(ruta, index=False)
+
+            historial = CargadorHistorial().cargar_real(ruta)
+            resultado = FiltroEstadistico().analizar_historial(
+                historial.eventos,
+                historial.entidades,
+                suspicion_threshold=0.6,
+            )
+            multistate = [
+                item
+                for item in resultado["results"]
+                if item["sensor_kind"] == "multistate"
+            ]
+            elegibilidad = resultado["summary"]["multistate_eligibility"]
+
+            self.assertTrue(multistate)
+            self.assertTrue(
+                any(item["suspected_pattern"] == "transition_burst" for item in multistate)
+            )
+            self.assertTrue(
+                all(item["score_version"] == "statistical-multistate-score-v1.0.0" for item in multistate)
+            )
+            self.assertEqual(elegibilidad["eligible_entities"], 1)
+            self.assertEqual(elegibilidad["by_status"]["high_cardinality"], 1)
+            self.assertEqual(
+                resultado["summary"]["implemented_kinds"],
+                ["continuous", "binary", "multistate"],
+            )
+            self.assertEqual(resultado["summary"]["pending_kinds"], [])
+
+    def test_reproduccion_validacion_es_causal_y_mide_retraso_por_lote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            desarrollo_path = base / "desarrollo.csv"
+            validacion_path = base / "validacion.csv"
+            inicio_desarrollo = pd.Timestamp("2026-02-01T00:00:00Z")
+            pd.DataFrame(
+                [
+                    {
+                        "entity_id": "sensor.replay_temperature",
+                        "state": str(20.0 + (indice % 2) * 0.1),
+                        "last_changed": (
+                            inicio_desarrollo + pd.Timedelta(minutes=indice)
+                        ).isoformat(),
+                    }
+                    for indice in range(120)
+                ]
+            ).to_csv(desarrollo_path, index=False)
+            inicio_validacion = pd.Timestamp("2026-05-21T00:00:00Z")
+            pd.DataFrame(
+                [
+                    {
+                        "entity_id": "sensor.replay_temperature",
+                        "state": str(
+                            50.0 if indice == 10 else 20.0 + (indice % 2) * 0.1
+                        ),
+                        "last_changed": (
+                            inicio_validacion + pd.Timedelta(minutes=indice)
+                        ).isoformat(),
+                    }
+                    for indice in range(30)
+                ]
+            ).to_csv(validacion_path, index=False)
+            filtro = FiltroEstadistico()
+            replay_conf_path = base / "replay-conf.txt"
+            filtro.continuos.conf_path = replay_conf_path
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=filtro,
+                static_history_dir=base / "static_history",
+                real_history_path=desarrollo_path,
+                analysis_cache_path=base / "cache" / "analysis.json",
+                validation_history_path=base / "uploaded_validation.csv",
+            )
+            estado.cargar_real()
+            estado_preparado_en = estado.future_evaluation_prepared_at
+            estado._preparar_continuidad_historica = lambda: self.fail(
+                "Subir Evaluacion no debe volver a preparar el estado historico"
+            )
+
+            preparado = estado.subir_validacion(validacion_path.read_bytes())
+            self.assertIsNone(estado.validation_baseline)
+            self.assertIsNone(estado.validation_context_map)
+            self.assertIsNone(estado.validation_context_events)
+            self.assertEqual(preparado["detector_state"], "pending_until_advance")
+            antes_del_pico = estado.avanzar_reproduccion_validacion(10, 0.6)
+            self.assertIsNotNone(estado.validation_baseline)
+            self.assertEqual(antes_del_pico["detector_state"], "active")
+            con_el_pico = estado.avanzar_reproduccion_validacion(3, 0.6)
+
+            self.assertTrue(preparado["loaded"])
+            self.assertEqual(preparado["evaluation_upload_mode"], "load_only")
+            self.assertEqual(preparado["state_source"], "historical_template")
+            self.assertEqual(
+                preparado["historical_state_prepared_at"], estado_preparado_en
+            )
+            self.assertEqual(estado.future_evaluation_prepared_at, estado_preparado_en)
+            self.assertFalse(replay_conf_path.exists())
+            self.assertEqual(preparado["baseline_summary"]["continuous"], 1)
+            self.assertFalse(
+                any(item.get("value") == 50.0 for item in antes_del_pico["results"])
+            )
+            pico = next(
+                item for item in con_el_pico["new_results"] if item.get("value") == 50.0
+            )
+            self.assertTrue(pico["replay"]["causal"])
+            self.assertEqual(pico["replay"]["detection_delay_seconds"], 120.0)
+            self.assertEqual(
+                len(con_el_pico["new_contextual_results"]),
+                len(con_el_pico["new_results"]),
+            )
+            self.assertEqual(
+                len(con_el_pico["new_classification_results"]),
+                len(con_el_pico["new_results"]),
+            )
+            diagnostico = next(
+                item
+                for item in con_el_pico["new_classification_results"]
+                if item["entity_id"] == "sensor.replay_temperature"
+            )
+            self.assertEqual(diagnostico["source"], "validation_replay")
+            self.assertTrue(diagnostico["replay"]["causal"])
+            self.assertEqual(
+                diagnostico["pipeline"]["contextual"]["outcome"],
+                "insufficient_coverage",
+            )
+            self.assertEqual(
+                con_el_pico["pipeline_summary"]["statistical"],
+                con_el_pico["pipeline_summary"]["classifier"],
+            )
+            self.assertEqual(
+                len(estado.contexto_actual()["results"]),
+                con_el_pico["contextual_count"],
+            )
+            self.assertEqual(
+                len(estado.clasificacion_actual()["results"]),
+                con_el_pico["classification_count"],
+            )
+            self.assertTrue(con_el_pico["last_batch"]["keeps_up_with_event_time"])
+            self.assertEqual(con_el_pico["processed_rows"], 13)
+
+            reiniciado = estado.reiniciar_reproduccion_validacion()
+            self.assertEqual(reiniciado["processed_rows"], 0)
+            self.assertEqual(reiniciado["detector_state"], "pending_until_advance")
+            self.assertIsNone(estado.validation_baseline)
+            self.assertEqual(reiniciado["detection_count"], 0)
+            self.assertEqual(reiniciado["contextual_count"], 0)
+            self.assertEqual(reiniciado["classification_count"], 0)
+
+    def test_reproduccion_validacion_multistate_detecta_estado_no_visto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            desarrollo_path = base / "desarrollo.csv"
+            inicio = pd.Timestamp("2026-02-01T00:00:00Z")
+            pd.DataFrame(
+                [
+                    {
+                        "entity_id": "sensor.review_status",
+                        "state": "ALERT" if indice % 2 else "DETECTION",
+                        "last_changed": (
+                            inicio + pd.Timedelta(minutes=indice)
+                        ).isoformat(),
+                    }
+                    for indice in range(60)
+                ]
+            ).to_csv(desarrollo_path, index=False)
+            validacion = pd.DataFrame(
+                [
+                    {
+                        "entity_id": "sensor.review_status",
+                        "state": "ERROR",
+                        "last_changed": "2026-05-21T00:00:00Z",
+                    }
+                ]
+            )
+            estado = EstadoAplicacion(
+                cargador=CargadorHistorial(),
+                filtro_estadistico=FiltroEstadistico(),
+                static_history_dir=base / "static_history",
+                real_history_path=desarrollo_path,
+                analysis_cache_path=base / "cache" / "analysis.json",
+                validation_history_path=base / "uploaded_validation.csv",
+            )
+            estado.cargar_real()
+            estado.subir_validacion(validacion.to_csv(index=False).encode("utf-8"))
+
+            avance = estado.avanzar_reproduccion_validacion(1, 0.6)
+            resultado = avance["new_results"][0]
+
+            self.assertEqual(resultado["sensor_kind"], "multistate")
+            self.assertEqual(resultado["observed_state"], "ERROR")
+            self.assertIn("state_probability", resultado["triggered_indicators"])
+            self.assertTrue(resultado["replay"]["causal"])
+
     def test_filtro_binario_report_gap_no_usa_p99_como_umbral_fuerte(self):
         filtro = FiltroEstadoBinarioEstadistico()
         perfil = PerfilBinario(
@@ -408,12 +767,16 @@ class CargaHistorialTest(unittest.TestCase):
             self.assertEqual(primero["results"], segundo["results"])
             with estado.analysis_cache_path.open("r", encoding="utf-8") as archivo:
                 cache = json.load(archivo)
-            self.assertEqual(cache["identity"]["cache_version"], 16)
+            self.assertEqual(cache["identity"]["cache_version"], 17)
             self.assertEqual(
                 cache["identity"]["continuous_score_specification"]["version"],
                 "statistical-continuous-score-v2.0.0",
             )
             self.assertTrue(cache["identity"]["continuous_conf_sha256"])
+            self.assertEqual(
+                cache["identity"]["multistate_score_specification"]["version"],
+                "statistical-multistate-score-v1.0.0",
+            )
             self.assertEqual(
                 cache["identity"]["contextual_filter_version"],
                 "contextual-spatiotemporal-v1",
@@ -440,383 +803,6 @@ class CargaHistorialTest(unittest.TestCase):
             identidad_vencida = estado._identidad_historial_real(0.6)
             self.assertTrue(identidad_vencida["contextual_map_expired"])
             self.assertIsNone(estado._leer_cache_analisis_real(0.6))
-
-    def test_tick_realtime_aplica_falla_y_reanaliza(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                {
-                    "entity_id": "sensor.realtime_temperature",
-                    "state": str(20.0 + (0.05 if indice % 2 else 0.0)),
-                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
-                }
-                for indice in range(120)
-            ]
-            pd.DataFrame(filas).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-
-            estado.cargar_real()
-            payload = estado.tick(
-                request=type(
-                    "Request",
-                    (),
-                    {
-                        "selected_entities": ["sensor.realtime_temperature"],
-                        "tick_seconds": 60,
-                        "faults": [
-                            {
-                                "entity_id": "sensor.realtime_temperature",
-                                "fault_type": "random/spike",
-                                "enabled": True,
-                            }
-                        ],
-                        "suspicion_threshold": 0.6,
-                    },
-                )()
-            )
-
-            self.assertEqual(payload["events"], 1)
-            self.assertTrue(payload["faults"])
-            self.assertTrue(payload["fault_ticks"])
-            self.assertEqual(payload["ground_truth_rows"], 1)
-            self.assertFalse(payload["fault_ticks"][0]["is_reliable"])
-            self.assertGreaterEqual(payload["result_count"], 1)
-            self.assertGreaterEqual(payload["classification_result_count"], 1)
-            self.assertTrue(payload["historical_classification_results"])
-            self.assertTrue(
-                any(
-                    item["entity_id"] == "sensor.realtime_temperature"
-                    and item["timestamp"] >= estado.realtime_current_timestamp[:19]
-                    for item in payload["results"]
-                )
-            )
-            evaluation = estado.evaluacion_clasificacion()
-            self.assertTrue(evaluation["available"])
-            self.assertEqual(
-                evaluation["dataset"]["source"],
-                "controlled_realtime_faults",
-            )
-            self.assertEqual(evaluation["funnel"]["all_labeled"], 1)
-            self.assertIn(
-                "fn_before_classifier",
-                evaluation["end_to_end"]["by_class"]["sensor_fault"],
-            )
-
-    def test_tick_realtime_sin_falla_usa_normalidad_de_entidad(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                {
-                    "entity_id": "sensor.normalized_temperature",
-                    "state": str(20.0 + (0.05 if indice % 2 else 0.0)),
-                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
-                }
-                for indice in range(119)
-            ]
-            filas.append(
-                {
-                    "entity_id": "sensor.normalized_temperature",
-                    "state": "80.0",
-                    "last_changed": (inicio + pd.Timedelta(minutes=119)).isoformat(),
-                }
-            )
-            pd.DataFrame(filas).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-
-            estado.cargar_real()
-            payload = estado.tick(
-                request=type(
-                    "Request",
-                    (),
-                    {
-                        "selected_entities": ["sensor.normalized_temperature"],
-                        "tick_seconds": 60,
-                        "faults": [],
-                        "suspicion_threshold": 0.6,
-                    },
-                )()
-            )
-
-            valor_tick = float(estado.realtime_events.iloc[-1]["value"])
-            self.assertLess(valor_tick, 21.0)
-            self.assertEqual(payload["fault_ticks"], [])
-
-    def test_ticks_binarios_sin_falla_respetan_ratio_temporal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                ("off", 0),
-                ("on", 10),
-                ("off", 11),
-                ("on", 20),
-                ("off", 21),
-            ]
-            pd.DataFrame(
-                [
-                    {
-                        "entity_id": "binary_sensor.normalized_motion",
-                        "state": estado,
-                        "last_changed": (inicio + pd.Timedelta(minutes=minuto)).isoformat(),
-                    }
-                    for estado, minuto in filas
-                ]
-            ).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-            request = type(
-                "Request",
-                (),
-                {
-                    "selected_entities": ["binary_sensor.normalized_motion"],
-                    "tick_seconds": 60,
-                    "faults": [],
-                    "suspicion_threshold": 0.6,
-                },
-            )()
-
-            estado.cargar_real()
-            for _ in range(20):
-                estado._insertar_tick_realtime(request)
-
-            activos = int((estado.realtime_events["value"] >= 0.5).sum())
-            self.assertLessEqual(activos, 2)
-
-    def test_manual_tick_inserta_muestra_continua(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                {
-                    "entity_id": "sensor.manual_temperature",
-                    "state": "20.0",
-                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
-                }
-                for indice in range(80)
-            ]
-            pd.DataFrame(filas).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-
-            estado.cargar_real()
-            payload = estado.manual_tick(
-                request=type(
-                    "Request",
-                    (),
-                    {
-                        "selected_entities": ["sensor.manual_temperature"],
-                        "sensor_states": {"sensor.manual_temperature": 24.5},
-                        "tick_seconds": 60,
-                        "suspicion_threshold": 0.6,
-                    },
-                )()
-            )
-
-            self.assertEqual(payload["summary"]["manual_inserted"], 1)
-            self.assertEqual(float(estado.realtime_events.iloc[-1]["value"]), 24.5)
-
-    def test_manual_tick_inserta_muestra_binaria(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                {
-                    "entity_id": "binary_sensor.manual_motion",
-                    "state": "off",
-                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
-                }
-                for indice in range(80)
-            ]
-            pd.DataFrame(filas).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-
-            estado.cargar_real()
-            payload = estado.manual_tick(
-                request=type(
-                    "Request",
-                    (),
-                    {
-                        "selected_entities": ["binary_sensor.manual_motion"],
-                        "sensor_states": {"binary_sensor.manual_motion": True},
-                        "tick_seconds": 60,
-                        "suspicion_threshold": 0.6,
-                    },
-                )()
-            )
-
-            self.assertEqual(payload["summary"]["manual_inserted"], 1)
-            self.assertEqual(estado.realtime_events.iloc[-1]["state"], "on")
-            self.assertEqual(float(estado.realtime_events.iloc[-1]["value"]), 1.0)
-
-    def test_manual_tick_respeta_cadencia_historica(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                {
-                    "entity_id": "sensor.slow_temperature",
-                    "state": "20.0",
-                    "last_changed": (inicio + pd.Timedelta(hours=indice)).isoformat(),
-                }
-                for indice in range(24)
-            ]
-            pd.DataFrame(filas).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-
-            estado.cargar_real()
-            payload = estado.manual_tick(
-                request=type(
-                    "Request",
-                    (),
-                    {
-                        "selected_entities": ["sensor.slow_temperature"],
-                        "sensor_states": {"sensor.slow_temperature": 21.0},
-                        "tick_seconds": 60,
-                        "suspicion_threshold": 0.6,
-                    },
-                )()
-            )
-
-            self.assertEqual(payload["summary"]["manual_inserted"], 0)
-            self.assertEqual(payload["summary"]["manual_skipped_by_cadence"], 1)
-            self.assertTrue(payload["summary"]["skipped_analysis"])
-            self.assertTrue(estado.realtime_events.empty)
-
-    def test_manual_tick_valor_continuo_fuera_de_normalidad_genera_sospecha(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                {
-                    "entity_id": "sensor.manual_alarm_temperature",
-                    "state": str(20.0 + (0.05 if indice % 2 else 0.0)),
-                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
-                }
-                for indice in range(120)
-            ]
-            pd.DataFrame(filas).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-
-            estado.cargar_real()
-            payload = estado.manual_tick(
-                request=type(
-                    "Request",
-                    (),
-                    {
-                        "selected_entities": ["sensor.manual_alarm_temperature"],
-                        "sensor_states": {"sensor.manual_alarm_temperature": 80.0},
-                        "tick_seconds": 60,
-                        "suspicion_threshold": 0.6,
-                    },
-                )()
-            )
-
-            self.assertEqual(payload["summary"]["manual_inserted"], 1)
-            self.assertTrue(payload["summary"]["incremental"])
-            self.assertTrue(
-                any(
-                    item["entity_id"] == "sensor.manual_alarm_temperature"
-                    and item["is_suspicious"]
-                    for item in payload["results"]
-                )
-            )
-
-    def test_iteraciones_realtime_usan_unidad_de_trabajo(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            ruta = base / "history.csv"
-            inicio = pd.Timestamp("2026-05-01T00:00:00Z")
-            filas = [
-                {
-                    "entity_id": "sensor.batch_temperature",
-                    "state": str(21.0 + (0.05 if indice % 2 else 0.0)),
-                    "last_changed": (inicio + pd.Timedelta(minutes=indice)).isoformat(),
-                }
-                for indice in range(120)
-            ]
-            pd.DataFrame(filas).to_csv(ruta, index=False)
-            estado = EstadoAplicacion(
-                cargador=CargadorHistorial(),
-                filtro_estadistico=FiltroEstadistico(),
-                static_history_dir=base / "static_history",
-                real_history_path=ruta,
-                analysis_cache_path=base / "cache" / "analysis.json",
-            )
-
-            estado.cargar_real()
-            payload = estado.iterations(
-                request=type(
-                    "Request",
-                    (),
-                    {
-                        "selected_entities": ["sensor.batch_temperature"],
-                        "tick_seconds": 60,
-                        "iteration_count": 5,
-                        "faults": [
-                            {
-                                "entity_id": "sensor.batch_temperature",
-                                "fault_type": "drift",
-                                "enabled": True,
-                            }
-                        ],
-                        "suspicion_threshold": 0.6,
-                    },
-                )()
-            )
-
-            self.assertEqual(payload["events"], 5)
-            self.assertEqual(payload["summary"]["iterations_done"], 5)
-            self.assertTrue(payload["faults"])
-            self.assertGreaterEqual(payload["result_count"], 1)
 
 
 if __name__ == "__main__":

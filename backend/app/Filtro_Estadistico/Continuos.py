@@ -90,7 +90,7 @@ class FiltroContinuoEstadistico:
             "aggregation": "maximum_component",
             "suspicion_score": "identity(evidence_score)",
             "hour_context_score": "same_soft_z_curve",
-            "realtime_cusum": "persistent_state_same_update_as_batch",
+            "cusum_state": "persistent_state_single_historical_pass",
             "operational_limits": "empirical_unless_user_edited",
             "isolated_reading_gap_cap": 0.5,
             "uses_simulated_dataset": False,
@@ -294,6 +294,8 @@ class FiltroContinuoEstadistico:
         self,
         serie: pd.DataFrame,
         entity_id: str,
+        *,
+        persistir_perfil_calculado: bool = True,
     ) -> dict[str, Any]:
         valores = pd.to_numeric(serie["value"], errors="coerce").dropna()
         if len(valores) < self.window_hampel:
@@ -304,7 +306,12 @@ class FiltroContinuoEstadistico:
         temporal["gap_seconds"] = temporal["timestamp_dt"].diff().dt.total_seconds()
         temporal["delta_value"] = temporal["value"].diff()
         temporal["rate_per_minute"] = temporal["delta_value"].abs() / (temporal["gap_seconds"].clip(lower=1.0) / 60.0)
-        perfil = self._perfil_desde_historial(entity_id, valores, temporal)
+        perfil = self._perfil_desde_historial(
+            entity_id,
+            valores,
+            temporal,
+            persistir_perfil_calculado=persistir_perfil_calculado,
+        )
 
         q01 = float(valores.quantile(0.01))
         q05 = float(valores.quantile(0.05))
@@ -314,7 +321,15 @@ class FiltroContinuoEstadistico:
         q95 = float(valores.quantile(0.95))
         q99 = float(valores.quantile(0.99))
         iqr = max(q75 - q25, perfil.value_floor)
-        perfil = replace(perfil, **self._limites_fisicos(entity_id, valores, iqr))
+        perfil = replace(
+            perfil,
+            **self._limites_fisicos(
+                entity_id,
+                valores,
+                iqr,
+                persistir_perfil_calculado=persistir_perfil_calculado,
+            ),
+        )
 
         # La normalidad se estima desde el cuerpo robusto del historico, no
         # desde el minimo y maximo observados, porque esos extremos pueden ser
@@ -450,62 +465,6 @@ class FiltroContinuoEstadistico:
             "last_score": 0.0,
             "last_residual": 0.0,
         }
-
-    def construir_estado_cusum(
-        self,
-        serie: pd.DataFrame,
-        base: dict[str, Any],
-    ) -> dict[str, float | None]:
-        """Reconstruye el estado CUSUM para continuar el flujo incremental."""
-        estado = self._estado_cusum_vacio()
-        if serie.empty:
-            return estado
-        trabajo = serie.sort_values("timestamp_dt").copy()
-        trabajo["value"] = pd.to_numeric(trabajo["value"], errors="coerce")
-        trabajo = trabajo[
-            trabajo["value"].notna() & trabajo["timestamp_dt"].notna()
-        ]
-        timestamp_previo: pd.Timestamp | None = None
-        for fila in trabajo.to_dict("records"):
-            timestamp = pd.to_datetime(
-                fila.get("timestamp_dt"),
-                errors="coerce",
-                utc=True,
-            )
-            if pd.isna(timestamp):
-                continue
-            gap_seconds = (
-                0.0
-                if timestamp_previo is None
-                else max(0.0, (timestamp - timestamp_previo).total_seconds())
-            )
-            fila_base = {
-                **fila,
-                "timestamp": str(
-                    fila.get("timestamp") or timestamp.isoformat()
-                ),
-            }
-            base_fila = self._base_horaria(base, fila_base)
-            valor = float(fila["value"])
-            _, score_limite = self._score_fisico(
-                valor,
-                base_fila["perfil"],
-            )
-            dentro_banda = (
-                base_fila["normal_lower"]
-                <= valor
-                <= base_fila["normal_upper"]
-            )
-            estado, _, _, _ = self._actualizar_cusum(
-                valor=valor,
-                gap_seconds=gap_seconds,
-                base=base_fila,
-                dentro_banda=dentro_banda,
-                score_limite_operacional=score_limite,
-                estado=estado,
-            )
-            timestamp_previo = timestamp
-        return estado
 
     def _actualizar_cusum(
         self,
@@ -703,7 +662,14 @@ class FiltroContinuoEstadistico:
         )
         return z_equivalente, self._score_desde_ratio(ratio)
 
-    def _perfil_desde_historial(self, entity_id: str, valores: pd.Series, temporal: pd.DataFrame) -> PerfilContinuo:
+    def _perfil_desde_historial(
+        self,
+        entity_id: str,
+        valores: pd.Series,
+        temporal: pd.DataFrame,
+        *,
+        persistir_perfil_calculado: bool = True,
+    ) -> PerfilContinuo:
         q25 = float(valores.quantile(0.25))
         q50 = float(valores.quantile(0.50))
         q75 = float(valores.quantile(0.75))
@@ -739,9 +705,19 @@ class FiltroContinuoEstadistico:
             min_constant_seconds=max(gap_p95 * 10.0, gap_median),
             min_gap_seconds=max(gap_p99, gap_median),
         )
-        return self._perfil_configurado(entity_id, perfil)
+        return self._perfil_configurado(
+            entity_id,
+            perfil,
+            persistir_perfil_calculado=persistir_perfil_calculado,
+        )
 
-    def _perfil_configurado(self, entity_id: str, perfil: PerfilContinuo) -> PerfilContinuo:
+    def _perfil_configurado(
+        self,
+        entity_id: str,
+        perfil: PerfilContinuo,
+        *,
+        persistir_perfil_calculado: bool = True,
+    ) -> PerfilContinuo:
         seccion = f"continuous.{entity_id}"
         claves = [
             "value_floor",
@@ -756,6 +732,8 @@ class FiltroContinuoEstadistico:
                 return replace(perfil, **valores)
             except (Error, TypeError, ValueError):
                 pass
+        if not persistir_perfil_calculado:
+            return perfil
         if not self.config.has_section(seccion):
             self.config.add_section(seccion)
             self.config.set(seccion, "origen", "calculado_desde_historial")
@@ -764,7 +742,14 @@ class FiltroContinuoEstadistico:
         self._guardar_config()
         return perfil
 
-    def _limites_fisicos(self, entity_id: str, valores: pd.Series, iqr: float) -> dict[str, float]:
+    def _limites_fisicos(
+        self,
+        entity_id: str,
+        valores: pd.Series,
+        iqr: float,
+        *,
+        persistir_perfil_calculado: bool = True,
+    ) -> dict[str, float]:
         seccion = f"continuous.{entity_id}"
         if self.config.has_section(seccion):
             try:
@@ -775,7 +760,8 @@ class FiltroContinuoEstadistico:
                     "extreme_high": self.config.getfloat(seccion, "extreme_high"),
                 }
             except (Error, TypeError, ValueError):
-                self.config.remove_section(seccion)
+                if persistir_perfil_calculado:
+                    self.config.remove_section(seccion)
 
         q01 = float(valores.quantile(0.01))
         q05 = float(valores.quantile(0.05))
@@ -787,6 +773,8 @@ class FiltroContinuoEstadistico:
             "extreme_low": q05 - 1.5 * iqr,
             "extreme_high": q95 + 1.5 * iqr,
         }
+        if not persistir_perfil_calculado:
+            return limites
         if not self.config.has_section(seccion):
             self.config.add_section(seccion)
         self.config.set(seccion, "origen", "calculado_desde_historial")

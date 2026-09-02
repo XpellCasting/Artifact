@@ -164,56 +164,68 @@ class FiltroEstadoBinarioEstadistico:
         acumulado_cambios = np.concatenate([[0], np.cumsum(cambios_array)])
         activo_acumulado = self._activo_acumulado_en_eventos(tiempos, valores)
 
-        ultima_activacion: pd.Timestamp | None = None
-        ultimo_cambio: pd.Timestamp | None = None
-        filas: list[dict[str, Any]] = []
-        for indice, fila in trabajo.iterrows():
-            timestamp = fila["timestamp_dt"]
-            tiempo_actual = tiempos[indice]
-            if int(fila["activation_event"]) == 1:
-                ultima_activacion = timestamp
-            if int(fila["state_change_event"]) == 1:
-                ultimo_cambio = timestamp
-            gap_activacion = 0.0
-            if ultima_activacion is not None:
-                gap_activacion = max(0.0, (timestamp - ultima_activacion).total_seconds())
-            gap_cambio = 0.0
-            if ultimo_cambio is not None:
-                gap_cambio = max(0.0, (timestamp - ultimo_cambio).total_seconds())
+        if len(trabajo) == 0:
+            return pd.DataFrame()
 
-            window_start = timestamp - pd.Timedelta(seconds=perfil.window_seconds)
-            inicio_segundos = tiempo_actual - perfil.window_seconds
-            izquierda = int(np.searchsorted(tiempos, inicio_segundos, side="right"))
-            activaciones = int(acumulado_activaciones[indice + 1] - acumulado_activaciones[izquierda])
-            cambios = int(acumulado_cambios[indice + 1] - acumulado_cambios[izquierda])
-            activo_segundos = self._segundos_activos_rapido(
-                tiempos=tiempos,
-                valores=valores,
-                activo_acumulado=activo_acumulado,
-                inicio=inicio_segundos,
-                fin=tiempo_actual,
-                indice_fin=indice,
-            )
-            inactivo_segundos = max(0.0, perfil.window_seconds - activo_segundos)
-            filas.append(
-                {
-                    "entity_id": fila["entity_id"],
-                    "timestamp": fila["timestamp"],
-                    "timestamp_dt": timestamp,
-                    "window_start": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "state": fila["state"],
-                    "value": float(fila["value"]),
-                    "activations": activaciones,
-                    "state_changes": cambios,
-                    "active_seconds": activo_segundos,
-                    "inactive_seconds": inactivo_segundos,
-                    "active_ratio": max(0.0, min(1.0, activo_segundos / perfil.window_seconds)),
-                    "gap_seconds": gap_activacion,
-                    "time_since_last_change_seconds": gap_cambio,
-                    "report_gap_seconds": max(0.0, float(fila["report_gap_seconds"])),
-                }
-            )
-        return pd.DataFrame(filas)
+        indices = np.arange(len(trabajo), dtype="int64")
+        inicios = tiempos - float(perfil.window_seconds)
+        izquierdas = np.searchsorted(tiempos, inicios, side="right")
+        activaciones = acumulado_activaciones[indices + 1] - acumulado_activaciones[izquierdas]
+        cambios = acumulado_cambios[indices + 1] - acumulado_cambios[izquierdas]
+
+        indices_inicio = np.searchsorted(tiempos, inicios, side="right") - 1
+        activo_en_inicio = np.zeros(len(trabajo), dtype="float64")
+        con_previo = indices_inicio >= 0
+        previos = indices_inicio[con_previo]
+        activo_en_inicio[con_previo] = (
+            activo_acumulado[previos]
+            + np.maximum(0.0, inicios[con_previo] - tiempos[previos])
+            * valores[previos]
+        )
+        activos_segundos = np.maximum(0.0, activo_acumulado - activo_en_inicio)
+        inactivos_segundos = np.maximum(
+            0.0, float(perfil.window_seconds) - activos_segundos
+        )
+
+        activacion_en = np.where(activaciones_array == 1, tiempos, -np.inf)
+        cambio_en = np.where(cambios_array == 1, tiempos, -np.inf)
+        ultima_activacion = np.maximum.accumulate(activacion_en)
+        ultimo_cambio = np.maximum.accumulate(cambio_en)
+        gaps_activacion = np.where(
+            np.isfinite(ultima_activacion),
+            np.maximum(0.0, tiempos - ultima_activacion),
+            0.0,
+        )
+        gaps_cambio = np.where(
+            np.isfinite(ultimo_cambio),
+            np.maximum(0.0, tiempos - ultimo_cambio),
+            0.0,
+        )
+
+        salida = trabajo[
+            ["entity_id", "timestamp", "timestamp_dt", "state", "value"]
+        ].copy()
+        salida["window_start"] = (
+            trabajo["timestamp_dt"]
+            - pd.Timedelta(seconds=perfil.window_seconds)
+        ).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        salida["value"] = valores
+        salida["activations"] = activaciones.astype("int64")
+        salida["state_changes"] = cambios.astype("int64")
+        salida["active_seconds"] = activos_segundos
+        salida["inactive_seconds"] = inactivos_segundos
+        salida["active_ratio"] = np.clip(
+            activos_segundos / float(perfil.window_seconds), 0.0, 1.0
+        )
+        salida["gap_seconds"] = gaps_activacion
+        salida["time_since_last_change_seconds"] = gaps_cambio
+        salida["report_gap_seconds"] = np.maximum(
+            0.0,
+            pd.to_numeric(
+                trabajo["report_gap_seconds"], errors="coerce"
+            ).fillna(0.0).to_numpy(dtype="float64"),
+        )
+        return salida
 
     def _activo_acumulado_en_eventos(self, tiempos: np.ndarray, valores: np.ndarray) -> np.ndarray:
         acumulado = np.zeros(len(tiempos), dtype="float64")

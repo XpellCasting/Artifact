@@ -70,18 +70,6 @@ const_epsilon_floor = 0.000000
 min_constant_seconds = 600.000000
 min_gap_seconds = 60.000000
 
-[continuous.sensor.batch_temperature]
-origen = calculado_desde_historial
-physical_low = 20.746137
-physical_high = 21.249885
-extreme_low = 20.925000
-extreme_high = 21.125000
-value_floor = 0.050000
-rate_floor_per_minute = 0.050000
-const_epsilon_floor = 0.012500
-min_constant_seconds = 600.000000
-min_gap_seconds = 60.000000
-
 [continuous.sensor.office_temperature]
 origen = calculado_desde_historial
 physical_low = -18.000000
@@ -91,54 +79,6 @@ extreme_high = 36.000000
 value_floor = 0.018000
 rate_floor_per_minute = 12.000000
 const_epsilon_floor = 0.000000
-min_constant_seconds = 600.000000
-min_gap_seconds = 60.000000
-
-[continuous.sensor.realtime_temperature]
-origen = calculado_desde_historial
-physical_low = 19.850000
-physical_high = 20.200000
-extreme_low = 19.925000
-extreme_high = 20.125000
-value_floor = 0.050000
-rate_floor_per_minute = 0.050000
-const_epsilon_floor = 0.012500
-min_constant_seconds = 600.000000
-min_gap_seconds = 60.000000
-
-[continuous.sensor.manual_temperature]
-origen = calculado_desde_historial
-physical_low = 6.500000
-physical_high = 34.400000
-extreme_low = 13.250000
-extreme_high = 26.750000
-value_floor = 0.020000
-rate_floor_per_minute = 0.000000
-const_epsilon_floor = 0.000000
-min_constant_seconds = 600.000000
-min_gap_seconds = 60.000000
-
-[continuous.sensor.slow_temperature]
-origen = calculado_desde_historial
-physical_low = 19.940000
-physical_high = 20.060000
-extreme_low = 19.970000
-extreme_high = 20.030000
-value_floor = 0.020000
-rate_floor_per_minute = 0.000000
-const_epsilon_floor = 0.000000
-min_constant_seconds = 36000.000000
-min_gap_seconds = 3600.000000
-
-[continuous.sensor.manual_alarm_temperature]
-origen = calculado_desde_historial
-physical_low = 19.850000
-physical_high = 20.200000
-extreme_low = 19.925000
-extreme_high = 20.125000
-value_floor = 0.050000
-rate_floor_per_minute = 0.050000
-const_epsilon_floor = 0.012500
 min_constant_seconds = 600.000000
 min_gap_seconds = 60.000000
 

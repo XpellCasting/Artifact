@@ -82,69 +82,6 @@ class PuntajeEstadisticoContinuoV2Test(unittest.TestCase):
         self.assertLess(score, 1.0)
         self.assertEqual(self.filtro._score_fisico(50.0, perfil), (0.0, 0.0))
 
-    def test_cusum_incremental_continua_el_mismo_estado_del_batch(self):
-        perfil = PerfilContinuo(
-            value_floor=0.1,
-            rate_floor_per_minute=0.1,
-            const_epsilon_floor=0.1,
-            min_constant_seconds=60.0,
-            min_gap_seconds=60.0,
-        )
-        base = {
-            "hourly_baseline": {},
-            "normal_lower": -1.0,
-            "normal_upper": 1.0,
-            "residual_scale": 1.0,
-            "cusum_k": 0.5,
-            "cusum_theta": 8.0,
-            "cusum_reset_gap_seconds": 3600.0,
-            "perfil": perfil,
-        }
-        start = pd.Timestamp("2026-05-01T00:00:00Z")
-        history = pd.DataFrame(
-            [
-                {
-                    "timestamp": (start + pd.Timedelta(minutes=index)).isoformat(),
-                    "timestamp_dt": start + pd.Timedelta(minutes=index),
-                    "value": 0.0,
-                }
-                for index in range(20)
-            ]
-        )
-        new_row = {
-            "timestamp": (start + pd.Timedelta(minutes=20)).isoformat(),
-            "timestamp_dt": start + pd.Timedelta(minutes=20),
-            "value": 10.0,
-        }
-
-        previous_state = self.filtro.construir_estado_cusum(history, base)
-        incremental_state, raw, score, _ = self.filtro._actualizar_cusum(
-            valor=10.0,
-            gap_seconds=60.0,
-            base=base,
-            dentro_banda=False,
-            score_limite_operacional=0.0,
-            estado=previous_state,
-        )
-        batch_state = self.filtro.construir_estado_cusum(
-            pd.concat([history, pd.DataFrame([new_row])], ignore_index=True),
-            base,
-        )
-
-        self.assertAlmostEqual(raw, float(batch_state["last_raw"]), places=12)
-        self.assertAlmostEqual(
-            score,
-            float(batch_state["last_score"]),
-            places=12,
-        )
-        self.assertAlmostEqual(
-            float(incremental_state["ewma"]),
-            float(batch_state["ewma"]),
-            places=12,
-        )
-        self.assertGreater(raw, base["cusum_theta"])
-        self.assertGreater(score, 0.6)
-
     def test_score_final_es_evidencia_y_brecha_aislada_no_avanza(self):
         componentes = {
             "s_H": 0.0,

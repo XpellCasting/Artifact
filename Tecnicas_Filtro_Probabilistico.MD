@@ -180,7 +180,7 @@ valor esperado = nivel + tendencia + estacionalidad
 
 **Limitaciones:**
 
-- Mas orientado a analisis por lotes que a tick realtime simple.
+- Mas orientado a analisis por lotes que a procesamiento incremental simple.
 - Requiere suficiente historial estacional.
 - Mas dificil de explicar que Hampel/MAD directo.
 

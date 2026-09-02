@@ -315,6 +315,160 @@ class FiltroContextualEspacioTemporal:
             "map_quality": mapa.get("refresh", {}),
         }
 
+    def analizar_causal(
+        self,
+        sospechas: list[dict[str, Any]],
+        eventos_disponibles: pd.DataFrame,
+        entidades: pd.DataFrame,
+        mapa: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Evalua cada sospecha usando solo observaciones con fecha no futura."""
+        inicio = perf_counter()
+        trabajo = self._preparar_eventos(eventos_disponibles)
+        catalogo = self._catalogo(entidades, trabajo)
+        edges_by_source: dict[str, list[dict[str, Any]]] = {}
+        for edge in mapa.get("edges", []):
+            if edge.get("accepted"):
+                edges_by_source.setdefault(str(edge["source"]), []).append(edge)
+        stats_mapa = {
+            str(node.get("entity_id")): {
+                "observations": int(node.get("observations") or 0),
+                "coverage_ratio": float(node.get("coverage_ratio") or 0.0),
+                "center": node.get("center"),
+                "scale": node.get("scale"),
+                "state_probabilities": dict(node.get("state_probabilities") or {}),
+            }
+            for node in mapa.get("nodes", [])
+            if node.get("entity_id")
+        }
+        candidatas = sorted(
+            (
+                dict(item)
+                for item in sospechas
+                if item.get("is_suspicious")
+                or item.get("passed_to_contextual_filter")
+            ),
+            key=lambda item: pd.to_datetime(
+                item.get("timestamp"), errors="coerce", utc=True
+            ),
+        )
+        resultados: list[dict[str, Any]] = []
+        for sospecha in candidatas:
+            timestamp = pd.to_datetime(
+                sospecha.get("timestamp"), errors="coerce", utc=True
+            )
+            entity_id = str(sospecha.get("entity_id", ""))
+            edges = edges_by_source.get(entity_id, [])
+            relevantes = {entity_id, *(str(edge["target"]) for edge in edges)}
+            if pd.isna(timestamp):
+                scoped = trabajo.iloc[0:0].copy()
+            else:
+                bucket = timestamp.floor(f"{self.config.window_seconds}s")
+                desde = bucket - pd.Timedelta(
+                    seconds=self.config.max_lag_windows
+                    * self.config.window_seconds
+                )
+                mascara_entidades = trabajo["entity_id"].isin(relevantes)
+                scoped = trabajo[
+                    mascara_entidades
+                    & trabajo["timestamp_dt"].between(
+                        desde,
+                        timestamp,
+                        inclusive="both",
+                    )
+                ].copy()
+                anteriores = trabajo[
+                    mascara_entidades
+                    & trabajo["timestamp_dt"].lt(desde)
+                    & trabajo["sensor_kind"].isin({"binary", "multistate"})
+                ]
+                if not anteriores.empty:
+                    arrastre = (
+                        anteriores.sort_values("timestamp_dt")
+                        .groupby("entity_id", sort=False)
+                        .tail(1)
+                        .copy()
+                    )
+                    arrastre["timestamp_dt"] = desde
+                    arrastre["timestamp"] = desde.isoformat()
+                    scoped = pd.concat(
+                        [arrastre, scoped], ignore_index=True
+                    ).sort_values(["entity_id", "timestamp_dt"])
+
+            catalogo_scoped = {
+                item: catalogo[item]
+                for item in relevantes
+                if item in catalogo
+            }
+            signals, _, stats_runtime, _ = self._construir_senales(
+                scoped,
+                catalogo_scoped,
+            )
+            stats = dict(stats_runtime)
+            for item in relevantes:
+                if item in stats_mapa:
+                    stats[item] = stats_mapa[item]
+            concurrentes = sorted(
+                {
+                    str(item.get("entity_id", ""))
+                    for item in candidatas
+                    if self._bucket_key(item.get("timestamp"))
+                    == self._bucket_key(sospecha.get("timestamp"))
+                    and pd.to_datetime(
+                        item.get("timestamp"), errors="coerce", utc=True
+                    )
+                    <= timestamp
+                }
+            ) if pd.notna(timestamp) else []
+            resultado = self._evaluar_sospecha(
+                sospecha=sospecha,
+                signals=signals,
+                stats=stats,
+                edges=edges,
+                map_quality={
+                    "version": mapa.get("map_version"),
+                    **mapa.get("refresh", {}),
+                },
+                concurrent_entities=concurrentes,
+            )
+            resultado["causal_runtime"] = {
+                "causal": True,
+                "uses_future_rows": False,
+                "available_through": (
+                    None if pd.isna(timestamp) else timestamp.isoformat()
+                ),
+                "baseline_partition": "development",
+            }
+            resultados.append(resultado)
+
+        outcomes: dict[str, int] = {}
+        for item in resultados:
+            outcome = str(item["context_outcome"])
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        return {
+            "results": resultados,
+            "summary": {
+                "evaluated": len(resultados),
+                "by_outcome": outcomes,
+                "supported": outcomes.get("supported", 0),
+                "contradicted": outcomes.get("contradicted", 0),
+                "unexplained": outcomes.get("unexplained", 0),
+                "insufficient_coverage": outcomes.get(
+                    "insufficient_coverage", 0
+                ),
+                "possible_common_cause": sum(
+                    bool(item.get("common_cause", {}).get("candidate"))
+                    for item in resultados
+                ),
+                "elapsed_ms": self._redondear(
+                    (perf_counter() - inicio) * 1000.0, 3
+                ),
+                "causal": True,
+                "uses_future_rows": False,
+            },
+            "map_quality": mapa.get("refresh", {}),
+        }
+
     def _preparar_eventos(self, eventos: pd.DataFrame) -> pd.DataFrame:
         if eventos is None or eventos.empty:
             return pd.DataFrame(

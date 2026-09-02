@@ -41,10 +41,10 @@ physical_high = 23.700000
 extreme_low = 7.800000
 extreme_high = 19.300000
 value_floor = 0.100000
-rate_floor_per_minute = 0.010017
+rate_floor_per_minute = 0.010016
 const_epsilon_floor = 0.025000
-min_constant_seconds = 11983.094000
-min_gap_seconds = 1797.569360
+min_constant_seconds = 11982.490000
+min_gap_seconds = 1797.442000
 
 [continuous.sensor.foyer_motion_temperature]
 origen = calculado_desde_historial
@@ -53,10 +53,10 @@ physical_high = 21.400000
 extreme_low = 6.000000
 extreme_high = 17.700000
 value_floor = 0.100000
-rate_floor_per_minute = 0.010016
+rate_floor_per_minute = 0.010017
 const_epsilon_floor = 0.025000
-min_constant_seconds = 11990.179000
-min_gap_seconds = 2096.468920
+min_constant_seconds = 11981.240000
+min_gap_seconds = 2096.223150
 
 [continuous.sensor.hall_sensor_temperature]
 origen = calculado_desde_historial
@@ -65,10 +65,10 @@ physical_high = 36.000000
 extreme_low = 6.050000
 extreme_high = 27.650000
 value_floor = 0.100000
-rate_floor_per_minute = 0.010045
+rate_floor_per_minute = 0.010022
 const_epsilon_floor = 0.025000
-min_constant_seconds = 11971.430000
-min_gap_seconds = 1796.487200
+min_constant_seconds = 11978.440000
+min_gap_seconds = 1797.441780
 
 [continuous.sensor.office_sensor_temperature]
 origen = calculado_desde_historial
@@ -77,10 +77,10 @@ physical_high = 29.706000
 extreme_low = 10.850000
 extreme_high = 21.780000
 value_floor = 0.100000
-rate_floor_per_minute = 0.010014
+rate_floor_per_minute = 0.010015
 const_epsilon_floor = 0.025000
-min_constant_seconds = 11987.718000
-min_gap_seconds = 2096.960760
+min_constant_seconds = 11983.295000
+min_gap_seconds = 2096.949000
 
 [continuous.sensor.weatherstation_humidity_in_2]
 origen = calculado_desde_historial
@@ -89,10 +89,10 @@ physical_high = 78.000000
 extreme_low = 48.000000
 extreme_high = 71.000000
 value_floor = 1.000000
-rate_floor_per_minute = 0.487532
+rate_floor_per_minute = 0.478672
 const_epsilon_floor = 0.250000
-min_constant_seconds = 61650.400000
-min_gap_seconds = 15749.954750
+min_constant_seconds = 50584.145000
+min_gap_seconds = 12831.545120
 
 [continuous.sensor.weatherstation_inside_temp_2]
 origen = calculado_desde_historial
@@ -101,10 +101,10 @@ physical_high = 25.000000
 extreme_low = 12.388889
 extreme_high = 21.222222
 value_floor = 0.055556
-rate_floor_per_minute = 0.039732
+rate_floor_per_minute = 0.041718
 const_epsilon_floor = 0.013889
-min_constant_seconds = 3599.620000
-min_gap_seconds = 540.139600
+min_constant_seconds = 3599.820000
+min_gap_seconds = 599.978000
 
 [continuous.sensor.living_humidity]
 origen = calculado_desde_historial
@@ -129,4 +129,491 @@ rate_floor_per_minute = 0.025000
 const_epsilon_floor = 0.375000
 min_constant_seconds = 36000.000000
 min_gap_seconds = 3600.000000
+
+[continuous.sensor.chair_load_value]
+origen = calculado_desde_historial
+physical_low = -89278.160000
+physical_high = 155584.900000
+extreme_low = -17737.600000
+extreme_high = 121773.200000
+value_floor = 522.000000
+rate_floor_per_minute = 195.547951
+const_epsilon_floor = 127.500000
+min_constant_seconds = 47255.798000
+min_gap_seconds = 16020.486360
+
+[continuous.sensor.entertainment_room_sensor_illuminance]
+origen = calculado_desde_historial
+physical_low = -30.000000
+physical_high = 62.000000
+extreme_low = -15.000000
+extreme_high = 39.000000
+value_floor = 1.000000
+rate_floor_per_minute = 0.150453
+const_epsilon_floor = 0.250000
+min_constant_seconds = 20969.836000
+min_gap_seconds = 9543.264840
+
+[continuous.sensor.foyer_motion_illuminance]
+origen = calculado_desde_historial
+physical_low = -165.000000
+physical_high = 309.000000
+extreme_low = -82.500000
+extreme_high = 190.500000
+value_floor = 1.000000
+rate_floor_per_minute = 0.200627
+const_epsilon_floor = 0.250000
+min_constant_seconds = 11294.074000
+min_gap_seconds = 4786.363980
+
+[continuous.sensor.hall_all_active_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 3.500000
+value_floor = 1.000000
+rate_floor_per_minute = 5.543558
+const_epsilon_floor = 0.250000
+min_constant_seconds = 8162.940000
+min_gap_seconds = 5325.548520
+
+[continuous.sensor.hall_all_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 3.500000
+value_floor = 1.000000
+rate_floor_per_minute = 5.570386
+const_epsilon_floor = 0.250000
+min_constant_seconds = 6549.006000
+min_gap_seconds = 3604.508520
+
+[continuous.sensor.hall_cat_active_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 3.075896
+const_epsilon_floor = 0.250000
+min_constant_seconds = 42978.947500
+min_gap_seconds = 14485.846350
+
+[continuous.sensor.hall_cat_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 2.728407
+const_epsilon_floor = 0.250000
+min_constant_seconds = 26186.495000
+min_gap_seconds = 11446.263050
+
+[continuous.sensor.hall_dog_active_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 4.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 6.062024
+const_epsilon_floor = 0.250000
+min_constant_seconds = 69603.500000
+min_gap_seconds = 22779.256160
+
+[continuous.sensor.hall_dog_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 4.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 4.082333
+const_epsilon_floor = 0.250000
+min_constant_seconds = 41246.460500
+min_gap_seconds = 17004.467270
+
+[continuous.sensor.hall_person_active_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 4.510474
+const_epsilon_floor = 0.250000
+min_constant_seconds = 19238.894000
+min_gap_seconds = 15916.941440
+
+[continuous.sensor.hall_person_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 4.374408
+const_epsilon_floor = 0.250000
+min_constant_seconds = 11528.413500
+min_gap_seconds = 6651.428830
+
+[continuous.sensor.hall_sensor_illuminance]
+origen = calculado_desde_historial
+physical_low = -18.000000
+physical_high = 36.000000
+extreme_low = -9.000000
+extreme_high = 23.000000
+value_floor = 1.000000
+rate_floor_per_minute = 0.096384
+const_epsilon_floor = 0.250000
+min_constant_seconds = 56891.352000
+min_gap_seconds = 16446.600140
+
+[continuous.sensor.kitchen_sensor_illuminance]
+origen = calculado_desde_historial
+physical_low = -78.000000
+physical_high = 141.000000
+extreme_low = -39.000000
+extreme_high = 90.000000
+value_floor = 1.000000
+rate_floor_per_minute = 0.151143
+const_epsilon_floor = 0.250000
+min_constant_seconds = 14978.532000
+min_gap_seconds = 8685.598010
+
+[continuous.sensor.kitchen_sensor_temperature]
+origen = calculado_desde_historial
+physical_low = -11.500000
+physical_high = 46.900000
+extreme_low = 0.900000
+extreme_high = 35.300000
+value_floor = 0.100000
+rate_floor_per_minute = 0.010015
+const_epsilon_floor = 0.025000
+min_constant_seconds = 14966.778000
+min_gap_seconds = 2391.038400
+
+[continuous.sensor.kitchen_switch_battery]
+origen = calculado_desde_historial
+physical_low = -38.000000
+physical_high = 79.000000
+extreme_low = -16.000000
+extreme_high = 51.000000
+value_floor = 1.000000
+rate_floor_per_minute = 0.269348
+const_epsilon_floor = 0.250000
+min_constant_seconds = 106519.170000
+min_gap_seconds = 35617.568000
+
+[continuous.sensor.office_sensor_illuminance]
+origen = calculado_desde_historial
+physical_low = -33.000000
+physical_high = 63.000000
+extreme_low = -16.500000
+extreme_high = 41.500000
+value_floor = 1.000000
+rate_floor_per_minute = 0.150191
+const_epsilon_floor = 0.250000
+min_constant_seconds = 33565.260000
+min_gap_seconds = 35928.045000
+
+[continuous.sensor.sittingroom_all_active_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 4.308596
+const_epsilon_floor = 0.250000
+min_constant_seconds = 6709.285000
+min_gap_seconds = 2898.195700
+
+[continuous.sensor.sittingroom_all_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 3.475962
+const_epsilon_floor = 0.250000
+min_constant_seconds = 8623.927500
+min_gap_seconds = 3307.846450
+
+[continuous.sensor.sittingroom_cat_active_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 3.790968
+const_epsilon_floor = 0.250000
+min_constant_seconds = 9960.240000
+min_gap_seconds = 4046.747950
+
+[continuous.sensor.sittingroom_cat_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 2.542122
+const_epsilon_floor = 0.250000
+min_constant_seconds = 18495.697000
+min_gap_seconds = 6418.815620
+
+[continuous.sensor.sittingroom_person_active_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 4.170000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 4.278149
+const_epsilon_floor = 0.250000
+min_constant_seconds = 18558.321000
+min_gap_seconds = 20599.608800
+
+[continuous.sensor.sittingroom_person_count]
+origen = calculado_desde_historial
+physical_low = -3.000000
+physical_high = 5.000000
+extreme_low = -1.500000
+extreme_high = 2.500000
+value_floor = 1.000000
+rate_floor_per_minute = 3.944805
+const_epsilon_floor = 0.250000
+min_constant_seconds = 12451.937500
+min_gap_seconds = 7434.956190
+
+[continuous.sensor.weatherstation_abs_pressure_2]
+origen = calculado_desde_historial
+physical_low = 29.127000
+physical_high = 30.266000
+extreme_low = 29.355500
+extreme_high = 30.025500
+value_floor = 0.029664
+rate_floor_per_minute = 0.001500
+const_epsilon_floor = 0.000750
+min_constant_seconds = 1800.260000
+min_gap_seconds = 299.863870
+
+[continuous.sensor.weatherstation_daily_rain_2]
+origen = calculado_desde_historial
+physical_low = -1.882500
+physical_high = 3.352800
+extreme_low = -0.931250
+extreme_high = 2.252750
+value_floor = 0.010000
+rate_floor_per_minute = 0.001904
+const_epsilon_floor = 0.002500
+min_constant_seconds = 144721.026000
+min_gap_seconds = 542271.950800
+
+[continuous.sensor.weatherstation_dew_point_2]
+origen = calculado_desde_historial
+physical_low = -13.487389
+physical_high = 31.377778
+extreme_low = -4.091667
+extreme_high = 22.363889
+value_floor = 0.055556
+rate_floor_per_minute = 0.063502
+const_epsilon_floor = 0.012500
+min_constant_seconds = 2999.620000
+min_gap_seconds = 540.091000
+
+[continuous.sensor.weatherstation_event_rain_2]
+origen = calculado_desde_historial
+physical_low = -1.890000
+physical_high = 3.390800
+extreme_low = -0.925000
+extreme_high = 2.289000
+value_floor = 0.010000
+rate_floor_per_minute = 0.001903
+const_epsilon_floor = 0.002500
+min_constant_seconds = 53192.118000
+min_gap_seconds = 536311.143910
+
+[continuous.sensor.weatherstation_feels_like_2]
+origen = calculado_desde_historial
+physical_low = -32.944444
+physical_high = 68.344444
+extreme_low = -11.694444
+extreme_high = 47.877778
+value_floor = 0.116111
+rate_floor_per_minute = 0.042556
+const_epsilon_floor = 0.006944
+min_constant_seconds = 3599.420000
+min_gap_seconds = 660.029090
+
+[continuous.sensor.weatherstation_hourly_rain_rate_2]
+origen = calculado_desde_historial
+physical_low = -0.510000
+physical_high = 1.481000
+extreme_low = -0.255000
+extreme_high = 0.795000
+value_floor = 0.040000
+rate_floor_per_minute = 0.015031
+const_epsilon_floor = 0.007500
+min_constant_seconds = 8069.314000
+min_gap_seconds = 95102.457460
+
+[continuous.sensor.weatherstation_humidity_2]
+origen = calculado_desde_historial
+physical_low = -61.000000
+physical_high = 178.000000
+extreme_low = -13.500000
+extreme_high = 129.500000
+value_floor = 1.000000
+rate_floor_per_minute = 0.400016
+const_epsilon_floor = 0.250000
+min_constant_seconds = 7799.970000
+min_gap_seconds = 1979.685200
+
+[continuous.sensor.weatherstation_lifetime_rain_2]
+origen = calculado_desde_historial
+physical_low = 140.851880
+physical_high = 156.986280
+extreme_low = 144.015400
+extreme_high = 153.772400
+value_floor = 0.148965
+rate_floor_per_minute = 0.002000
+const_epsilon_floor = 0.001750
+min_constant_seconds = 38146.894500
+min_gap_seconds = 617691.624470
+
+[continuous.sensor.weatherstation_max_gust_2]
+origen = calculado_desde_historial
+physical_low = -14.100000
+physical_high = 27.700000
+extreme_low = -7.050000
+extreme_high = 18.450000
+value_floor = 1.100000
+rate_floor_per_minute = 0.016970
+const_epsilon_floor = 0.275000
+min_constant_seconds = 404879.594000
+min_gap_seconds = 55762.782400
+
+[continuous.sensor.weatherstation_monthly_rain_2]
+origen = calculado_desde_historial
+physical_low = -5.285000
+physical_high = 8.346400
+extreme_low = -2.587500
+extreme_high = 5.544500
+value_floor = 0.017650
+rate_floor_per_minute = 0.001796
+const_epsilon_floor = 0.002500
+min_constant_seconds = 44254.632500
+min_gap_seconds = 684155.047200
+
+[continuous.sensor.weatherstation_rel_pressure_2]
+origen = calculado_desde_historial
+physical_low = 29.329000
+physical_high = 30.603000
+extreme_low = 29.593000
+extreme_high = 30.322000
+value_floor = 0.029959
+rate_floor_per_minute = 0.001500
+const_epsilon_floor = 0.000750
+min_constant_seconds = 1800.260000
+min_gap_seconds = 299.863000
+
+[continuous.sensor.weatherstation_solar_rad_2]
+origen = calculado_desde_historial
+physical_low = -1339.120000
+physical_high = 2158.040000
+extreme_low = -660.630000
+extreme_high = 1423.630000
+value_floor = 4.467800
+rate_floor_per_minute = 2.704351
+const_epsilon_floor = 0.092500
+min_constant_seconds = 1199.561500
+min_gap_seconds = 120.456230
+
+[continuous.sensor.weatherstation_solar_rad_lx]
+origen = calculado_desde_historial
+physical_low = -169511.000000
+physical_high = 273171.000000
+extreme_low = -83624.500000
+extreme_high = 180207.500000
+value_floor = 565.550000
+rate_floor_per_minute = 342.617875
+const_epsilon_floor = 11.750000
+min_constant_seconds = 1199.561500
+min_gap_seconds = 120.456230
+
+[continuous.sensor.weatherstation_temp_2]
+origen = calculado_desde_historial
+physical_low = -32.944444
+physical_high = 69.166667
+extreme_low = -11.944444
+extreme_high = 48.722222
+value_floor = 0.115556
+rate_floor_per_minute = 0.039738
+const_epsilon_floor = 0.013889
+min_constant_seconds = 3600.383000
+min_gap_seconds = 719.956060
+
+[continuous.sensor.weatherstation_uv]
+origen = calculado_desde_historial
+physical_low = -9.000000
+physical_high = 18.000000
+extreme_low = -4.500000
+extreme_high = 11.500000
+value_floor = 1.000000
+rate_floor_per_minute = 0.466561
+const_epsilon_floor = 0.250000
+min_constant_seconds = 24599.651000
+min_gap_seconds = 52400.431600
+
+[continuous.sensor.weatherstation_weekly_rain_2]
+origen = calculado_desde_historial
+physical_low = -4.080000
+physical_high = 6.621000
+extreme_low = -2.010000
+extreme_high = 4.425000
+value_floor = 0.013600
+rate_floor_per_minute = 0.001903
+const_epsilon_floor = 0.002500
+min_constant_seconds = 48332.127000
+min_gap_seconds = 482812.522770
+
+[continuous.sensor.weatherstation_wind_dir_2]
+origen = calculado_desde_historial
+physical_low = -662.000000
+physical_high = 1021.000000
+extreme_low = -322.500000
+extreme_high = 684.500000
+value_floor = 3.000000
+rate_floor_per_minute = 19.615782
+const_epsilon_floor = 0.250000
+min_constant_seconds = 652.714000
+min_gap_seconds = 120.140000
+
+[continuous.sensor.weatherstation_wind_gust_2]
+origen = calculado_desde_historial
+physical_low = -6.900000
+physical_high = 15.000000
+extreme_low = -3.450000
+extreme_high = 9.250000
+value_floor = 1.100000
+rate_floor_per_minute = 0.549789
+const_epsilon_floor = 0.275000
+min_constant_seconds = 3599.381500
+min_gap_seconds = 1560.061480
+
+[continuous.sensor.weatherstation_wind_speed_2]
+origen = calculado_desde_historial
+physical_low = -4.500000
+physical_high = 10.100000
+extreme_low = -2.250000
+extreme_high = 6.250000
 

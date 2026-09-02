@@ -8,10 +8,9 @@ el filtro estadistico-temporal implementado en el backend.
 La pagina funciona como interfaz local del artefacto. Su objetivo principal es
 permitir:
 
-- cargar o crear un historial;
+- cargar un historial real;
 - revisar las entidades disponibles;
 - visualizar el historico en charts;
-- seleccionar entidades;
 - ejecutar el filtro estadistico;
 - revisar sospechas detectadas;
 - abrir el detalle de calculo de una sospecha.
@@ -26,7 +25,7 @@ El flujo esperado de uso es:
 ```text
 1. Abrir la pagina web.
 2. Consultar el estado del backend.
-3. Cargar historial real o crear/cargar historial canonico.
+3. Cargar o subir el historial real.
 4. Revisar cantidad total de datos y entidades disponibles.
 5. Ajustar el umbral global de sospecha.
 6. Ejecutar el filtro estadistico.
@@ -43,7 +42,7 @@ se apoya en:
 
 ```text
 GET /health
-GET /history/static/status
+GET /history/static/status?autoload=false
 ```
 
 ### Cargar historial
@@ -54,24 +53,13 @@ defecto se define mediante la variable de entorno `REAL_HISTORY_PATH`.
 Endpoint usado:
 
 ```text
-POST /history/real/load
+POST /history/real/load/start
+POST /history/real/upload/start
+GET /history/real/load/jobs/{job_id}
 ```
 
 Cuando se carga el historial, el backend normaliza los datos hacia el modelo
 interno del artefacto.
-
-### Crear o cargar historial canonico
-
-Permite crear un historial canonico minimo si no existe, o cargarlo si ya esta
-creado.
-
-Endpoint usado:
-
-```text
-POST /history/static/ensure
-```
-
-Este flujo sirve como respaldo cuando no se quiere usar el historial real.
 
 ### Resumen del historial
 
@@ -90,21 +78,18 @@ La informacion viene desde:
 GET /history/static/status
 ```
 
-### Seleccion de entidades
-
-La pagina permite marcar entidades para enfocar los charts o el flujo realtime.
-La seleccion no modifica el historial original.
-
 ### Charts historicos
 
 Los charts muestran la serie temporal de cada entidad. Para entidades continuas
 se muestra la linea de valores numericos. Para entidades binarias se muestran
-activaciones o porcentaje de tiempo activo por lapsos.
+activaciones o porcentaje de tiempo activo por lapsos. Para entidades
+multivaloricas se muestra cada estado real como una categoria en el eje Y; no se
+asigna significado numerico a la categoria.
 
 Endpoint usado:
 
 ```text
-GET /realtime/timeline
+GET /history/timeline
 ```
 
 Parametros relevantes:
@@ -178,22 +163,55 @@ La ventana muestra:
 - lectura de la entidad;
 - puntaje final.
 
-## Simulacion realtime actual
+### Evaluacion con eventos futuros
 
-La pagina tambien puede generar ticks manuales sobre entidades seleccionadas. En
-la version actual del backend, el tick copia el ultimo estado historico de la
-entidad seleccionada y avanza el timestamp.
+El control se encuentra dentro de la vista Estadistico y recibe el CSV posterior
+al historico cargado. El estado inicial de CUSUM, las ventanas binarias, las
+transiciones multistate y el mapa contextual se preparan al cargar el historico.
+Subir Evaluacion solo guarda, valida y ordena ese CSV: no entrena ni reinicializa
+detectores. La copia del estado congelado se activa recien al pulsar `Avanzar`.
+No crea otro modulo de resultados; al avanzar reproduce los eventos
+en orden global de `last_changed` y envía cada sospecha a las vistas Contextual
+y Clasificador existentes. Las filas futuras nunca se usan para puntuar ni
+contextualizar el evento actual.
+
+Controles disponibles:
+
+- subir los eventos futuros de `Evaluacion`;
+- elegir entre 100 y 10.000 eventos por avance;
+- avanzar una vez, reproducir automaticamente, pausar o reiniciar;
+- cambiar el umbral antes de continuar;
+- observar reloj, porcentaje, rendimiento y avance por el pipeline existente.
 
 Endpoints usados:
 
 ```text
-POST /realtime/tick
-POST /realtime/reset
-GET /realtime/current
+POST /validation/replay/upload
+GET  /validation/replay/status
+POST /validation/replay/advance
+POST /validation/replay/reset
 ```
 
-Este flujo todavia no reemplaza el analisis del historial real. Sirve como base
-para una simulacion posterior.
+Cada resultado incluye:
+
+```json
+{
+  "replay": {
+    "detected_at_simulated": "2026-05-21T01:10:10.209000+00:00",
+    "detection_delay_seconds": 120.0,
+    "causal": true
+  }
+}
+```
+
+El mismo metadato causal se conserva al pasar a Contextual y Clasificador. Las
+tablas que muestran estos resultados son las vistas ya existentes de ambos
+filtros; el control de Evaluacion solo informa el progreso y el embudo.
+
+El retraso depende del lote: con avance de un evento se aproxima a cero; con
+lotes grandes aumenta porque la interfaz publica las detecciones cuando termina
+el lote. `keeps_up_with_event_time` compara el tiempo de procesamiento contra el
+intervalo temporal real cubierto por ese lote.
 
 ## Funcionamiento general del filtro estadistico
 
@@ -208,7 +226,7 @@ Ese archivo separa el analisis por tipo de entidad:
 ```text
 continuous -> backend/app/Filtro_Estadistico/Continuos.py
 binary     -> backend/app/Filtro_Estadistico/Estados_Binarios.py
-multistate -> pendiente en esta etapa
+multistate -> backend/app/Filtro_Estadistico/Estados_Multivalor.py
 ```
 
 El flujo interno es:
@@ -312,6 +330,45 @@ absence_gap
 missing_gap
 ```
 
+## Filtro para entidades multivaloricas
+
+El filtro multivalorico trabaja solo con los estados y transiciones observados
+en el CSV real. Una entidad es elegible cuando tiene al menos 24 lecturas
+validas, entre 2 y 32 estados y no presenta una proporcion de valores unicos
+propia de campos libres o timestamps.
+
+Indicadores:
+
+```text
+C_i(W)       -> cambios de estado dentro de una hora
+P(s)         -> frecuencia historica del estado observado
+P(s_j|s_i)   -> frecuencia condicional de la transicion observada
+D_s(t)       -> tiempo transcurrido en el estado actual
+M_i(t)       -> brecha entre reportes validos
+```
+
+El puntaje conserva la fuerza de la evidencia estadistica:
+
+```text
+suspicion_score = max(s_C, s_estado, s_transicion, s_D, s_M)
+```
+
+Patrones posibles:
+
+```text
+transition_burst
+rare_state
+rare_transition
+state_persistence
+missing_gap
+```
+
+Las entidades con un solo estado se informan como `insufficient_states`; las
+que contienen un valor casi siempre unico se informan como `high_cardinality`.
+En el conjunto Desarrollo actual son elegibles
+`sensor.hall_review_status` y `sensor.sittingroom_review_status`, ambas con los
+estados reales `ALERT` y `DETECTION`.
+
 ## Salida comun del filtro
 
 Los resultados mantienen una salida comun para que la pagina pueda mostrarlos en
@@ -344,8 +401,12 @@ umbral global de la interfaz.
 
 ## Limitaciones actuales
 
-- El filtro multivalorico no esta activo en esta etapa.
-- El filtro contextual todavia no clasifica la causa final.
+- El perfil multivalorico se estima desde el historial que se encuentra cargado;
+  todavia no se exporta como un modelo entrenado en Desarrollo para reutilizarlo
+  sin recalibracion en Validacion y Prueba.
+- Una persistencia o brecha es una sospecha estadistica; en historicos basados
+  en cambios de estado puede representar una permanencia real y requiere el
+  filtro contextual antes de interpretarse como falla.
 - El resultado es una sospecha inicial, no un diagnostico definitivo.
-- El realtime actual es una base para simulacion futura, no una reproduccion
-  completa de eventos reales.
+- La linea temporal reproduce las fechas del CSV real; no genera observaciones
+  ni timestamps artificiales.

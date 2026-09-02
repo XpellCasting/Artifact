@@ -241,6 +241,58 @@ class ContextualFilterTests(unittest.TestCase):
             )
         )
 
+    def test_contexto_causal_ignora_eventos_posteriores_del_mismo_lote(self):
+        historico, entidades = construir_historial()
+        mapa = self.filtro.construir_mapa(historico, entidades)
+        timestamp = pd.Timestamp("2026-01-06T00:05:00Z")
+        sospecha = {
+            "entity_id": "sensor.temperature",
+            "timestamp": timestamp.isoformat(),
+            "sensor_kind": "continuous",
+            "value": 8.0,
+            "suspicion_score": 0.8,
+            "is_suspicious": True,
+            "passed_to_contextual_filter": True,
+            "pattern": "abrupt_change",
+        }
+        disponibles = self._agregar_ventana(
+            historico,
+            timestamp,
+            temperature=8.0,
+            humidity=-16.0,
+            climate_state="off",
+            climate_valid=True,
+        )
+        futuro = self._agregar_ventana(
+            historico.iloc[0:0],
+            timestamp + pd.Timedelta(minutes=20),
+            temperature=8.0,
+            humidity=16.0,
+            climate_state="on",
+            climate_valid=True,
+        )
+        lote_con_futuro = pd.concat(
+            [disponibles, futuro], ignore_index=True
+        )
+
+        sin_futuro = self.filtro.analizar_causal(
+            [sospecha], disponibles, entidades, mapa
+        )["results"][0]
+        con_futuro = self.filtro.analizar_causal(
+            [sospecha], lote_con_futuro, entidades, mapa
+        )["results"][0]
+
+        self.assertEqual(
+            con_futuro["context_score"], sin_futuro["context_score"]
+        )
+        self.assertEqual(con_futuro["evidence"], sin_futuro["evidence"])
+        self.assertTrue(con_futuro["causal_runtime"]["causal"])
+        self.assertFalse(con_futuro["causal_runtime"]["uses_future_rows"])
+        self.assertEqual(
+            con_futuro["causal_runtime"]["available_through"],
+            timestamp.isoformat(),
+        )
+
     def test_politica_de_actualizacion_detecta_catalogo_y_antiguedad(self):
         eventos, entidades = construir_historial()
         mapa = self.filtro.construir_mapa(eventos, entidades)

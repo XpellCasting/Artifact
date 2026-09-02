@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -10,6 +10,7 @@ import pandas as pd
 ESTADOS_INVALIDOS = {"", "unknown", "unavailable", "none", "null", "nan"}
 ESTADOS_ACTIVOS = {"on", "open", "home", "active", "detected", "true", "1"}
 ESTADOS_INACTIVOS = {"off", "closed", "not_home", "inactive", "clear", "false", "0"}
+ProgressCallback = Callable[[str, float, str], None]
 
 
 @dataclass
@@ -28,15 +29,36 @@ class CargadorHistorial:
     columnas_minimas_reales = {"entity_id", "state", "last_changed"}
     columnas_minimas_canonicas = {"entity_id", "timestamp", "state"}
 
-    def cargar_real(self, ruta: Path) -> ResultadoHistorial:
+    def cargar_real(
+        self,
+        ruta: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ResultadoHistorial:
         if not ruta.exists():
             raise FileNotFoundError(f"No se encontro el historial real: {ruta}")
+        self._reportar_progreso(
+            progress_callback,
+            "reading_csv",
+            5.0,
+            f"Leyendo {ruta.name}",
+        )
         frame = pd.read_csv(ruta, dtype=str, keep_default_na=False).fillna("")
+        self._reportar_progreso(
+            progress_callback,
+            "validating_columns",
+            22.0,
+            f"{len(frame):,} filas leidas; validando columnas",
+        )
         faltantes = sorted(self.columnas_minimas_reales - set(frame.columns))
         if faltantes:
             raise ValueError(f"El historial real no contiene columnas requeridas: {', '.join(faltantes)}")
         frame = frame.rename(columns={"last_changed": "timestamp"})
-        return self._normalizar(frame, origen="real", ruta=ruta)
+        return self._normalizar(
+            frame,
+            origen="real",
+            ruta=ruta,
+            progress_callback=progress_callback,
+        )
 
     def cargar_canonico(self, directorio: Path) -> ResultadoHistorial:
         eventos_path = directorio / "events.csv"
@@ -144,7 +166,19 @@ class CargadorHistorial:
         metadata.to_csv(metadata_path, index=False)
         return self.cargar_canonico(directorio)
 
-    def _normalizar(self, frame: pd.DataFrame, origen: str, ruta: Path) -> ResultadoHistorial:
+    def _normalizar(
+        self,
+        frame: pd.DataFrame,
+        origen: str,
+        ruta: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ResultadoHistorial:
+        self._reportar_progreso(
+            progress_callback,
+            "normalizing",
+            28.0,
+            "Preparando columnas de trabajo",
+        )
         trabajo = frame.copy()
         trabajo["_raw_index"] = range(len(trabajo))
         trabajo["entity_id"] = trabajo["entity_id"].astype(str).str.strip()
@@ -154,6 +188,12 @@ class CargadorHistorial:
             trabajo["entity_id"].ne("")
             & trabajo["timestamp_dt"].notna()
         ].copy()
+        self._reportar_progreso(
+            progress_callback,
+            "normalizing_timestamps",
+            42.0,
+            f"{len(trabajo):,} filas con entidad y fecha validas",
+        )
         trabajo["is_valid_value"] = ~trabajo["state"].str.lower().isin(ESTADOS_INVALIDOS)
         trabajo["timestamp"] = trabajo["timestamp_dt"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         if "domain" in trabajo.columns:
@@ -190,6 +230,12 @@ class CargadorHistorial:
             trabajo["entity_id"].map(tipo_por_entidad),
         )
         trabajo["sensor_kind"] = trabajo["sensor_kind"].fillna(sensor_kind_base)
+        self._reportar_progreso(
+            progress_callback,
+            "classifying_entities",
+            62.0,
+            "Clasificando entidades continuas, binarias y multivaloricas",
+        )
         trabajo["tipo_interno"] = trabajo["sensor_kind"].map(
             {
                 "continuous": "continua",
@@ -203,6 +249,12 @@ class CargadorHistorial:
         es_binario = trabajo["sensor_kind"].eq("binary") & es_valido
         trabajo.loc[es_continuo, "value"] = valores_numericos.loc[es_continuo].astype(float)
         trabajo.loc[es_binario, "value"] = estado.loc[es_binario].isin(ESTADOS_ACTIVOS).astype(float)
+        self._reportar_progreso(
+            progress_callback,
+            "normalizing_values",
+            74.0,
+            "Normalizando valores numericos y estados",
+        )
         if "unit_of_measurement" in trabajo.columns:
             trabajo["unit_of_measurement"] = trabajo["unit_of_measurement"].astype(str).str.strip()
         else:
@@ -216,9 +268,21 @@ class CargadorHistorial:
         trabajo.loc[trabajo["device_class"].eq("") & (entity_lower.str.contains("temperature", regex=False) | entity_lower.str.contains("temp", regex=False)), "device_class"] = "temperature"
         trabajo.loc[trabajo["device_class"].eq("") & (entity_lower.str.contains("motion", regex=False) | entity_lower.str.contains("pir", regex=False)), "device_class"] = "motion"
         trabajo.loc[trabajo["device_class"].eq("") & (entity_lower.str.contains("door", regex=False) | entity_lower.str.contains("contact", regex=False) | entity_lower.str.contains("window", regex=False)), "device_class"] = "door"
+        self._reportar_progreso(
+            progress_callback,
+            "sorting_history",
+            84.0,
+            "Ordenando el historico por entidad y tiempo",
+        )
         trabajo = trabajo.sort_values(["entity_id", "timestamp_dt"]).reset_index(drop=True)
 
         entidades = self._construir_entidades(trabajo)
+        self._reportar_progreso(
+            progress_callback,
+            "building_catalog",
+            93.0,
+            f"Catalogo construido con {len(entidades):,} entidades",
+        )
         muestras = self._construir_muestras_normalizacion(frame, trabajo)
         metadatos = {
             "source_type": origen,
@@ -228,12 +292,28 @@ class CargadorHistorial:
             "start": None if trabajo.empty else trabajo["timestamp_dt"].min().isoformat(),
             "end": None if trabajo.empty else trabajo["timestamp_dt"].max().isoformat(),
         }
+        self._reportar_progreso(
+            progress_callback,
+            "history_ready",
+            100.0,
+            "Lectura y normalizacion completadas",
+        )
         return ResultadoHistorial(
             eventos=trabajo,
             entidades=entidades,
             metadatos=metadatos,
             normalizacion_muestras=muestras,
         )
+
+    @staticmethod
+    def _reportar_progreso(
+        callback: ProgressCallback | None,
+        phase: str,
+        progress: float,
+        message: str,
+    ) -> None:
+        if callback is not None:
+            callback(phase, float(progress), message)
 
     def _clasificar_fila(self, fila: pd.Series) -> str:
         if str(fila.get("sensor_kind", "")).strip() in {"continuous", "binary", "multistate"}:
