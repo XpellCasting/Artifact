@@ -11,3 +11,7 @@ data/static_history/*.csv
 !data/static_history/.gitkeep
 data/cache/*.json
 !data/cache/.gitkeep
+data/datosreales/Historico108dias.csv
+data/datosreales/history.csv
+data/datosreales/history.csv
+/data/datosreales
