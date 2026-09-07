@@ -275,7 +275,7 @@ class MotorReproduccionValidacion:
                     "value": valor,
                     "timestamp": str(
                         fila.get("timestamp")
-                        or timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        or timestamp.isoformat()
                     ),
                     "local_median": local_median,
                     "local_mad": local_mad,
@@ -562,7 +562,7 @@ class MotorReproduccionValidacion:
                             "timestamp": str(fila.get("timestamp")),
                             "window_start": (
                                 timestamp - pd.Timedelta(seconds=filtro.window_seconds)
-                            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            ).isoformat(),
                             "window_end": str(fila.get("timestamp")),
                             "sensor_kind": "multistate",
                             "tipo_interno": "estado_multivalor",

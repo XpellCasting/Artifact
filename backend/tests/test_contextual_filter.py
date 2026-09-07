@@ -161,6 +161,11 @@ class ContextualFilterTests(unittest.TestCase):
             [sospecha], supported_events, entidades, mapa
         )["results"][0]
         self.assertEqual(supported["context_outcome"], "supported")
+        self.assertEqual(supported["contextual_class"], "environmental_anomaly")
+        self.assertTrue(supported["routing"]["terminal"])
+        self.assertFalse(supported["routing"]["send_to_classifier"])
+        self.assertEqual(supported["alert"]["level"], "informational")
+        self.assertEqual(supported["alert"]["delivery"], "recorded_only")
         self.assertGreater(supported["support_score"], 0)
         self.assertTrue(
             any(item["c_j_normalized"] > 0 for item in supported["supports"])
@@ -178,10 +183,18 @@ class ContextualFilterTests(unittest.TestCase):
             [sospecha], contradicted_events, entidades, mapa
         )["results"][0]
         self.assertEqual(contradicted["context_outcome"], "contradicted")
+        self.assertTrue(contradicted["routing"]["send_to_classifier"])
+        self.assertIsNone(contradicted["contextual_class"])
+        self.assertIsNone(contradicted["alert"])
         self.assertGreater(contradicted["contradiction_score"], 0)
 
+        # Sin lecturas actuales ni una ultima lectura dentro de su vigencia.
+        missing_history = historico[
+            ~historico["entity_id"].eq("sensor.humidity")
+            | historico["timestamp_dt"].lt(timestamp - pd.Timedelta(hours=1))
+        ]
         missing_events = self._agregar_ventana(
-            historico,
+            missing_history,
             timestamp,
             temperature=8.0,
             humidity=None,
@@ -192,10 +205,13 @@ class ContextualFilterTests(unittest.TestCase):
             [sospecha], missing_events, entidades, mapa
         )["results"][0]
         self.assertEqual(missing["context_outcome"], "insufficient_coverage")
+        self.assertTrue(missing["routing"]["send_to_classifier"])
         self.assertEqual(missing["suspicion_effect"], "maintain")
         self.assertEqual(missing["contradiction_score"], 0.0)
+        self.assertIsNone(missing["coherence_score"])
+        self.assertFalse(missing["context_evaluable"])
 
-    def test_patron_multientidad_marca_causa_comun_no_identificable(self):
+    def test_patron_multientidad_es_coincidencia_no_atribucion_causal(self):
         eventos, entidades = construir_historial()
         mapa = self.filtro.construir_mapa(eventos, entidades)
         timestamp = pd.Timestamp("2026-01-05T23:00:00Z").isoformat()
@@ -217,29 +233,12 @@ class ContextualFilterTests(unittest.TestCase):
 
         resultados = self.filtro.analizar(sospechas, eventos, entidades, mapa)["results"]
 
-        self.assertTrue(all(item["common_cause"]["candidate"] for item in resultados))
-        self.assertTrue(
-            all(
-                item["common_cause"]["status"]
-                == "unidentifiable_without_independent_evidence"
-                for item in resultados
-            )
-        )
-        self.assertTrue(
-            all(not item["common_cause"]["independent_evidence_available"] for item in resultados)
-        )
-        self.assertTrue(
-            all(item["adjustment_blocked_by_common_cause"] for item in resultados)
-        )
-        self.assertTrue(
-            all(item["suspicion_effect"] == "maintain" for item in resultados)
-        )
-        self.assertTrue(
-            all(
-                item["adjusted_suspicion_score"] == item["statistical_score"]
-                for item in resultados
-            )
-        )
+        self.assertFalse(any(item["common_cause"]["candidate"] for item in resultados))
+        self.assertTrue(resultados[-1]["common_cause"]["contextual_coincidence"])
+        self.assertTrue(all(item["common_cause"]["status"] == "not_evaluated" for item in resultados))
+        self.assertFalse(any(item["adjustment_blocked_by_common_cause"] for item in resultados))
+        self.assertFalse(any(item["common_cause"]["independent_evidence_available"] for item in resultados))
+        self.assertFalse(any(item["routing"]["reason"] == "ambiguous_common_cause" for item in resultados))
 
     def test_contexto_causal_ignora_eventos_posteriores_del_mismo_lote(self):
         historico, entidades = construir_historial()
@@ -286,6 +285,7 @@ class ContextualFilterTests(unittest.TestCase):
             con_futuro["context_score"], sin_futuro["context_score"]
         )
         self.assertEqual(con_futuro["evidence"], sin_futuro["evidence"])
+        self.assertEqual(con_futuro["routing"], sin_futuro["routing"])
         self.assertTrue(con_futuro["causal_runtime"]["causal"])
         self.assertFalse(con_futuro["causal_runtime"]["uses_future_rows"])
         self.assertEqual(

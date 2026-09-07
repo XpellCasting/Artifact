@@ -183,7 +183,9 @@ class CargadorHistorial:
         trabajo["_raw_index"] = range(len(trabajo))
         trabajo["entity_id"] = trabajo["entity_id"].astype(str).str.strip()
         trabajo["state"] = trabajo["state"].astype(str).str.strip()
-        trabajo["timestamp_dt"] = pd.to_datetime(trabajo["timestamp"], errors="coerce", utc=True)
+        trabajo["timestamp_dt"] = pd.to_datetime(
+            trabajo["timestamp"], format="ISO8601", errors="coerce", utc=True
+        )
         trabajo = trabajo[
             trabajo["entity_id"].ne("")
             & trabajo["timestamp_dt"].notna()
@@ -195,7 +197,10 @@ class CargadorHistorial:
             f"{len(trabajo):,} filas con entidad y fecha validas",
         )
         trabajo["is_valid_value"] = ~trabajo["state"].str.lower().isin(ESTADOS_INVALIDOS)
-        trabajo["timestamp"] = trabajo["timestamp_dt"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # La fecha serializada tambien es una clave y un corte causal: no truncar.
+        trabajo["timestamp"] = trabajo["timestamp_dt"].map(
+            lambda value: value.isoformat().replace("+00:00", "Z")
+        )
         if "domain" in trabajo.columns:
             trabajo["domain"] = trabajo["domain"].astype(str).str.strip()
         else:
@@ -284,6 +289,24 @@ class CargadorHistorial:
             f"Catalogo construido con {len(entidades):,} entidades",
         )
         muestras = self._construir_muestras_normalizacion(frame, trabajo)
+        # El historial puede contener millones de filas. Estas columnas tienen
+        # cardinalidad baja y no necesitan un objeto Python por celda. El valor
+        # normalizado es siempre numerico; los estados multivalor se conservan
+        # en `state`.
+        trabajo["value"] = pd.to_numeric(trabajo["value"], errors="coerce")
+        trabajo = trabajo.drop(columns=["_sensor_kind_candidate"], errors="ignore")
+        for columna in (
+            "entity_id",
+            "domain",
+            "sensor_kind",
+            "tipo_interno",
+            "unit_of_measurement",
+            "device_class",
+        ):
+            if columna in trabajo.columns:
+                trabajo[columna] = trabajo[columna].astype("category")
+        if "_raw_index" in trabajo.columns and len(trabajo) < 2_147_483_647:
+            trabajo["_raw_index"] = trabajo["_raw_index"].astype("int32")
         metadatos = {
             "source_type": origen,
             "source_path": str(ruta),

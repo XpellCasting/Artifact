@@ -1,3 +1,13 @@
+# Documento histórico — implementación retirada
+
+Desde el 3 de septiembre de 2026, este anexo no describe la implementación
+vigente. Se retiraron la lista de decisión y su evaluador. La elección entre
+machine learning y un árbol de decisión sigue pendiente; no existe un modelo
+seleccionado ni un clasificador en ejecución. El texto siguiente se conserva
+solo como antecedente de diseño. El flujo actual está en
+`Filtro_Contextual_Espacio_Temporal.MD`: los ambientales terminan en F2 y los
+demás casos quedan pendientes.
+
 # Clasificador diagnóstico reproducible basado en reglas versionadas
 
 ## Estado del documento

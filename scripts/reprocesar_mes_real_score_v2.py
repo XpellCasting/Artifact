@@ -34,7 +34,6 @@ def construir_resumen(
         for value in ((row.get("reading") or {}).get("components") or {}).values()
     ]
     contextual = (result.get("contextual") or {}).get("summary") or {}
-    classification = (result.get("classification") or {}).get("summary") or {}
 
     return {
         "data_policy": {
@@ -88,7 +87,7 @@ def construir_resumen(
             ),
         },
         "contextual_outcomes": dict(contextual.get("by_outcome") or {}),
-        "classifier_classes": dict(classification.get("by_class") or {}),
+        "pipeline": dict(result.get("pipeline_summary") or {}),
     }
 
 

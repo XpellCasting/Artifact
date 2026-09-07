@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -34,12 +34,45 @@ class ConfiguracionContextual:
     max_map_age_days: int = 7
     association_drift_threshold: float = 0.20
     coverage_drift_threshold: float = 0.20
+    continuous_max_age_seconds: float = 3600.0
+    continuous_max_age_seconds_by_entity: dict[str, float] = field(default_factory=dict)
+    window_candidates_seconds: tuple[int, ...] = (300, 900, 3600)
+    common_cause_window_seconds: int = 300
+    cadence_ttl_multiplier: float = 2.0
+    residual_quantile: float = 0.99
+
+    def __post_init__(self) -> None:
+        if (self.window_seconds <= 0 or self.max_lag_windows < 0
+                or self.common_cause_window_seconds <= 0
+                or self.cadence_ttl_multiplier < 1
+                or not 0.5 < self.residual_quantile < 1
+                or any(not isinstance(v, int) or isinstance(v, bool) or v <= 0
+                       for v in self.window_candidates_seconds)):
+            raise ValueError("Configuracion temporal o de residuos invalida.")
+        if not isinstance(self.continuous_max_age_seconds_by_entity, dict):
+            raise ValueError("La antiguedad por entidad debe ser un objeto de segundos.")
+        limits = [("default", self.continuous_max_age_seconds),
+                  *self.continuous_max_age_seconds_by_entity.items()]
+        for entity_id, seconds in limits:
+            if (not isinstance(entity_id, str) or not entity_id
+                    or isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                    or not math.isfinite(seconds) or seconds < 0):
+                raise ValueError("La antiguedad contextual debe ser finita y no negativa.")
+
+    def antiguedad_maxima(self, entity_id: str) -> float:
+        return float(self.continuous_max_age_seconds_by_entity.get(
+            entity_id, self.continuous_max_age_seconds
+        ))
 
     def como_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        payload["window_candidates_seconds"] = list(self.window_candidates_seconds)
         payload["lag_candidates_seconds"] = [
             lag * self.window_seconds for lag in range(self.max_lag_windows + 1)
         ]
+        payload["lag_candidates_by_window"] = {
+            str(seconds): self.desfases(seconds) for seconds in self.ventanas()
+        }
         payload["acceptance_rule"] = (
             "n_observations >= min_observations AND "
             "coverage_ratio >= min_pair_coverage AND "
@@ -48,6 +81,18 @@ class ConfiguracionContextual:
             "sign_consistency >= min_sign_consistency; despues se conserva top_k por entidad"
         )
         return payload
+
+    def ventanas(self) -> list[int]:
+        return sorted({self.window_seconds, *(
+            value for value in self.window_candidates_seconds
+            if value <= self.window_seconds and self.window_seconds % value == 0
+        )})
+
+    def desfases(self, seconds: int) -> list[int]:
+        maximum = self.max_lag_windows * self.window_seconds
+        return sorted(offset for offset in {0, seconds, 2 * seconds, 3 * seconds,
+                      6 * seconds, self.window_seconds, maximum // 2, maximum}
+                      if offset <= maximum and offset % seconds == 0)
 
 
 class FiltroContextualEspacioTemporal:
@@ -58,7 +103,7 @@ class FiltroContextualEspacioTemporal:
     observaciones futuras para explicar una sospecha.
     """
 
-    MAP_VERSION = "contextual-spatiotemporal-v1"
+    MAP_VERSION = "contextual-spatiotemporal-v2"
 
     def __init__(self, config: ConfiguracionContextual | None = None) -> None:
         self.config = config or ConfiguracionContextual()
@@ -145,25 +190,42 @@ class FiltroContextualEspacioTemporal:
         signals, availability, stats, full_index = self._construir_senales(trabajo, catalogo)
         entity_ids = sorted(signals)
         covariance = self._matriz_covarianza(signals, catalogo, entity_ids)
+        temporal = self._calibrar_tiempos(trabajo, catalogo)
+        resolutions = {item["window_seconds"] for item in temporal.values()}
+        grids = {self.config.window_seconds: (signals, availability, stats, full_index)}
+        for seconds in sorted(resolutions - grids.keys()):
+            grids[seconds] = self._construir_senales(trabajo, catalogo, seconds)
 
         edges: list[dict[str, Any]] = []
         for source in entity_ids:
             for target in entity_ids:
                 if source == target:
                     continue
+                seconds = max(temporal[source]["window_seconds"], temporal[target]["window_seconds"])
+                pair_signals, _, pair_stats, pair_index = grids[seconds]
                 relation = self._mejor_relacion(
                     source,
                     target,
-                    signals[source],
-                    signals[target],
+                    pair_signals[source],
+                    pair_signals[target],
                     catalogo[source]["sensor_kind"],
                     catalogo[target]["sensor_kind"],
-                    len(full_index),
+                    len(pair_index),
+                    window_seconds=seconds,
                 )
+                relation["source_stats"] = pair_stats[source]
+                relation["target_stats"] = pair_stats[target]
+                relation["max_age_seconds"] = temporal[target]["max_age_seconds"]
                 relation["raw_covariance"] = self._valor_matriz(covariance, source, target)
                 edges.append(relation)
 
         self._aplicar_top_k(edges)
+        # Solo las relaciones utilizables necesitan payload de inferencia y
+        # auditoria de candidatos; no multiplicarlo por todos los pares rechazados.
+        for edge in edges:
+            if not edge["accepted"]:
+                for key in ("source_stats", "target_stats", "expected_response", "lag_candidates"):
+                    edge.pop(key, None)
         accepted_edges = [edge for edge in edges if edge["accepted"]]
         accepted_by_source: dict[str, int] = {}
         for edge in accepted_edges:
@@ -187,6 +249,8 @@ class FiltroContextualEspacioTemporal:
                     "state_probabilities": node_stats.get("state_probabilities", {}),
                     "accepted_relations": int(accepted_by_source.get(entity_id, 0)),
                     "covered": bool(accepted_by_source.get(entity_id, 0)),
+                    "context_status": "connected" if accepted_by_source.get(entity_id) else "no_learned_relations",
+                    "temporal_profile": temporal[entity_id],
                 }
             )
 
@@ -211,6 +275,7 @@ class FiltroContextualEspacioTemporal:
             "source_range": {"start": fingerprint["start"], "end": fingerprint["end"]},
             "source_fingerprint": fingerprint,
             "config": self.config.como_dict(),
+            "calibration_partition": "development",
             "refresh": {
                 "stale": False,
                 "stale_reasons": [],
@@ -261,59 +326,7 @@ class FiltroContextualEspacioTemporal:
         entidades: pd.DataFrame,
         mapa: dict[str, Any],
     ) -> dict[str, Any]:
-        inicio = perf_counter()
-        trabajo = self._preparar_eventos(eventos)
-        catalogo = self._catalogo(entidades, trabajo)
-        signals, _, stats, _ = self._construir_senales(trabajo, catalogo)
-        edges_by_source: dict[str, list[dict[str, Any]]] = {}
-        for edge in mapa.get("edges", []):
-            if edge.get("accepted"):
-                edges_by_source.setdefault(str(edge["source"]), []).append(edge)
-
-        candidatas = [
-            dict(item)
-            for item in sospechas
-            if item.get("is_suspicious") or item.get("passed_to_contextual_filter")
-        ]
-        concurrent_by_window = self._concurrencia(candidatas)
-        resultados = []
-        for sospecha in candidatas:
-            resultados.append(
-                self._evaluar_sospecha(
-                    sospecha=sospecha,
-                    signals=signals,
-                    stats=stats,
-                    edges=edges_by_source.get(str(sospecha.get("entity_id")), []),
-                    map_quality={
-                        "version": mapa.get("map_version"),
-                        **mapa.get("refresh", {}),
-                    },
-                    concurrent_entities=concurrent_by_window.get(
-                        self._bucket_key(sospecha.get("timestamp")), []
-                    ),
-                )
-            )
-
-        outcomes: dict[str, int] = {}
-        for item in resultados:
-            outcome = str(item["context_outcome"])
-            outcomes[outcome] = outcomes.get(outcome, 0) + 1
-        return {
-            "results": resultados,
-            "summary": {
-                "evaluated": len(resultados),
-                "by_outcome": outcomes,
-                "supported": outcomes.get("supported", 0),
-                "contradicted": outcomes.get("contradicted", 0),
-                "unexplained": outcomes.get("unexplained", 0),
-                "insufficient_coverage": outcomes.get("insufficient_coverage", 0),
-                "possible_common_cause": sum(
-                    bool(item.get("common_cause", {}).get("candidate")) for item in resultados
-                ),
-                "elapsed_ms": self._redondear((perf_counter() - inicio) * 1000.0, 3),
-            },
-            "map_quality": mapa.get("refresh", {}),
-        }
+        return self.analizar_causal(sospechas, eventos, entidades, mapa)
 
     def analizar_causal(
         self,
@@ -321,32 +334,25 @@ class FiltroContextualEspacioTemporal:
         eventos_disponibles: pd.DataFrame,
         entidades: pd.DataFrame,
         mapa: dict[str, Any],
+        concurrence_state: dict[tuple[str, str], pd.Timestamp] | None = None,
     ) -> dict[str, Any]:
         """Evalua cada sospecha usando solo observaciones con fecha no futura."""
         inicio = perf_counter()
         trabajo = self._preparar_eventos(eventos_disponibles)
         catalogo = self._catalogo(entidades, trabajo)
+        observaciones = self._indexar_observaciones(trabajo, catalogo)
         edges_by_source: dict[str, list[dict[str, Any]]] = {}
         for edge in mapa.get("edges", []):
             if edge.get("accepted"):
                 edges_by_source.setdefault(str(edge["source"]), []).append(edge)
-        stats_mapa = {
-            str(node.get("entity_id")): {
-                "observations": int(node.get("observations") or 0),
-                "coverage_ratio": float(node.get("coverage_ratio") or 0.0),
-                "center": node.get("center"),
-                "scale": node.get("scale"),
-                "state_probabilities": dict(node.get("state_probabilities") or {}),
-            }
-            for node in mapa.get("nodes", [])
-            if node.get("entity_id")
-        }
+        stats_mapa = self._estadisticas_mapa(mapa)
+        concurrence_state = {} if concurrence_state is None else concurrence_state
         candidatas = sorted(
             (
                 dict(item)
                 for item in sospechas
-                if item.get("is_suspicious")
-                or item.get("passed_to_contextual_filter")
+                if (item.get("is_suspicious") or item.get("passed_to_contextual_filter"))
+                and not item.get("suppressed_by_episode")
             ),
             key=lambda item: pd.to_datetime(
                 item.get("timestamp"), errors="coerce", utc=True
@@ -359,67 +365,9 @@ class FiltroContextualEspacioTemporal:
             )
             entity_id = str(sospecha.get("entity_id", ""))
             edges = edges_by_source.get(entity_id, [])
-            relevantes = {entity_id, *(str(edge["target"]) for edge in edges)}
-            if pd.isna(timestamp):
-                scoped = trabajo.iloc[0:0].copy()
-            else:
-                bucket = timestamp.floor(f"{self.config.window_seconds}s")
-                desde = bucket - pd.Timedelta(
-                    seconds=self.config.max_lag_windows
-                    * self.config.window_seconds
-                )
-                mascara_entidades = trabajo["entity_id"].isin(relevantes)
-                scoped = trabajo[
-                    mascara_entidades
-                    & trabajo["timestamp_dt"].between(
-                        desde,
-                        timestamp,
-                        inclusive="both",
-                    )
-                ].copy()
-                anteriores = trabajo[
-                    mascara_entidades
-                    & trabajo["timestamp_dt"].lt(desde)
-                    & trabajo["sensor_kind"].isin({"binary", "multistate"})
-                ]
-                if not anteriores.empty:
-                    arrastre = (
-                        anteriores.sort_values("timestamp_dt")
-                        .groupby("entity_id", sort=False)
-                        .tail(1)
-                        .copy()
-                    )
-                    arrastre["timestamp_dt"] = desde
-                    arrastre["timestamp"] = desde.isoformat()
-                    scoped = pd.concat(
-                        [arrastre, scoped], ignore_index=True
-                    ).sort_values(["entity_id", "timestamp_dt"])
-
-            catalogo_scoped = {
-                item: catalogo[item]
-                for item in relevantes
-                if item in catalogo
-            }
-            signals, _, stats_runtime, _ = self._construir_senales(
-                scoped,
-                catalogo_scoped,
-            )
-            stats = dict(stats_runtime)
-            for item in relevantes:
-                if item in stats_mapa:
-                    stats[item] = stats_mapa[item]
-            concurrentes = sorted(
-                {
-                    str(item.get("entity_id", ""))
-                    for item in candidatas
-                    if self._bucket_key(item.get("timestamp"))
-                    == self._bucket_key(sospecha.get("timestamp"))
-                    and pd.to_datetime(
-                        item.get("timestamp"), errors="coerce", utc=True
-                    )
-                    <= timestamp
-                }
-            ) if pd.notna(timestamp) else []
+            signals = {}
+            stats = stats_mapa
+            concurrentes = self._concurrencia_relacionada(sospecha, edges, concurrence_state)
             resultado = self._evaluar_sospecha(
                 sospecha=sospecha,
                 signals=signals,
@@ -430,6 +378,7 @@ class FiltroContextualEspacioTemporal:
                     **mapa.get("refresh", {}),
                 },
                 concurrent_entities=concurrentes,
+                continuous_observations=observaciones,
             )
             resultado["causal_runtime"] = {
                 "causal": True,
@@ -449,12 +398,17 @@ class FiltroContextualEspacioTemporal:
             "results": resultados,
             "summary": {
                 "evaluated": len(resultados),
+                **self.resumen_enrutamiento(resultados),
                 "by_outcome": outcomes,
                 "supported": outcomes.get("supported", 0),
                 "contradicted": outcomes.get("contradicted", 0),
                 "unexplained": outcomes.get("unexplained", 0),
                 "insufficient_coverage": outcomes.get(
                     "insufficient_coverage", 0
+                ),
+                "no_learned_relations": outcomes.get("no_learned_relations", 0),
+                "contextual_coincidences": sum(
+                    bool(item.get("common_cause", {}).get("contextual_coincidence")) for item in resultados
                 ),
                 "possible_common_cause": sum(
                     bool(item.get("common_cause", {}).get("candidate"))
@@ -485,7 +439,7 @@ class FiltroContextualEspacioTemporal:
         trabajo = eventos.copy()
         if "timestamp_dt" not in trabajo.columns:
             trabajo["timestamp_dt"] = pd.to_datetime(
-                trabajo.get("timestamp"), errors="coerce", utc=True
+                trabajo.get("timestamp"), format="ISO8601", errors="coerce", utc=True
             )
         else:
             trabajo["timestamp_dt"] = pd.to_datetime(
@@ -538,6 +492,7 @@ class FiltroContextualEspacioTemporal:
         self,
         eventos: pd.DataFrame,
         catalogo: dict[str, dict[str, Any]],
+        window_seconds: int | None = None,
     ) -> tuple[
         dict[str, pd.Series],
         dict[str, pd.Series],
@@ -546,7 +501,7 @@ class FiltroContextualEspacioTemporal:
     ]:
         if eventos.empty or not catalogo:
             return {}, {}, {}, pd.DatetimeIndex([])
-        freq = f"{self.config.window_seconds}s"
+        freq = f"{window_seconds or self.config.window_seconds}s"
         start = eventos["timestamp_dt"].min().floor(freq)
         end = eventos["timestamp_dt"].max().floor(freq)
         full_index = pd.date_range(start, end, freq=freq, tz="UTC")
@@ -572,6 +527,7 @@ class FiltroContextualEspacioTemporal:
 
             if kind == "continuous":
                 numeric = pd.to_numeric(grupo.get("value", grupo["state"]), errors="coerce")
+                numeric = numeric.replace([math.inf, -math.inf], float("nan"))
                 grupo["_feature"] = numeric.where(grupo["is_valid_value"])
                 signal = (
                     grupo.groupby("bucket", sort=True)["_feature"]
@@ -654,6 +610,60 @@ class FiltroContextualEspacioTemporal:
         frame.columns = continuous
         return frame.cov(min_periods=self.config.min_observations)
 
+    def _calibrar_tiempos(self, eventos, catalogo) -> dict[str, dict[str, Any]]:
+        """Politica acotada de cadencia, aprendida exclusivamente en Desarrollo.
+
+        Un intervalo entre cambios no prueba la frecuencia de muestreo. Por eso
+        el TTL inferido nunca supera el limite explicito y no se aplica a estados.
+        """
+        windows = self.config.ventanas()
+        profiles = {}
+        for entity, group in eventos.groupby("entity_id", sort=False):
+            gaps = group.loc[group["is_valid_value"], "timestamp_dt"].sort_values().diff().dt.total_seconds()
+            gaps = gaps[gaps.gt(0)]
+            calibrated = len(gaps) >= self.config.min_observations
+            median = float(gaps.median()) if calibrated else None
+            p95 = float(gaps.quantile(.95)) if calibrated else None
+            window = next((value for value in windows if median is not None and value >= median),
+                          self.config.window_seconds)
+            limit = self.config.antiguedad_maxima(entity)
+            explicit = entity in self.config.continuous_max_age_seconds_by_entity
+            continuous = catalogo[entity]["sensor_kind"] == "continuous"
+            ttl = limit if explicit or not calibrated else min(limit, p95 * self.config.cadence_ttl_multiplier)
+            profiles[entity] = {
+                "window_seconds": window,
+                "max_age_seconds": ttl if continuous else None,
+                "median_interval_seconds": median, "p95_interval_seconds": p95,
+                "interval_count": len(gaps), "partition": "development",
+                "ttl_source": ("not_applicable_to_state" if not continuous else
+                               "explicit_entity_limit" if explicit else
+                               "development_cadence_capped" if calibrated else "configured_fallback"),
+            }
+        return profiles
+
+    def _calibrar_respuesta(self, pair: pd.DataFrame) -> dict[str, Any] | None:
+        """Recta contextual, no clasificador de fallas; residuos fuera del ajuste.
+
+        Ajuste con el primer 70 % de Desarrollo y tolerancia empirica con el
+        ultimo 30 %. No es un intervalo de confianza ni una prueba causal.
+        """
+        split = int(len(pair) * .7)
+        train, calibration = pair.iloc[:split], pair.iloc[split:]
+        if len(train) < 20 or len(calibration) < 10 or train["target"].nunique() < 2:
+            return None
+        slope = float(train["source"].cov(train["target"]) / train["target"].var())
+        intercept = float(train["source"].mean() - slope * train["target"].mean())
+        residuals = (calibration["source"] - (intercept + slope * calibration["target"])).abs()
+        tolerance = max(float(residuals.quantile(self.config.residual_quantile)),
+                        float(train["source"].std(ddof=0)) * .05, 1e-6)
+        return {
+            "method": "linear_conditional_residual", "partition": "development",
+            "slope": slope, "intercept": intercept, "tolerance": tolerance,
+            "residual_quantile": self.config.residual_quantile,
+            "fit_observations": len(train), "calibration_observations": len(calibration),
+            "context_min": float(train["target"].min()), "context_max": float(train["target"].max()),
+        }
+
     def _mejor_relacion(
         self,
         source: str,
@@ -663,9 +673,15 @@ class FiltroContextualEspacioTemporal:
         source_kind: str,
         target_kind: str,
         total_windows: int,
+        *,
+        window_seconds: int | None = None,
     ) -> dict[str, Any]:
+        seconds = window_seconds or self.config.window_seconds
         candidates = []
-        for lag in range(self.config.max_lag_windows + 1):
+        # Como maximo ocho desfases: se conserva el horizonte anterior sin
+        # multiplicar la busqueda por cada segundo de una grilla mas fina.
+        for offset in self.config.desfases(seconds):
+            lag = offset // seconds
             aligned_source = source_signal
             aligned_target = target_signal.shift(lag)
             encoded = self._codificar_par(
@@ -676,36 +692,38 @@ class FiltroContextualEspacioTemporal:
             )
             pair = encoded["pair"]
             association = self._correlacion(pair)
+            stability = self._estabilidad(pair, association or 0.0)
+            coverage = float(len(pair) / total_windows) if total_windows else 0.0
+            checks = {
+                "insufficient_observations": len(pair) < self.config.min_observations,
+                "insufficient_pair_coverage": coverage < self.config.min_pair_coverage,
+                "weak_association": abs(association or 0.0) < self.config.association_threshold,
+                "temporal_instability": stability["stable_slices"] < self.config.min_stable_slices,
+                "sign_instability": stability["sign_consistency"] < self.config.min_sign_consistency,
+            }
             candidates.append(
                 {
                     **encoded,
                     "association": association,
                     "lag_windows": lag,
                     "n_observations": int(len(pair)),
-                    "coverage_ratio": float(len(pair) / total_windows) if total_windows else 0.0,
+                    "coverage_ratio": coverage,
+                    "stability": stability,
+                    "rejection_reasons": [key for key, failed in checks.items() if failed],
                 }
             )
         best = max(
             candidates,
             key=lambda item: (
+                not item["rejection_reasons"],
                 -1.0 if item["association"] is None else abs(item["association"]),
                 item["n_observations"],
                 -item["lag_windows"],
             ),
         )
         association = best["association"] or 0.0
-        stability = self._estabilidad(best["pair"], association)
-        rejection_reasons = []
-        if best["n_observations"] < self.config.min_observations:
-            rejection_reasons.append("insufficient_observations")
-        if best["coverage_ratio"] < self.config.min_pair_coverage:
-            rejection_reasons.append("insufficient_pair_coverage")
-        if abs(association) < self.config.association_threshold:
-            rejection_reasons.append("weak_association")
-        if stability["stable_slices"] < self.config.min_stable_slices:
-            rejection_reasons.append("temporal_instability")
-        if stability["sign_consistency"] < self.config.min_sign_consistency:
-            rejection_reasons.append("sign_instability")
+        stability = best["stability"]
+        rejection_reasons = best["rejection_reasons"]
         threshold_eligible = not rejection_reasons
         family, metric = self._familia_metrica(
             source_kind,
@@ -726,7 +744,21 @@ class FiltroContextualEspacioTemporal:
             "strength": self._redondear(abs(association)),
             "expected_sign": "positive" if association >= 0 else "negative",
             "lag_windows": int(best["lag_windows"]),
-            "lag_seconds": int(best["lag_windows"] * self.config.window_seconds),
+            "lag_seconds": int(best["lag_windows"] * seconds),
+            "window_seconds": seconds,
+            "lag_selection": "quality_before_strength",
+            "lag_candidates": [
+                {"lag_seconds": item["lag_windows"] * seconds,
+                 "association": self._redondear_o_none(item["association"]),
+                 "n_observations": item["n_observations"],
+                 "coverage_ratio": self._redondear(item["coverage_ratio"]),
+                 "rejection_reasons": item["rejection_reasons"]}
+                for item in candidates
+            ],
+            "expected_response": (
+                self._calibrar_respuesta(best["pair"])
+                if threshold_eligible and source_kind == target_kind == "continuous" else None
+            ),
             "n_observations": int(best["n_observations"]),
             "coverage_ratio": self._redondear(best["coverage_ratio"]),
             "stability_score": self._redondear(stability["stability_score"]),
@@ -945,17 +977,30 @@ class FiltroContextualEspacioTemporal:
         edges: list[dict[str, Any]],
         map_quality: dict[str, Any],
         concurrent_entities: list[str],
+        continuous_observations: dict[str, pd.DataFrame] | None = None,
     ) -> dict[str, Any]:
         entity_id = str(sospecha.get("entity_id", ""))
         bucket = self._bucket_timestamp(sospecha.get("timestamp"))
         target_signal = signals.get(entity_id)
         target_stats = stats.get(entity_id, {})
         target_value = self._signal_value(target_signal, bucket)
+        timestamp = pd.to_datetime(sospecha.get("timestamp"), errors="coerce", utc=True)
+        if continuous_observations is not None and entity_id in continuous_observations:
+            target_value, _ = self._observacion_contextual(
+                continuous_observations[entity_id], timestamp, entity_id
+            )
+        # La magnitud sospechosa es la lectura puntual, no una mediana que
+        # podria diluir precisamente el salto que detecto F1.
+        reading_value = self._numeric_or_none(sospecha.get("value", (sospecha.get("reading") or {}).get("value")))
+        if reading_value is not None and sospecha.get("sensor_kind") == "continuous":
+            target_value = reading_value
         if target_value is None:
             target_value = self._numeric_or_none(
                 sospecha.get("value", (sospecha.get("reading") or {}).get("value"))
             )
         target_z = self._standardized_value(target_value, target_stats)
+        pattern = sospecha.get("suspected_pattern") or sospecha.get("pattern")
+        directional_applicable = target_value is not None and pattern != "missing_gap"
         if abs(target_z) < 0.05:
             delta = self._numeric_or_none((sospecha.get("reading") or {}).get("delta_value"))
             if delta is not None and delta != 0:
@@ -979,6 +1024,13 @@ class FiltroContextualEspacioTemporal:
             )
             context_signal = signals.get(context_id)
             context_value = self._signal_value(context_signal, context_bucket)
+            observation_details: dict[str, Any] = {}
+            if continuous_observations is not None and context_id in continuous_observations:
+                # El desfase es una referencia temporal, no permiso para mirar adelante.
+                reference = timestamp - pd.Timedelta(seconds=int(edge.get("lag_seconds", 0)))
+                context_value, observation_details = self._observacion_contextual(
+                    continuous_observations[context_id], reference, context_id, edge
+                )
             if context_value is None:
                 evidence.append(
                     {
@@ -999,12 +1051,13 @@ class FiltroContextualEspacioTemporal:
                         "n_observations": edge.get("n_observations"),
                         "coverage_ratio": edge.get("coverage_ratio"),
                         "stability_score": edge.get("stability_score"),
+                        **observation_details,
                     }
                 )
                 continue
 
             observed_weight += weight
-            context_stats = stats.get(context_id, {})
+            context_stats = edge.get("target_stats") or stats.get(context_id, {})
             if edge.get("target_state") is not None:
                 state = str(edge["target_state"])
                 context_component = 1.0 if str(context_value) == state else 0.0
@@ -1014,10 +1067,37 @@ class FiltroContextualEspacioTemporal:
             else:
                 context_z = self._standardized_value(context_value, context_stats)
 
-            target_direction = 1.0 if target_z >= 0 else -1.0
+            source_stats = edge.get("source_stats") or target_stats
+            source_z = self._standardized_value(target_value, source_stats)
+            if edge.get("source_state") is not None:
+                state = str(edge["source_state"])
+                source_z = float(str(target_value) == state) - float(source_stats.get("state_probabilities", {}).get(state, 0))
+            elif abs(source_z) < .05:
+                source_z = target_z
+            target_direction = 1.0 if source_z >= 0 else -1.0
             relation_direction = 1.0 if float(edge.get("association_signed", 0.0)) >= 0 else -1.0
             c_raw = relation_direction * target_direction * context_z
+            if not directional_applicable:
+                c_raw = 0.0
             c_normalized = max(-1.0, min(1.0, c_raw / 2.0))
+            magnitude = {"status": "not_calibrated"}
+            model = edge.get("expected_response")
+            actual, context_numeric = self._numeric_or_none(target_value), self._numeric_or_none(context_value)
+            if model and directional_applicable and actual is not None and context_numeric is not None:
+                expected = model["intercept"] + model["slope"] * context_numeric
+                residual = abs(actual - expected)
+                tolerance = max(model["tolerance"], 1e-6)
+                compatible = residual <= tolerance
+                magnitude = {
+                    "status": "compatible" if compatible else "incompatible",
+                    "expected_value": expected, "actual_value": actual,
+                    "lower": expected - tolerance, "upper": expected + tolerance,
+                    "absolute_residual": residual, "tolerance": tolerance,
+                    "extrapolated": not model["context_min"] <= context_numeric <= model["context_max"],
+                    "partition": "development", "method": model["method"],
+                }
+                if not compatible:
+                    c_normalized = min(c_normalized, -min(1.0, (residual / tolerance - 1.0) / 2.0))
             contribution = weight * c_normalized
             if c_normalized >= self.config.evidence_threshold:
                 status = "supports"
@@ -1041,11 +1121,13 @@ class FiltroContextualEspacioTemporal:
                     "c_j_raw": self._redondear(c_raw),
                     "c_j_normalized": self._redondear(c_normalized),
                     "weighted_contribution": self._redondear(contribution),
+                    "magnitude_check": magnitude,
                     "observation_status": status,
                     "temporal_match": True,
                     "n_observations": edge.get("n_observations"),
                     "coverage_ratio": edge.get("coverage_ratio"),
                     "stability_score": edge.get("stability_score"),
+                    **observation_details,
                 }
             )
 
@@ -1059,9 +1141,11 @@ class FiltroContextualEspacioTemporal:
             if observed_weight > 0
             else 0.0
         )
-        if (
-            not edges
-            or coverage_ratio < self.config.runtime_coverage_threshold
+        if not edges:
+            outcome = "no_learned_relations"
+            effect = "maintain"
+        elif (
+            coverage_ratio < self.config.runtime_coverage_threshold
             or observed_weight <= 0
         ):
             outcome = "insufficient_coverage"
@@ -1075,6 +1159,7 @@ class FiltroContextualEspacioTemporal:
         elif (
             support_score >= self.config.decision_threshold
             and support_score > contradiction_score
+            and not any(item.get("magnitude_check", {}).get("status") == "incompatible" for item in evidence)
         ):
             outcome = "supported"
             effect = "decrease"
@@ -1091,53 +1176,70 @@ class FiltroContextualEspacioTemporal:
         else:
             adjusted = statistical_score
 
-        # El mismo patrón coherente puede provenir del ambiente o de una falla
-        # compartida. Sin telemetría independiente no se permite que el
-        # contexto modifique por sí solo la sospecha estadística.
-        if common_candidate:
-            adjusted = statistical_score
-            effect = "maintain"
+        # No atribuir ni vetar por coincidencia. La deteccion de infraestructura
+        # requiere una fuente independiente que este filtro aun no recibe.
         common_cause = {
-            "candidate": common_candidate,
-            "status": (
-                "unidentifiable_without_independent_evidence"
-                if common_candidate
-                else "not_indicated"
-            ),
+            "candidate": False,
+            "status": "not_evaluated",
+            "identifiable": False,
+            "contextual_coincidence": common_candidate,
             "concurrent_entities": concurrent_entities,
+            "window_seconds": self.config.common_cause_window_seconds,
+            "grouping_rule": "accepted_neighbors_same_pattern_past_window",
             "independent_evidence_available": False,
             "independent_domains_required": ["network", "power", "integration"],
             "interpretation": (
-                "El historico no permite separar una causa comun de una anomalia ambiental."
+                "Coincidencia en entidades relacionadas; no demuestra una causa comun ni bloquea la salida ambiental."
                 if common_candidate
-                else "No se observo un patron multientidad suficiente; esto no descarta una causa comun."
+                else "Sin coincidencia contextual suficiente. La causa comun no se evalua sin telemetria independiente."
             ),
         }
         covered_neighbors = sum(
             item["observation_status"] != "missing" for item in evidence
         )
+        routing = self._decidir_ruta(outcome, map_quality)
+        environmental = routing["terminal"]
         result = {
             "event_id": f"{entity_id}@{sospecha.get('timestamp')}",
+            "episode": sospecha.get("episode"),
             "entity_id": entity_id,
             "timestamp": sospecha.get("timestamp"),
             "sensor_kind": sospecha.get("sensor_kind"),
             "suspected_pattern": sospecha.get("suspected_pattern", sospecha.get("pattern")),
             "statistical_score": self._redondear(statistical_score),
-            "context_score": self._redondear(context_score),
-            "coherence_score": self._redondear((context_score + 1.0) / 2.0),
+            "context_score": self._redondear(context_score) if observed_weight > 0 else None,
+            "coherence_score": (
+                self._redondear((context_score + 1.0) / 2.0) if observed_weight > 0 else None
+            ),
+            "context_evaluable": observed_weight > 0,
+            "context_applicability": "applicable" if edges else "no_learned_relations",
+            "directional_evidence_applicable": directional_applicable,
             "support_score": self._redondear(support_score),
             "contradiction_score": self._redondear(contradiction_score),
             "adjusted_suspicion_score": self._redondear(max(0.0, min(1.0, adjusted))),
             "context_outcome": outcome,
+            "contextual_class": "environmental_anomaly" if environmental else None,
+            "routing": routing,
+            "alert": (
+                {
+                    "type": "environmental_anomaly",
+                    "level": "informational",
+                    "message": "Cambio respaldado por el contexto; anomalia ambiental.",
+                    "delivery": "recorded_only",
+                }
+                if environmental
+                else None
+            ),
             "suspicion_effect": effect,
             "coverage": {
                 "eligible_neighbors": len(edges),
                 "observed_neighbors": covered_neighbors,
+                "carried_neighbors": sum(bool(item.get("carried_forward")) for item in evidence),
                 "ratio": self._redondear(coverage_ratio),
                 "status": (
                     "sufficient"
                     if coverage_ratio >= self.config.runtime_coverage_threshold and edges
-                    else "insufficient"
+                    else "not_applicable" if not edges else "insufficient"
                 ),
             },
             "evidence": evidence,
@@ -1151,24 +1253,196 @@ class FiltroContextualEspacioTemporal:
                 if item["observation_status"] in {"missing", "observed_neutral"}
             ],
             "common_cause": common_cause,
-            "adjustment_blocked_by_common_cause": common_candidate,
+            "adjustment_blocked_by_common_cause": False,
             "map_quality": map_quality,
-            "diagnostic_guard": (
-                "do_not_label_environmental_without_independent_evidence"
-                if common_candidate
-                else "context_is_associative_not_causal"
-            ),
+            "diagnostic_guard": "context_is_associative_not_causal",
         }
         return result
 
-    def _concurrencia(
-        self, sospechas: list[dict[str, Any]]
-    ) -> dict[str | None, list[str]]:
-        groups: dict[str | None, set[str]] = {}
-        for item in sospechas:
-            key = self._bucket_key(item.get("timestamp"))
-            groups.setdefault(key, set()).add(str(item.get("entity_id", "")))
-        return {key: sorted(entity_ids) for key, entity_ids in groups.items()}
+    def _estadisticas_mapa(self, mapa: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {
+            str(node["entity_id"]): {
+                "observations": int(node.get("observations") or 0),
+                "coverage_ratio": float(node.get("coverage_ratio") or 0.0),
+                "center": node.get("center"),
+                "scale": node.get("scale"),
+                "state_probabilities": dict(node.get("state_probabilities") or {}),
+            }
+            for node in mapa.get("nodes", []) if node.get("entity_id")
+        }
+
+    def _indexar_observaciones(
+        self, eventos: pd.DataFrame, catalogo: dict[str, dict[str, Any]]
+    ) -> dict[str, pd.DataFrame]:
+        """Indice de eventos originales, sin rellenar ni cambiar sus fechas."""
+        groups = dict(tuple(eventos.groupby("entity_id", sort=False)))
+        return {
+            entity_id: groups.get(entity_id, eventos.iloc[:0]).set_index("timestamp_dt")
+            for entity_id, meta in catalogo.items()
+        }
+
+    def _observacion_continua(
+        self, events: pd.DataFrame, reference: pd.Timestamp, entity_id: str,
+        *, window_seconds: int | None = None, max_age_seconds: float | None = None,
+    ) -> tuple[float | None, dict[str, Any]]:
+        """Mediana de la ventana parcial o ultimo valor anterior con caducidad.
+
+        Nunca salta por encima de un reporte invalido para rescatar un valor
+        antiguo. El TTL se mide en la fecha consultada (t - desfase).
+        """
+        max_age = (self.config.antiguedad_maxima(entity_id)
+                   if max_age_seconds is None else float(max_age_seconds))
+        seconds = window_seconds or self.config.window_seconds
+        details = {
+            "reference_timestamp": None if pd.isna(reference) else reference.isoformat(),
+            "observed_timestamp": None,
+            "observation_age_seconds": None,
+            "max_age_seconds": max_age,
+            "window_seconds": seconds,
+            "observation_method": "unavailable",
+            "carried_forward": False,
+            "missing_reason": "no_previous_observation",
+        }
+        if events.empty or pd.isna(reference):
+            return None, details
+        end = int(events.index.searchsorted(reference, side="right"))
+        if not end:
+            return None, details
+        latest = events.iloc[end - 1]
+        observed_at = events.index[end - 1]
+        elapsed = reference - observed_at
+        age = elapsed.total_seconds()
+        details.update({
+            "observed_timestamp": observed_at.isoformat(),
+            "observation_age_seconds": round(age, 6),
+        })
+        value = self._numeric_or_none(latest.get("value", latest.get("state")))
+        if not bool(latest.get("is_valid_value")) or value is None:
+            details["missing_reason"] = "invalid_latest_observation"
+            return None, details
+        if elapsed > pd.Timedelta(seconds=max_age):
+            details["missing_reason"] = "expired_observation"
+            return None, details
+        bucket = reference.floor(f"{seconds}s")
+        if observed_at < bucket:
+            details.update({"observation_method": "last_known", "carried_forward": True})
+        else:
+            # No incluir en la mediana muestras caducadas ni anteriores a una
+            # interrupcion explicita de disponibilidad dentro de la ventana.
+            start = max(bucket, reference - pd.Timedelta(seconds=max_age))
+            window = events.iloc[int(events.index.searchsorted(start)):end]
+            invalid_positions = [i for i, valid in enumerate(window["is_valid_value"]) if not valid]
+            if invalid_positions:
+                window = window.iloc[invalid_positions[-1] + 1:]
+            values = pd.to_numeric(window.get("value", window["state"]), errors="coerce")
+            values = values.replace([math.inf, -math.inf], float("nan"))
+            value = self._numeric_or_none(values.median())
+            details["observation_method"] = "bucket_median"
+        details["missing_reason"] = None if value is not None else "invalid_latest_observation"
+        if value is not None:
+            details["lag_error_seconds"] = round(age, 6)
+        return value, details
+
+    def _observacion_contextual(self, events, reference, entity_id, edge=None):
+        edge = edge or {}
+        if events.empty or events.iloc[-1].get("sensor_kind") == "continuous":
+            return self._observacion_continua(
+                events, reference, entity_id, window_seconds=edge.get("window_seconds"),
+                max_age_seconds=edge.get("max_age_seconds"),
+            )
+        seconds = edge.get("window_seconds") or self.config.window_seconds
+        details = {"reference_timestamp": None if pd.isna(reference) else reference.isoformat(),
+                   "observed_timestamp": None, "max_age_seconds": None,
+                   "window_seconds": seconds, "observation_method": "state_as_of",
+                   "missing_reason": "no_previous_observation", "carried_forward": False}
+        end = 0 if pd.isna(reference) else int(events.index.searchsorted(reference, side="right"))
+        if not end:
+            return None, details
+        latest = events.iloc[end - 1]
+        observed_at = events.index[end - 1]
+        details.update(observed_timestamp=observed_at.isoformat(),
+                       observation_age_seconds=(reference - observed_at).total_seconds())
+        if not bool(latest.get("is_valid_value")):
+            details["missing_reason"] = "invalid_latest_observation"
+            return None, details
+        value = latest.get("state")
+        bucket = reference.floor(f"{seconds}s")
+        details["carried_forward"] = observed_at < bucket
+        if latest.get("sensor_kind") == "binary":
+            start = int(events.index.searchsorted(bucket))
+            window = events.iloc[start:end]
+            # Descartar estados anteriores a una interrupcion explicita.
+            invalid = [i for i, valid in enumerate(window["is_valid_value"]) if not valid]
+            if invalid:
+                window = window.iloc[invalid[-1] + 1:]
+            value = self._numeric_or_none(latest.get("value"))
+            if value is None:
+                value = float(str(latest.get("state")).lower() in ESTADOS_ACTIVOS)
+            if not window.empty:
+                values = pd.to_numeric(window.get("value", window["state"]), errors="coerce")
+                fallback = window["state"].str.lower().isin(ESTADOS_ACTIVOS).astype(float)
+                value = float(values.where(values.notna(), fallback).max())
+        details["missing_reason"] = None
+        return value, details
+
+    def _decidir_ruta(
+        self,
+        outcome: str,
+        map_quality: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Cierra los ambientales antes del tercer filtro, sin diagnosticar fallas.
+
+        ``supported`` ya exige cobertura y el unico umbral de decision
+        contextual. El puntaje ajustado se conserva como evidencia, no como
+        compuerta. Una ruta al clasificador indica elegibilidad, no ejecucion.
+        """
+        if map_quality.get("stale") is not False:
+            reason = "stale_or_unknown_context_map"
+        elif outcome == "supported":
+            reason = "context_supported"
+        else:
+            reason = outcome
+        environmental = reason == "context_supported"
+        return {
+            "terminal": environmental,
+            "destination": "environmental_alert" if environmental else "classifier",
+            "send_to_classifier": not environmental,
+            "reason": reason,
+        }
+
+    def resumen_enrutamiento(
+        self, resultados: list[dict[str, Any]]
+    ) -> dict[str, int]:
+        ambientales = sum(
+            item.get("routing", {}).get("terminal") is True
+            and item.get("routing", {}).get("send_to_classifier") is False
+            and item.get("contextual_class") == "environmental_anomaly"
+            for item in resultados
+        )
+        return {
+            "environmental_anomalies": ambientales,
+            "requires_classification": len(resultados) - ambientales,
+        }
+
+    def _concurrencia_relacionada(self, sospecha, edges, state) -> list[str]:
+        """Ultimo evento por entidad/patron; memoria acotada, sin consultar futuro.
+
+        El llamador conserva state entre lotes del mismo replay y lo reinicia
+        al reiniciar la evaluacion. Coincidencia no significa causa identificada.
+        """
+        timestamp = pd.to_datetime(sospecha.get("timestamp"), errors="coerce", utc=True)
+        if pd.isna(timestamp):
+            return []
+        entity = str(sospecha.get("entity_id", ""))
+        pattern = str(sospecha.get("suspected_pattern") or sospecha.get("pattern") or "unspecified")
+        since = timestamp - pd.Timedelta(seconds=self.config.common_cause_window_seconds)
+        for key in list(state):
+            if state[key] < since:
+                del state[key]
+        state[(entity, pattern)] = timestamp
+        related = {entity, *(str(edge["target"]) for edge in edges)}
+        return sorted({other for (other, other_pattern), when in state.items()
+                       if other in related and other_pattern == pattern and since <= when <= timestamp})
 
     def _bucket_timestamp(self, value: Any) -> pd.Timestamp | None:
         timestamp = pd.to_datetime(value, errors="coerce", utc=True)

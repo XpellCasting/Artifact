@@ -564,31 +564,36 @@ class CargaHistorialTest(unittest.TestCase):
                 len(con_el_pico["new_results"]),
             )
             self.assertEqual(
-                len(con_el_pico["new_classification_results"]),
+                len(con_el_pico["new_classifier_results"]),
                 len(con_el_pico["new_results"]),
             )
-            diagnostico = next(
+            pendiente = next(
                 item
-                for item in con_el_pico["new_classification_results"]
+                for item in con_el_pico["new_classifier_results"]
                 if item["entity_id"] == "sensor.replay_temperature"
             )
-            self.assertEqual(diagnostico["source"], "validation_replay")
-            self.assertTrue(diagnostico["replay"]["causal"])
+            self.assertEqual(pendiente["source"], "validation_replay")
+            self.assertTrue(pendiente["replay"]["causal"])
+            self.assertEqual(pendiente["classification_status"], pendiente["diagnosis"]["status"])
+            self.assertIn(pendiente["diagnosis"]["status"], {"compatible", "indeterminate", "no_fault_evidence"})
             self.assertEqual(
-                diagnostico["pipeline"]["contextual"]["outcome"],
-                "insufficient_coverage",
+                pendiente["context_outcome"],
+                "no_learned_relations",
             )
             self.assertEqual(
-                con_el_pico["pipeline_summary"]["statistical"],
+                con_el_pico["classification_count"],
                 con_el_pico["pipeline_summary"]["classifier"],
             )
+            self.assertGreater(con_el_pico["classification_count"], 0)
+            self.assertEqual(con_el_pico["pipeline_summary"]["classifier_status"], "catalogue")
+            self.assertIn("classifier_results", con_el_pico)
             self.assertEqual(
                 len(estado.contexto_actual()["results"]),
                 con_el_pico["contextual_count"],
             )
             self.assertEqual(
-                len(estado.clasificacion_actual()["results"]),
-                con_el_pico["classification_count"],
+                len(estado.contexto_actual()["pending_classification_results"]),
+                con_el_pico["pending_classification_count"],
             )
             self.assertTrue(con_el_pico["last_batch"]["keeps_up_with_event_time"])
             self.assertEqual(con_el_pico["processed_rows"], 13)
@@ -599,7 +604,12 @@ class CargaHistorialTest(unittest.TestCase):
             self.assertIsNone(estado.validation_baseline)
             self.assertEqual(reiniciado["detection_count"], 0)
             self.assertEqual(reiniciado["contextual_count"], 0)
+            self.assertEqual(reiniciado["pending_classification_count"], 0)
+            self.assertEqual(reiniciado["environmental_count"], 0)
             self.assertEqual(reiniciado["classification_count"], 0)
+            self.assertEqual(reiniciado["indeterminate_count"], 0)
+            self.assertEqual(reiniciado["no_fault_count"], 0)
+            self.assertNotEqual(reiniciado["diagnostic_run_id"], preparado["diagnostic_run_id"])
 
     def test_reproduccion_validacion_multistate_detecta_estado_no_visto(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -767,7 +777,9 @@ class CargaHistorialTest(unittest.TestCase):
             self.assertEqual(primero["results"], segundo["results"])
             with estado.analysis_cache_path.open("r", encoding="utf-8") as archivo:
                 cache = json.load(archivo)
-            self.assertEqual(cache["identity"]["cache_version"], 17)
+            self.assertEqual(cache["identity"]["cache_version"], 20)
+            self.assertNotIn("classification", segundo)
+            self.assertEqual(primero["pipeline_summary"], segundo["pipeline_summary"])
             self.assertEqual(
                 cache["identity"]["continuous_score_specification"]["version"],
                 "statistical-continuous-score-v2.0.0",
@@ -779,7 +791,7 @@ class CargaHistorialTest(unittest.TestCase):
             )
             self.assertEqual(
                 cache["identity"]["contextual_filter_version"],
-                "contextual-spatiotemporal-v1",
+                "contextual-spatiotemporal-v2",
             )
             self.assertTrue(
                 cache["identity"]["contextual_implementation_sha256"]

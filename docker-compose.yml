@@ -6,15 +6,22 @@ services:
       MULTISTATE_FIXTURE_DIR: /app/fixtures
       STATIC_HISTORY_DIR: /app/data/static_history
       REAL_HISTORY_PATH: /app/data/datosreales/history.csv
+      VALIDATION_HISTORY_PATH: /app/data/datosreales/historico_validacion.csv
+      ANALYSIS_CACHE_PATH: /app/data/cache/real_history_analysis.json
       CONTINUOUS_CONF_PATH: /app/data/cache/conf.txt
       CONTEXT_MAP_CACHE_PATH: /app/data/cache/contextual_map.json
-      GROUND_TRUTH_PATH: /app/data/datosreales/ground_truth.csv
+      REVIEW_DATA_DIR: /app/data/review
+      VALIDATION_REPLAY_MEMORY_RESULTS: "500"
+      VALIDATION_REPLAY_STATUS_RESULTS: "25"
+      CONTEXT_CONTINUOUS_MAX_AGE_SECONDS: "3600"
+      CONTEXT_CONTINUOUS_MAX_AGE_BY_ENTITY: "{}"
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     volumes:
       - ./data/fixtures:/app/fixtures:ro
       - ./data/static_history:/app/data/static_history
       - ./data/datosreales:/app/data/datosreales
       - ./data/cache:/app/data/cache
+      - ./data/review:/app/data/review
     ports:
       - "8000:8000"
 

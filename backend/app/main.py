@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import sqlite3
+from collections import deque
+from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from time import time
 from typing import Any, Callable
 from urllib.parse import unquote
@@ -19,21 +23,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .Cargar_Historial.Cargar_Historial import CargadorHistorial, ResultadoHistorial
-from .Filtro_Clasificacion import ClasificadorDiagnostico, EvaluadorExtremoAExtremo
-from .Filtro_Contextual import FiltroContextualEspacioTemporal
+from .Filtro_Contextual import ConfiguracionContextual, FiltroContextualEspacioTemporal
 from .Filtro_Estadistico.Filtro import FiltroEstadistico
+from .Filtro_Estadistico.Episodios import (
+    DEFAULT_QUIET_SECONDS, EPISODE_POLICY_VERSION, agrupar_sospechas,
+    enviar_a_contextual, resumen_episodios,
+)
 from .Reproduccion_Validacion import MotorReproduccionValidacion
+from .Revision_Fragmentos import crear_router_revision
+from .Diagnostico_Trabajo import DiagnosticWorkbench, crear_router_diagnostico
 DEFAULT_HISTORY_LOAD_SECONDS_PER_MIB = float(
     os.getenv("HISTORY_LOAD_SECONDS_PER_MIB", "0.22")
 )
+VALIDATION_REPLAY_MEMORY_RESULTS = max(
+    1, int(os.getenv("VALIDATION_REPLAY_MEMORY_RESULTS", "500"))
+)
+VALIDATION_REPLAY_STATUS_RESULTS = max(
+    1, int(os.getenv("VALIDATION_REPLAY_STATUS_RESULTS", "25"))
+)
+MIN_SUSPICION_THRESHOLD = 0.01
+MAX_SUSPICION_THRESHOLD = 0.99
+DEFAULT_SUSPICION_THRESHOLD = 0.60
 
 
 class AnalyzeRequest(BaseModel):
-    suspicion_threshold: float = 0.6
-
-
-class ClassifierEvaluationRequest(BaseModel):
-    partition: str = "test"
+    suspicion_quiet_seconds: int = Field(default=DEFAULT_QUIET_SECONDS, ge=0, le=86400)
+    suspicion_threshold: float = Field(
+        default=DEFAULT_SUSPICION_THRESHOLD,
+        ge=MIN_SUSPICION_THRESHOLD,
+        le=MAX_SUSPICION_THRESHOLD,
+    )
 
 
 class ContinuousConfigRequest(BaseModel):
@@ -41,8 +60,13 @@ class ContinuousConfigRequest(BaseModel):
 
 
 class ValidationReplayAdvanceRequest(BaseModel):
+    suspicion_quiet_seconds: int = Field(default=DEFAULT_QUIET_SECONDS, ge=0, le=86400)
     batch_size: int = Field(default=1000, ge=1, le=20000)
-    suspicion_threshold: float = Field(default=0.6, ge=0.01, le=0.99)
+    suspicion_threshold: float = Field(
+        default=DEFAULT_SUSPICION_THRESHOLD,
+        ge=MIN_SUSPICION_THRESHOLD,
+        le=MAX_SUSPICION_THRESHOLD,
+    )
 
 
 @dataclass
@@ -56,22 +80,13 @@ class EstadoAplicacion:
     filtro_contextual: FiltroContextualEspacioTemporal = field(
         default_factory=FiltroContextualEspacioTemporal
     )
-    filtro_clasificacion: ClasificadorDiagnostico = field(
-        default_factory=ClasificadorDiagnostico
-    )
-    evaluador_extremo_a_extremo: EvaluadorExtremoAExtremo = field(
-        default_factory=EvaluadorExtremoAExtremo
-    )
     context_map_cache_path: Path | None = None
-    ground_truth_path: Path | None = None
+    diagnostic_workbench: Any = field(default=None, repr=False)
     historial: ResultadoHistorial | None = None
     resultados: list[dict[str, Any]] = field(default_factory=list)
     timeline_base_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     mapa_contextual_cache: dict[str, Any] | None = None
     resultados_contextuales: list[dict[str, Any]] = field(default_factory=list)
-    resultados_clasificacion: list[dict[str, Any]] = field(default_factory=list)
-    ultimo_payload_clasificacion: dict[str, Any] | None = None
-    ultima_evaluacion_clasificacion: dict[str, Any] | None = None
     analysis_completed: bool = False
     future_baseline_template: dict[str, Any] | None = field(
         default=None, repr=False
@@ -97,15 +112,28 @@ class EstadoAplicacion:
     validation_baseline: dict[str, Any] | None = field(default=None, repr=False)
     validation_context_map: dict[str, Any] | None = field(default=None, repr=False)
     validation_context_events: pd.DataFrame | None = field(default=None, repr=False)
-    validation_results: list[dict[str, Any]] = field(default_factory=list, repr=False)
-    validation_contextual_results: list[dict[str, Any]] = field(
-        default_factory=list, repr=False
+    validation_diagnostic_events: pd.DataFrame | None = field(default=None, repr=False)
+    validation_context_concurrence: dict = field(default_factory=dict, repr=False)
+    validation_suspicion_episodes: dict = field(default_factory=dict, repr=False)
+    validation_results: Any = field(
+        default_factory=lambda: deque(maxlen=VALIDATION_REPLAY_MEMORY_RESULTS),
+        repr=False,
     )
-    validation_classification_results: list[dict[str, Any]] = field(
-        default_factory=list, repr=False
+    validation_contextual_results: Any = field(
+        default_factory=lambda: deque(maxlen=VALIDATION_REPLAY_MEMORY_RESULTS),
+        repr=False,
     )
     validation_replay_state: dict[str, Any] = field(default_factory=dict, repr=False)
     validation_replay_lock: Any = field(default_factory=Lock, repr=False)
+    validation_replay_pause: Any = field(default_factory=Event, repr=False)
+    validation_replay_worker: Thread | None = field(default=None, repr=False)
+    validation_replay_generation: int = field(default=0, repr=False)
+    validation_last_results: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    validation_last_contextual_results: list[dict[str, Any]] = field(
+        default_factory=list, repr=False
+    )
+    validation_replay_snapshot: dict[str, Any] = field(default_factory=dict, repr=False)
+    validation_results_store_ready: bool = field(default=False, repr=False)
 
     def status(self, autoload: bool = True) -> dict[str, Any]:
         if self.historial is None and autoload:
@@ -438,6 +466,9 @@ class EstadoAplicacion:
                 "vuelve a cargar el historico real."
             )
 
+        # Una carga nueva invalida cualquier ejecucion anterior. La señal se
+        # establece antes de esperar el lock para que el worker no tome otro lote.
+        self.validation_replay_pause.set()
         with self.validation_replay_lock:
             inicio = time()
             ruta = self.validation_history_path or (
@@ -466,6 +497,9 @@ class EstadoAplicacion:
                 ["timestamp_dt", "entity_id"]
             ).reset_index(drop=True)
             eventos["_replay_index"] = eventos.index
+            # Evita conservar simultaneamente el orden por entidad creado por
+            # el cargador y la copia cronologica usada por el replay.
+            validacion.eventos = eventos
             entidades_objetivo = set(eventos["entity_id"].astype(str).unique())
             baseline_historico = self.future_baseline_template
             mapa_contextual_historico = self.future_context_map_template
@@ -481,9 +515,19 @@ class EstadoAplicacion:
             self.validation_baseline = None
             self.validation_context_map = None
             self.validation_context_events = None
-            self.validation_results = []
-            self.validation_contextual_results = []
-            self.validation_classification_results = []
+            self.validation_diagnostic_events = None
+            self.validation_context_concurrence.clear()
+            self.validation_suspicion_episodes.clear()
+            self.validation_results = deque(maxlen=VALIDATION_REPLAY_MEMORY_RESULTS)
+            self.validation_contextual_results = deque(
+                maxlen=VALIDATION_REPLAY_MEMORY_RESULTS
+            )
+            self.validation_last_results = []
+            self.validation_last_contextual_results = []
+            self._reiniciar_almacen_resultados_validacion()
+            self.validation_replay_generation += 1
+            self.validation_replay_pause = Event()
+            self.validation_replay_worker = None
             self.validation_replay_state = {
                 "status": "ready",
                 "filename": Path(filename).name or ruta.name,
@@ -511,21 +555,79 @@ class EstadoAplicacion:
                 "load_elapsed_seconds": round(max(0.0, time() - inicio), 3),
                 "processing_elapsed_seconds": 0.0,
                 "contextual_elapsed_ms": 0.0,
-                "classification_elapsed_ms": 0.0,
+                "detection_count": 0,
+                "contextual_count": 0,
+                "environmental_count": 0,
+                "pending_classification_count": 0,
+                "classification_count": 0,
+                "indeterminate_count": 0,
+                "no_fault_count": 0,
+                "classifier_status": "ready",
+                "diagnostic_run_id": uuid4().hex,
+                "suspicion_threshold": DEFAULT_SUSPICION_THRESHOLD,
+                "suspicion_quiet_seconds": DEFAULT_QUIET_SECONDS,
+                "suppressed_count": 0,
+                "forwarded_count": 0,
+                "contextual_outcomes": {},
+                "contextual_coincidences": 0,
+                "possible_common_cause": 0,
+                "detection_delay_sum_seconds": 0.0,
+                "max_detection_delay_seconds": None,
+                "last_error": None,
                 "last_batch": None,
             }
-            return self._payload_reproduccion_validacion()
+            return self._publicar_snapshot_reproduccion()
 
     def _limpiar_reproduccion_validacion(self) -> None:
-        self.historial_validacion = None
-        self.eventos_validacion_ordenados = None
-        self.validation_baseline = None
-        self.validation_context_map = None
-        self.validation_context_events = None
-        self.validation_results = []
-        self.validation_contextual_results = []
-        self.validation_classification_results = []
-        self.validation_replay_state = {}
+        self.validation_replay_pause.set()
+        with self.validation_replay_lock:
+            self.validation_replay_generation += 1
+            self.historial_validacion = None
+            self.eventos_validacion_ordenados = None
+            self.validation_baseline = None
+            self.validation_context_map = None
+            self.validation_context_events = None
+            self.validation_diagnostic_events = None
+            self.validation_context_concurrence.clear()
+            self.validation_suspicion_episodes.clear()
+            self.validation_results = deque(maxlen=VALIDATION_REPLAY_MEMORY_RESULTS)
+            self.validation_contextual_results = deque(
+                maxlen=VALIDATION_REPLAY_MEMORY_RESULTS
+            )
+            self.validation_last_results = []
+            self.validation_last_contextual_results = []
+            self.validation_replay_state = {}
+            self.validation_replay_snapshot = {}
+            self.validation_results_store_ready = False
+            self.validation_replay_worker = None
+
+    @staticmethod
+    def _recortar_eventos_diagnosticos(
+        eventos: pd.DataFrame, hasta: pd.Timestamp, window_seconds: int,
+    ) -> pd.DataFrame:
+        """Buffer propio de F3: su ventana puede superar la requerida por F2."""
+        if eventos.empty:
+            return eventos.copy()
+        stamps = pd.to_datetime(eventos["timestamp_dt"], utc=True, errors="coerce")
+        lower = hasta - pd.Timedelta(seconds=window_seconds)
+        return eventos.loc[stamps.between(lower, hasta, inclusive="both")].copy()
+
+    def _eventos_diagnosticos_del_lote(self, lote: pd.DataFrame, run_id: str) -> pd.DataFrame:
+        if "diagnostic_window_seconds" not in self.validation_replay_state:
+            window = (self.diagnostic_workbench.window_seconds_for_run("validation_replay", run_id)
+                      if self.diagnostic_workbench is not None else 3600)
+            self.validation_replay_state["diagnostic_window_seconds"] = int(window)
+        window = self.validation_replay_state["diagnostic_window_seconds"]
+        previous = self.validation_diagnostic_events
+        if previous is None:
+            historical = getattr(self.historial, "eventos", None)
+            if not isinstance(historical, pd.DataFrame):
+                historical = self.validation_context_events
+            previous = self._recortar_eventos_diagnosticos(
+                historical if historical is not None else lote.iloc[:0],
+                lote["timestamp_dt"].min(), window,
+            )
+        return pd.concat([previous, lote], ignore_index=True).sort_values(["timestamp_dt", "entity_id"])
 
     def _recortar_eventos_contextuales(
         self,
@@ -549,16 +651,17 @@ class EstadoAplicacion:
             f"{self.filtro_contextual.config.window_seconds}s"
         ) - pd.Timedelta(seconds=ventana)
         recientes = trabajo[trabajo["timestamp_dt"].ge(desde)].copy()
-        anteriores_estado = trabajo[
+        # Conservar tambien el ultimo reporte continuo, incluso si es invalido:
+        # F2 decide si sigue vigente y nunca rejuvenece su fecha.
+        anteriores = trabajo[
             trabajo["timestamp_dt"].lt(desde)
-            & trabajo["sensor_kind"].isin({"binary", "multistate"})
         ]
-        if anteriores_estado.empty:
+        if anteriores.empty:
             return recientes.sort_values(
                 ["timestamp_dt", "entity_id"]
             ).reset_index(drop=True)
         arrastre = (
-            anteriores_estado.sort_values("timestamp_dt")
+            anteriores.sort_values("timestamp_dt")
             .groupby("entity_id", sort=False)
             .tail(1)
         )
@@ -571,14 +674,239 @@ class EstadoAplicacion:
             .reset_index(drop=True)
         )
 
+    def _ruta_almacen_resultados_validacion(self) -> Path:
+        return self.analysis_cache_path.parent / "validation_replay_results.sqlite3"
+
+    def _reiniciar_almacen_resultados_validacion(self) -> None:
+        path = self._ruta_almacen_resultados_validacion()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(path, timeout=30.0)) as connection:
+            with connection:
+                connection.execute("DROP TABLE IF EXISTS replay_results")
+                connection.execute(
+                    """
+                    CREATE TABLE replay_results (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        kind TEXT NOT NULL,
+                        payload TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX replay_results_kind_sequence "
+                    "ON replay_results(kind, sequence DESC)"
+                )
+        self.validation_results_store_ready = True
+
+    def _guardar_resultados_validacion(
+        self,
+        estadisticos: list[dict[str, Any]],
+        contextuales: list[dict[str, Any]],
+        salidas: dict[str, Any],
+    ) -> None:
+        if not self.validation_results_store_ready:
+            self._reiniciar_almacen_resultados_validacion()
+        por_tipo = {
+            "statistical": estadisticos,
+            "contextual": contextuales,
+            "environmental": salidas.get("environmental_results", []),
+            "pending": salidas.get("pending_classification_results", []),
+            "classifier": salidas.get("classifier_results", []),
+        }
+        rows = [
+            (
+                kind,
+                json.dumps(
+                    serializable_json(item),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+            )
+            for kind, items in por_tipo.items()
+            for item in items
+        ]
+        if not rows:
+            return
+        with closing(
+            sqlite3.connect(
+                self._ruta_almacen_resultados_validacion(), timeout=30.0
+            )
+        ) as connection:
+            with connection:
+                connection.executemany(
+                    "INSERT INTO replay_results(kind, payload) VALUES (?, ?)",
+                    rows,
+                )
+
+    def _leer_resultados_validacion(
+        self,
+        kind: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        with closing(
+            sqlite3.connect(
+                self._ruta_almacen_resultados_validacion(), timeout=30.0
+            )
+        ) as connection:
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM replay_results WHERE kind = ?",
+                    (kind,),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                "SELECT payload FROM replay_results WHERE kind = ? "
+                "ORDER BY sequence DESC LIMIT ? OFFSET ?",
+                (kind, limit, offset),
+            ).fetchall()
+        return total, [json.loads(row[0]) for row in rows]
+
+    def _publicar_snapshot_reproduccion(self) -> dict[str, Any]:
+        snapshot = self._payload_reproduccion_validacion(include_recent=True)
+        self.validation_replay_snapshot = snapshot
+        return snapshot
+
     def estado_reproduccion_validacion(self) -> dict[str, Any]:
+        snapshot = self.validation_replay_snapshot
+        if snapshot:
+            return snapshot
         with self.validation_replay_lock:
-            return self._payload_reproduccion_validacion()
+            return self._publicar_snapshot_reproduccion()
+
+    def iniciar_reproduccion_validacion(
+        self,
+        batch_size: int,
+        suspicion_threshold: float,
+        suspicion_quiet_seconds: int = DEFAULT_QUIET_SECONDS,
+    ) -> dict[str, Any]:
+        worker_anterior = self.validation_replay_worker
+        if (
+            worker_anterior is not None
+            and worker_anterior.is_alive()
+            and self.validation_replay_pause.is_set()
+        ):
+            worker_anterior.join(timeout=2.0)
+
+        with self.validation_replay_lock:
+            if (
+                self.historial_validacion is None
+                or self.eventos_validacion_ordenados is None
+            ):
+                raise ValueError("Primero debes subir los eventos futuros de Evaluacion.")
+            if int(self.validation_replay_state.get("cursor", 0)) >= len(
+                self.eventos_validacion_ordenados
+            ):
+                self.validation_replay_state["status"] = "completed"
+                return self._publicar_snapshot_reproduccion()
+            if (
+                self.validation_replay_worker is not None
+                and self.validation_replay_worker.is_alive()
+                and not self.validation_replay_pause.is_set()
+            ):
+                return self._publicar_snapshot_reproduccion()
+
+            cursor = int(self.validation_replay_state.get("cursor", 0))
+            umbral_anterior = self.validation_replay_state.get("suspicion_threshold")
+            umbral_activo = (
+                float(umbral_anterior)
+                if cursor > 0
+                and isinstance(umbral_anterior, (int, float))
+                and MIN_SUSPICION_THRESHOLD <= float(umbral_anterior) <= MAX_SUSPICION_THRESHOLD
+                else float(suspicion_threshold)
+            )
+            quiet_seconds = (int(self.validation_replay_state.get("suspicion_quiet_seconds", 0))
+                             if cursor > 0 else suspicion_quiet_seconds)
+            self.validation_replay_generation += 1
+            generation = self.validation_replay_generation
+            pause = Event()
+            self.validation_replay_pause = pause
+            self.validation_replay_state.update(
+                {
+                    "status": "running",
+                    "last_error": None,
+                    "automatic": True,
+                    "batch_size": int(batch_size),
+                    "suspicion_threshold": umbral_activo,
+                    "suspicion_quiet_seconds": quiet_seconds,
+                }
+            )
+            worker = Thread(
+                target=self._ejecutar_reproduccion_validacion,
+                args=(generation, pause, int(batch_size), umbral_activo, quiet_seconds),
+                name=f"validation-replay-{generation}",
+                daemon=True,
+            )
+            self.validation_replay_worker = worker
+            worker.start()
+            return self._publicar_snapshot_reproduccion()
+
+    def _ejecutar_reproduccion_validacion(
+        self,
+        generation: int,
+        pause: Event,
+        batch_size: int,
+        suspicion_threshold: float,
+        suspicion_quiet_seconds: int = DEFAULT_QUIET_SECONDS,
+    ) -> None:
+        try:
+            while not pause.is_set():
+                payload = self.avanzar_reproduccion_validacion(
+                    batch_size=batch_size,
+                    suspicion_threshold=suspicion_threshold,
+                    suspicion_quiet_seconds=suspicion_quiet_seconds,
+                    _automatic=True,
+                    _generation=generation,
+                )
+                if payload.get("status") in {"completed", "failed", "paused"}:
+                    break
+                # Cede brevemente el lock entre lotes para que status y pause
+                # respondan aun durante una reproduccion de larga duracion.
+                if pause.wait(0.01):
+                    break
+        except Exception as exc:
+            with self.validation_replay_lock:
+                if generation == self.validation_replay_generation:
+                    self.validation_replay_state.update(
+                        {
+                            "status": "failed",
+                            "last_error": str(exc),
+                            "automatic": False,
+                        }
+                    )
+                    self._publicar_snapshot_reproduccion()
+        finally:
+            with self.validation_replay_lock:
+                if generation == self.validation_replay_generation:
+                    if (
+                        pause.is_set()
+                        and self.validation_replay_state.get("status")
+                        not in {"completed", "failed"}
+                    ):
+                        self.validation_replay_state["status"] = "paused"
+                    self.validation_replay_state["automatic"] = False
+                    self._publicar_snapshot_reproduccion()
+
+    def pausar_reproduccion_validacion(self) -> dict[str, Any]:
+        self.validation_replay_pause.set()
+        with self.validation_replay_lock:
+            if not self.validation_replay_state:
+                return self._publicar_snapshot_reproduccion()
+            if self.validation_replay_state.get("status") not in {
+                "completed",
+                "failed",
+            }:
+                self.validation_replay_state["status"] = "paused"
+            self.validation_replay_state["automatic"] = False
+            return self._publicar_snapshot_reproduccion()
 
     def avanzar_reproduccion_validacion(
         self,
         batch_size: int,
         suspicion_threshold: float,
+        _automatic: bool = False,
+        _generation: int | None = None,
+        suspicion_quiet_seconds: int = DEFAULT_QUIET_SECONDS,
     ) -> dict[str, Any]:
         with self.validation_replay_lock:
             if (
@@ -586,11 +914,41 @@ class EstadoAplicacion:
                 or self.eventos_validacion_ordenados is None
             ):
                 raise ValueError("Primero debes subir los eventos futuros de Evaluacion.")
+            if _automatic:
+                if (
+                    _generation != self.validation_replay_generation
+                    or self.validation_replay_pause.is_set()
+                ):
+                    self.validation_replay_state["status"] = "paused"
+                    return self._publicar_snapshot_reproduccion()
+            elif (
+                self.validation_replay_worker is not None
+                and self.validation_replay_worker.is_alive()
+                and current_thread() is not self.validation_replay_worker
+                and not self.validation_replay_pause.is_set()
+            ):
+                raise ValueError(
+                    "La reproduccion automatica esta activa; pausala antes de avanzar manualmente."
+                )
             total = len(self.eventos_validacion_ordenados)
             cursor = int(self.validation_replay_state.get("cursor", 0))
             if cursor >= total:
                 self.validation_replay_state["status"] = "completed"
-                return self._payload_reproduccion_validacion(new_results=[])
+                return self._publicar_snapshot_reproduccion()
+            umbral_guardado = self.validation_replay_state.get("suspicion_threshold")
+            if (
+                cursor > 0
+                and isinstance(umbral_guardado, (int, float))
+                and MIN_SUSPICION_THRESHOLD <= float(umbral_guardado) <= MAX_SUSPICION_THRESHOLD
+            ):
+                # Una evaluación es reproducible: al reanudar no se cambia el
+                # umbral a mitad de la secuencia aunque la interfaz tenga otro.
+                suspicion_threshold = float(umbral_guardado)
+            else:
+                self.validation_replay_state["suspicion_threshold"] = float(suspicion_threshold)
+            quiet_seconds = (int(self.validation_replay_state.get("suspicion_quiet_seconds", 0))
+                             if cursor > 0 else suspicion_quiet_seconds)
+            self.validation_replay_state["suspicion_quiet_seconds"] = quiet_seconds
             self._inicializar_estado_reproduccion_validacion()
 
             fin = min(total, cursor + int(batch_size))
@@ -630,17 +988,23 @@ class EstadoAplicacion:
                 enriquecido["source"] = "validation_replay"
                 enriquecido["partition"] = "evaluation"
                 nuevos_resultados.append(enriquecido)
-            self.validation_results.extend(nuevos_resultados)
+
+            nuevos_resultados, siguientes_episodios = agrupar_sospechas(
+                nuevos_resultados, quiet_seconds, self.validation_suspicion_episodes
+            )
+            agrupacion_lote = resumen_episodios(nuevos_resultados)
 
             eventos_contextuales = pd.concat(
                 [self.validation_context_events, lote],
                 ignore_index=True,
             ).sort_values(["timestamp_dt", "entity_id"])
+            siguiente_concurrencia = dict(self.validation_context_concurrence)
             contextual = self.filtro_contextual.analizar_causal(
-                sospechas=nuevos_resultados,
+                sospechas=[item for item in nuevos_resultados if enviar_a_contextual(item)],
                 eventos_disponibles=eventos_contextuales,
                 entidades=self.historial.entidades,
                 mapa=self.validation_context_map or {},
+                concurrence_state=siguiente_concurrencia,
             )
             replay_por_evento = {
                 (
@@ -667,30 +1031,18 @@ class EstadoAplicacion:
                 enriquecido["source"] = "validation_replay"
                 enriquecido["partition"] = "evaluation"
                 nuevos_contextuales.append(enriquecido)
-            self.validation_contextual_results.extend(nuevos_contextuales)
 
-            clasificacion = self._analizar_clasificacion(
+            diagnostic_run_id = self.validation_replay_state.setdefault("diagnostic_run_id", uuid4().hex)
+            eventos_diagnosticos = self._eventos_diagnosticos_del_lote(lote, diagnostic_run_id)
+            nuevos_contextuales = self._diagnosticar_contextuales(
                 nuevos_resultados,
                 nuevos_contextuales,
+                eventos_diagnosticos,
                 source="validation_replay",
+                run_id=diagnostic_run_id,
             )
-            nuevos_diagnosticos = []
-            for item in clasificacion.get("results", []):
-                enriquecido = dict(item)
-                timestamp = pd.to_datetime(
-                    enriquecido.get("timestamp"), errors="coerce", utc=True
-                )
-                clave = (
-                    str(enriquecido.get("entity_id")),
-                    None if pd.isna(timestamp) else timestamp.isoformat(),
-                )
-                enriquecido["replay"] = deepcopy(
-                    replay_por_evento.get(clave, {})
-                )
-                enriquecido["partition"] = "evaluation"
-                nuevos_diagnosticos.append(enriquecido)
-            self.validation_classification_results.extend(nuevos_diagnosticos)
-            self.validation_context_events = self._recortar_eventos_contextuales(
+
+            siguientes_eventos_contextuales = self._recortar_eventos_contextuales(
                 eventos_contextuales,
                 reloj,
             )
@@ -709,12 +1061,58 @@ class EstadoAplicacion:
             contextual_elapsed = float(
                 contextual.get("summary", {}).get("elapsed_ms", 0.0)
             )
-            classification_elapsed = float(
-                clasificacion.get("summary", {}).get("elapsed_ms", 0.0)
+            rutas_lote = self._salidas_pipeline(nuevos_resultados, nuevos_contextuales)
+            self._guardar_resultados_validacion(
+                nuevos_resultados,
+                nuevos_contextuales,
+                rutas_lote,
             )
+            self.validation_context_events = siguientes_eventos_contextuales
+            self.validation_diagnostic_events = self._recortar_eventos_diagnosticos(
+                eventos_diagnosticos, reloj, self.validation_replay_state["diagnostic_window_seconds"],
+            )
+            self.validation_context_concurrence = siguiente_concurrencia
+            self.validation_suspicion_episodes = siguientes_episodios
+            self.validation_results.extend(nuevos_resultados)
+            self.validation_contextual_results.extend(nuevos_contextuales)
+            self.validation_last_results = nuevos_resultados[
+                -VALIDATION_REPLAY_STATUS_RESULTS:
+            ]
+            self.validation_last_contextual_results = nuevos_contextuales[
+                -VALIDATION_REPLAY_STATUS_RESULTS:
+            ]
+            delays_lote = [
+                float(item.get("replay", {}).get("detection_delay_seconds", 0.0))
+                for item in nuevos_resultados
+            ]
+            outcomes = dict(
+                self.validation_replay_state.get("contextual_outcomes", {})
+            )
+            for item in nuevos_contextuales:
+                outcome = str(item.get("context_outcome", "unexplained"))
+                outcomes[outcome] = int(outcomes.get(outcome, 0)) + 1
+            delay_sum = float(
+                self.validation_replay_state.get(
+                    "detection_delay_sum_seconds", 0.0
+                )
+            ) + sum(delays_lote)
+            max_delay_anterior = self.validation_replay_state.get(
+                "max_detection_delay_seconds"
+            )
+            max_delay_lote = max(delays_lote) if delays_lote else None
+            if max_delay_anterior is None:
+                max_delay = max_delay_lote
+            elif max_delay_lote is None:
+                max_delay = float(max_delay_anterior)
+            else:
+                max_delay = max(float(max_delay_anterior), max_delay_lote)
             self.validation_replay_state.update(
                 {
-                    "status": "completed" if fin >= total else "running",
+                    "status": (
+                        "completed"
+                        if fin >= total
+                        else "running" if _automatic else "paused"
+                    ),
                     "detector_state": "active",
                     "cursor": fin,
                     "current_timestamp": reloj.isoformat(),
@@ -728,15 +1126,54 @@ class EstadoAplicacion:
                         + contextual_elapsed,
                         3,
                     ),
-                    "classification_elapsed_ms": round(
-                        float(
-                            self.validation_replay_state.get(
-                                "classification_elapsed_ms", 0.0
-                            )
+                    "detection_count": int(
+                        self.validation_replay_state.get("detection_count", 0)
+                    )
+                    + len(nuevos_resultados),
+                    "forwarded_count": int(self.validation_replay_state.get(
+                        "forwarded_count", self.validation_replay_state.get("contextual_count", 0)))
+                    + agrupacion_lote["forwarded"],
+                    "suppressed_count": int(self.validation_replay_state.get("suppressed_count", 0))
+                    + agrupacion_lote["suppressed"],
+                    "contextual_count": int(
+                        self.validation_replay_state.get("contextual_count", 0)
+                    )
+                    + len(nuevos_contextuales),
+                    "environmental_count": int(
+                        self.validation_replay_state.get("environmental_count", 0)
+                    )
+                    + rutas_lote["environmental_count"],
+                    "pending_classification_count": int(
+                        self.validation_replay_state.get(
+                            "pending_classification_count", 0
                         )
-                        + classification_elapsed,
-                        3,
+                    )
+                    + rutas_lote["pending_classification_count"],
+                    "classification_count": int(self.validation_replay_state.get("classification_count", 0))
+                    + rutas_lote["classification_count"],
+                    "indeterminate_count": int(self.validation_replay_state.get("indeterminate_count", 0))
+                    + rutas_lote["indeterminate_count"],
+                    "no_fault_count": int(self.validation_replay_state.get("no_fault_count", 0))
+                    + rutas_lote["no_fault_count"],
+                    "classifier_status": (
+                        rutas_lote["pipeline_summary"]["classifier_status"]
+                        if rutas_lote["classification_count"]
+                        else self.validation_replay_state.get("classifier_status", "ready")
                     ),
+                    "contextual_outcomes": outcomes,
+                    "contextual_coincidences": int(self.validation_replay_state.get("contextual_coincidences", 0))
+                    + sum(bool(item.get("common_cause", {}).get("contextual_coincidence")) for item in nuevos_contextuales),
+                    "possible_common_cause": int(
+                        self.validation_replay_state.get(
+                            "possible_common_cause", 0
+                        )
+                    )
+                    + sum(
+                        bool(item.get("common_cause", {}).get("candidate"))
+                        for item in nuevos_contextuales
+                    ),
+                    "detection_delay_sum_seconds": delay_sum,
+                    "max_detection_delay_seconds": max_delay,
                     "last_batch": {
                         "events": int(len(lote)),
                         "processing_elapsed_ms": round(elapsed * 1000.0, 3),
@@ -744,26 +1181,32 @@ class EstadoAplicacion:
                         "events_per_second": round(len(lote) / max(elapsed, 1e-9), 3),
                         "keeps_up_with_event_time": elapsed <= max(simulated_span, 0.001),
                         "new_detections": len(nuevos_resultados),
+                        "forwarded": agrupacion_lote["forwarded"],
+                        "suppressed": agrupacion_lote["suppressed"],
                         "contextual_evaluated": len(nuevos_contextuales),
-                        "classified": len(nuevos_diagnosticos),
+                        "classified": rutas_lote["classification_count"],
+                        "indeterminate": rutas_lote["indeterminate_count"],
+                        "no_fault": rutas_lote["no_fault_count"],
+                        "environmental": rutas_lote["environmental_count"],
+                        "pending_classification": rutas_lote["pending_classification_count"],
                         "timings_by_kind_ms": resultado.get("summary", {}).get(
                             "timings_by_kind_ms", {}
                         ),
                         "contextual_elapsed_ms": contextual_elapsed,
-                        "classification_elapsed_ms": classification_elapsed,
-                        "classification_by_class": clasificacion.get(
-                            "summary", {}
-                        ).get("by_class", {}),
                     },
                 }
             )
-            return self._payload_reproduccion_validacion(
-                new_results=nuevos_resultados,
-                new_contextual_results=nuevos_contextuales,
-                new_classification_results=nuevos_diagnosticos,
+            respuesta = self._payload_reproduccion_validacion(
+                new_results=nuevos_resultados[-VALIDATION_REPLAY_MEMORY_RESULTS:],
+                new_contextual_results=nuevos_contextuales[
+                    -VALIDATION_REPLAY_MEMORY_RESULTS:
+                ],
             )
+            self._publicar_snapshot_reproduccion()
+            return respuesta
 
     def reiniciar_reproduccion_validacion(self) -> dict[str, Any]:
+        self.validation_replay_pause.set()
         with self.validation_replay_lock:
             if (
                 self.historial_validacion is None
@@ -773,9 +1216,19 @@ class EstadoAplicacion:
             self.validation_baseline = None
             self.validation_context_map = None
             self.validation_context_events = None
-            self.validation_results = []
-            self.validation_contextual_results = []
-            self.validation_classification_results = []
+            self.validation_diagnostic_events = None
+            self.validation_context_concurrence.clear()
+            self.validation_suspicion_episodes.clear()
+            self.validation_results = deque(maxlen=VALIDATION_REPLAY_MEMORY_RESULTS)
+            self.validation_contextual_results = deque(
+                maxlen=VALIDATION_REPLAY_MEMORY_RESULTS
+            )
+            self.validation_last_results = []
+            self.validation_last_contextual_results = []
+            self._reiniciar_almacen_resultados_validacion()
+            self.validation_replay_generation += 1
+            self.validation_replay_worker = None
+            self.validation_replay_pause = Event()
             self.validation_replay_state.update(
                 {
                     "status": "ready",
@@ -784,11 +1237,29 @@ class EstadoAplicacion:
                     "current_timestamp": self.validation_replay_state.get("start"),
                     "processing_elapsed_seconds": 0.0,
                     "contextual_elapsed_ms": 0.0,
-                    "classification_elapsed_ms": 0.0,
+                    "detection_count": 0,
+                    "forwarded_count": 0,
+                    "suppressed_count": 0,
+                    "contextual_count": 0,
+                    "environmental_count": 0,
+                    "pending_classification_count": 0,
+                    "classification_count": 0,
+                    "indeterminate_count": 0,
+                    "no_fault_count": 0,
+                    "classifier_status": "ready",
+                    "diagnostic_run_id": uuid4().hex,
+                    "contextual_outcomes": {},
+                    "contextual_coincidences": 0,
+                    "possible_common_cause": 0,
+                    "detection_delay_sum_seconds": 0.0,
+                    "max_detection_delay_seconds": None,
+                    "last_error": None,
+                    "automatic": False,
                     "last_batch": None,
                 }
             )
-            return self._payload_reproduccion_validacion(new_results=[])
+            self.validation_replay_state.pop("diagnostic_window_seconds", None)
+            return self._publicar_snapshot_reproduccion()
 
     def _inicializar_estado_reproduccion_validacion(self) -> None:
         if (
@@ -809,12 +1280,141 @@ class EstadoAplicacion:
         self.validation_baseline = deepcopy(self.future_baseline_template)
         self.validation_context_map = deepcopy(self.future_context_map_template)
         self.validation_context_events = self.future_context_events_template.copy()
+        self.validation_context_concurrence.clear()
+        self.validation_suspicion_episodes.clear()
+
+    @staticmethod
+    def _clave_evento(item: dict[str, Any]) -> tuple[str, str]:
+        timestamp = pd.to_datetime(item.get("timestamp"), errors="coerce", utc=True)
+        return (
+            str(item.get("entity_id", "")),
+            str(item.get("timestamp")) if pd.isna(timestamp) else timestamp.isoformat(),
+        )
+
+    def _diagnosticar_contextuales(
+        self,
+        estadisticos: list[dict[str, Any]],
+        contextuales: list[dict[str, Any]],
+        eventos: pd.DataFrame | None = None,
+        source: str = "history",
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Ejecuta F3 una vez en el productor; las consultas leen estos snapshots."""
+        if self.diagnostic_workbench is not None:
+            return self.diagnostic_workbench.enrich_contextual(
+                estadisticos, contextuales, events=eventos,
+                source=source, run_id=run_id or uuid4().hex,
+            )
+        # Instancias embebidas y pruebas pueden usar el catálogo sin persistencia.
+        from .Diagnostico_Patrones import diagnose
+
+        lookup = {self._clave_evento(item): item for item in estadisticos
+                  if enviar_a_contextual(item)}
+        enriched = []
+        for contextual in contextuales:
+            item = deepcopy(contextual)
+            if self._es_ambiental_terminal(item):
+                enriched.append(item)
+                continue
+            statistical = lookup.get(self._clave_evento(item))
+            if statistical is not None:
+                item["diagnosis"] = diagnose(statistical, item)
+                item["diagnosis_mode"] = "catalogue"
+            enriched.append(item)
+        return enriched
+
+    @staticmethod
+    def _es_ambiental_terminal(contextual: dict[str, Any]) -> bool:
+        route = contextual.get("routing", {})
+        return (
+            contextual.get("contextual_class") == "environmental_anomaly"
+            and route.get("terminal") is True
+            and route.get("send_to_classifier") is False
+        )
+
+    @staticmethod
+    def _estado_clasificador(resultados: list[dict[str, Any]]) -> str:
+        if not resultados:
+            return "ready"
+        modes = {item.get("diagnosis_mode") for item in resultados}
+        if "active_model" in modes:
+            return "active_model"
+        return "catalogue"
+
+    def _salidas_pipeline(
+        self,
+        estadisticos: list[dict[str, Any]],
+        contextuales: list[dict[str, Any]],
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Resume snapshots F1/F2/F3; no ejecuta inferencia al consultar resultados."""
+        lookup = {self._clave_evento(item): item for item in contextuales}
+        ambientales: list[dict[str, Any]] = []
+        pendientes: list[dict[str, Any]] = []
+        clasificados: list[dict[str, Any]] = []
+        for statistical in estadisticos:
+            if not enviar_a_contextual(statistical):
+                continue
+            contextual = lookup.get(self._clave_evento(statistical))
+            if contextual is None:
+                # La ausencia de contexto nunca descarta una sospecha.
+                contextual = {
+                    "event_id": f"{statistical.get('entity_id')}@{statistical.get('timestamp')}",
+                    "entity_id": statistical.get("entity_id"),
+                    "timestamp": statistical.get("timestamp"),
+                    "context_outcome": "insufficient_coverage",
+                    "contextual_class": None,
+                    "alert": None,
+                    "routing": {
+                        "terminal": False,
+                        "destination": "classifier",
+                        "send_to_classifier": True,
+                        "reason": "missing_contextual_result",
+                    },
+                }
+            contextual = {**contextual, **({"episode": statistical["episode"]} if statistical.get("episode") else {})}
+            if self._es_ambiental_terminal(contextual):
+                ambientales.append({**contextual, "resolved_by": "contextual"})
+            else:
+                diagnosis = contextual.get("diagnosis") or {}
+                routed = {
+                    **contextual,
+                    "classification_status": diagnosis.get("status", "pending"),
+                }
+                if diagnosis:
+                    clasificados.append({**routed, "resolved_by": "classifier"})
+                if not diagnosis or diagnosis.get("status") == "indeterminate":
+                    pendientes.append(routed)
+        indeterminados = sum(item["diagnosis"].get("status") == "indeterminate" for item in clasificados)
+        sin_falla = sum(item["diagnosis"].get("status") == "no_fault_evidence" for item in clasificados)
+        return {
+            "environmental_count": len(ambientales),
+            "pending_classification_count": len(pendientes),
+            "classification_count": len(clasificados),
+            "indeterminate_count": indeterminados,
+            "no_fault_count": sin_falla,
+            "environmental_results": ambientales[:limit],
+            "pending_classification_results": pendientes[:limit],
+            "classifier_results": clasificados[:limit],
+            "pipeline_summary": {
+                "version": "sequential-diagnostic-v2",
+                "statistical": resumen_episodios(estadisticos)["detected"],
+                "grouping": resumen_episodios(estadisticos),
+                "contextual": len(contextuales),
+                "environmental": len(ambientales),
+                "pending_classification": len(pendientes),
+                "classifier": len(clasificados),
+                "indeterminate": indeterminados,
+                "no_fault": sin_falla,
+                "classifier_status": self._estado_clasificador(clasificados),
+            },
+        }
 
     def _payload_reproduccion_validacion(
         self,
         new_results: list[dict[str, Any]] | None = None,
         new_contextual_results: list[dict[str, Any]] | None = None,
-        new_classification_results: list[dict[str, Any]] | None = None,
+        include_recent: bool = False,
     ) -> dict[str, Any]:
         if not self.validation_replay_state:
             return {
@@ -827,117 +1427,220 @@ class EstadoAplicacion:
                 "new_results": [],
                 "contextual_results": [],
                 "new_contextual_results": [],
-                "classification_results": [],
-                "new_classification_results": [],
+                "recent_results": [],
+                "recent_contextual_results": [],
+                **self._salidas_pipeline([], []),
             }
         payload = dict(self.validation_replay_state)
         rows = int(payload.get("rows", 0))
         cursor = int(payload.get("cursor", 0))
-        resultados = sorted(
-            self.validation_results,
-            key=lambda item: pd.to_datetime(
-                item.get("timestamp"), errors="coerce", utc=True
-            ),
-            reverse=True,
+        detection_count = int(payload.get("detection_count", len(self.validation_results)))
+        contextual_count = int(
+            payload.get("contextual_count", len(self.validation_contextual_results))
         )
-        delays = [
-            float(item.get("replay", {}).get("detection_delay_seconds", 0.0))
-            for item in resultados
-        ]
-        contextuales = sorted(
-            self.validation_contextual_results,
-            key=lambda item: pd.to_datetime(
-                item.get("timestamp"), errors="coerce", utc=True
-            ),
-            reverse=True,
+        environmental_count = int(payload.get("environmental_count", 0))
+        pending_count = int(payload.get("pending_classification_count", 0))
+        classification_count = int(payload.get("classification_count", 0))
+        indeterminate_count = int(payload.get("indeterminate_count", 0))
+        no_fault_count = int(payload.get("no_fault_count", 0))
+        delay_sum = float(payload.pop("detection_delay_sum_seconds", 0.0))
+        outcomes = dict(payload.pop("contextual_outcomes", {}))
+        response_results = (
+            new_results
+            if new_results is not None
+            else self.validation_last_results if include_recent else []
         )
-        diagnosticos = sorted(
-            self.validation_classification_results,
-            key=lambda item: pd.to_datetime(
-                item.get("timestamp"), errors="coerce", utc=True
-            ),
-            reverse=True,
+        response_contextual = (
+            new_contextual_results
+            if new_contextual_results is not None
+            else self.validation_last_contextual_results if include_recent else []
         )
-        outcomes: dict[str, int] = {}
-        for item in contextuales:
-            outcome = str(item.get("context_outcome", "unexplained"))
-            outcomes[outcome] = outcomes.get(outcome, 0) + 1
         resumen_contextual = {
-            "evaluated": len(contextuales),
+            "evaluated": contextual_count,
             "by_outcome": outcomes,
-            "possible_common_cause": sum(
-                bool(item.get("common_cause", {}).get("candidate"))
-                for item in contextuales
-            ),
-            "elapsed_ms": round(
-                float(payload.get("contextual_elapsed_ms", 0.0)), 3
-            ),
+            "environmental_anomalies": environmental_count,
+            "requires_classification": max(0, contextual_count - environmental_count),
+            "possible_common_cause": int(payload.get("possible_common_cause", 0)),
+            "contextual_coincidences": int(payload.get("contextual_coincidences", 0)),
+            "elapsed_ms": round(float(payload.get("contextual_elapsed_ms", 0.0)), 3),
             "causal": True,
         }
-        resumen_clasificacion = self._resumen_resultados_clasificacion(
-            diagnosticos,
-            elapsed_ms=float(
-                payload.get("classification_elapsed_ms", 0.0)
-            ),
+        salidas_respuesta = self._salidas_pipeline(
+            response_results,
+            response_contextual,
         )
+        nuevas_salidas = self._salidas_pipeline(
+            new_results or [],
+            new_contextual_results or [],
+        )
+        pipeline_summary = {
+            "version": "sequential-diagnostic-v2",
+            "statistical": detection_count,
+            "grouping": {
+                "detected": detection_count,
+                "forwarded": int(payload.get("forwarded_count", contextual_count)),
+                "suppressed": int(payload.get("suppressed_count", 0)),
+            },
+            "contextual": contextual_count,
+            "environmental": environmental_count,
+            "pending_classification": pending_count,
+            "classifier": classification_count,
+            "indeterminate": indeterminate_count,
+            "no_fault": no_fault_count,
+            "classifier_status": payload.get("classifier_status", "ready"),
+            "causal": True,
+            "uses_future_evaluation_rows": False,
+        }
         return {
             "loaded": True,
             **payload,
             "processed_rows": cursor,
             "remaining_rows": max(0, rows - cursor),
             "progress": round(cursor * 100.0 / max(rows, 1), 4),
-            "detection_count": len(resultados),
-            "average_detection_delay_seconds": round(
-                sum(delays) / len(delays), 3
-            ) if delays else None,
-            "max_detection_delay_seconds": round(max(delays), 3) if delays else None,
-            "results": resultados[:500],
+            "detection_count": detection_count,
+            "average_detection_delay_seconds": (
+                round(delay_sum / detection_count, 3) if detection_count else None
+            ),
+            # Compatibilidad: en una respuesta de avance estos nombres contienen
+            # solamente el lote nuevo, nunca el acumulado completo.
+            "results": response_results,
             "new_results": new_results or [],
-            "contextual_count": len(contextuales),
+            "recent_results": [],
+            "contextual_count": contextual_count,
             "contextual_summary": resumen_contextual,
-            "contextual_results": contextuales[:500],
+            "contextual_results": response_contextual,
             "new_contextual_results": new_contextual_results or [],
-            "classification_count": len(diagnosticos),
-            "classification_summary": resumen_clasificacion,
-            "classification_results": diagnosticos[:500],
-            "new_classification_results": new_classification_results or [],
-            "pipeline_summary": {
-                "statistical": len(resultados),
-                "contextual": len(contextuales),
-                "classifier": len(diagnosticos),
-                "causal": True,
-                "uses_future_evaluation_rows": False,
-            },
+            "recent_contextual_results": [],
+            "environmental_count": environmental_count,
+            "pending_classification_count": pending_count,
+            "classification_count": classification_count,
+            "indeterminate_count": indeterminate_count,
+            "no_fault_count": no_fault_count,
+            "classifier_results": salidas_respuesta["classifier_results"],
+            "new_classifier_results": nuevas_salidas["classifier_results"],
+            "environmental_results": salidas_respuesta["environmental_results"],
+            "pending_classification_results": salidas_respuesta[
+                "pending_classification_results"
+            ],
+            "new_environmental_results": nuevas_salidas["environmental_results"],
+            "new_pending_classification_results": nuevas_salidas["pending_classification_results"],
+            "pipeline_summary": pipeline_summary,
         }
 
-    def analizar_historial(self, suspicion_threshold: float) -> dict[str, Any]:
+    def resultados_reproduccion_validacion(
+        self,
+        kind: str,
+        offset: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        if kind not in {"statistical", "contextual", "environmental", "pending", "classifier"}:
+            raise ValueError("Tipo de resultado de Evaluacion no valido.")
+        if not self.validation_replay_state:
+            raise ValueError("Primero debes subir los eventos futuros de Evaluacion.")
+        if self.validation_results_store_ready:
+            total, items = self._leer_resultados_validacion(kind, offset, limit)
+            return {
+                "kind": kind,
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "next_offset": (
+                    offset + len(items) if offset + len(items) < total else None
+                ),
+                "items": items,
+            }
+
+        with self.validation_replay_lock:
+            if not self.validation_replay_state:
+                raise ValueError("Primero debes subir los eventos futuros de Evaluacion.")
+
+            if kind == "statistical":
+                total = len(self.validation_results)
+                items = list(
+                    islice(reversed(self.validation_results), offset, offset + limit)
+                )
+            elif kind == "contextual":
+                total = len(self.validation_contextual_results)
+                items = list(
+                    islice(
+                        reversed(self.validation_contextual_results),
+                        offset,
+                        offset + limit,
+                    )
+                )
+            else:
+                items = []
+                vistos = 0
+                for contextual in reversed(self.validation_contextual_results):
+                    es_ambiental = self._es_ambiental_terminal(contextual)
+                    diagnosis = contextual.get("diagnosis") or {}
+                    matches = (
+                        es_ambiental if kind == "environmental"
+                        else bool(diagnosis) and not es_ambiental if kind == "classifier"
+                        else not es_ambiental and (not diagnosis or diagnosis.get("status") == "indeterminate")
+                    )
+                    if not matches:
+                        continue
+                    if vistos >= offset:
+                        items.append(
+                            {
+                                **contextual,
+                                **(
+                                    {"resolved_by": "contextual"}
+                                    if es_ambiental
+                                    else {
+                                        "classification_status": diagnosis.get("status", "pending"),
+                                        **({"resolved_by": "classifier"} if kind == "classifier" else {}),
+                                    }
+                                ),
+                            }
+                        )
+                    vistos += 1
+                    if len(items) >= limit:
+                        break
+                total = int(
+                    self.validation_replay_state.get(
+                        "environmental_count"
+                        if kind == "environmental"
+                        else "classification_count" if kind == "classifier"
+                        else "pending_classification_count",
+                        vistos,
+                    )
+                )
+
+            return {
+                "kind": kind,
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "next_offset": offset + len(items) if offset + len(items) < total else None,
+                "items": items,
+            }
+
+    def analizar_historial(
+        self, suspicion_threshold: float, suspicion_quiet_seconds: int = DEFAULT_QUIET_SECONDS,
+    ) -> dict[str, Any]:
         if self.historial is None:
             self.status()
         if self.historial is None:
             raise ValueError("Primero debes cargar un historial.")
 
-        cached = self._leer_cache_analisis_real(suspicion_threshold)
+        cached = self._leer_cache_analisis_real(suspicion_threshold, suspicion_quiet_seconds)
         if cached is not None:
-            self.resultados = list(cached.get("results", []))
+            self.resultados = list(cached.get("all_results", cached.get("results", [])))
             contextual = cached.get("contextual")
             if not isinstance(contextual, dict):
-                contextual = self._analizar_contextual(
-                    self.resultados,
-                    self.historial.eventos,
-                )
+                contextual = self._analizar_contextual(self.resultados, self.historial.eventos)
                 cached["contextual"] = contextual
-                self._guardar_cache_analisis_real(suspicion_threshold, cached)
             self.resultados_contextuales = list(contextual.get("results", []))
-            classification = cached.get("classification")
-            if not isinstance(classification, dict):
-                classification = self._analizar_clasificacion(
-                    self.resultados,
-                    self.resultados_contextuales,
-                    source="historical",
-                )
-                cached["classification"] = classification
-                self._guardar_cache_analisis_real(suspicion_threshold, cached)
-            self._guardar_estado_clasificacion(classification)
+            self.resultados_contextuales = self._diagnosticar_contextuales(
+                self.resultados, self.resultados_contextuales, self.historial.eventos,
+            )
+            cached["contextual"] = {**contextual, "results": self.resultados_contextuales}
+            cached.update(self._salidas_pipeline(self.resultados, self.resultados_contextuales))
+            summary = dict(cached.get("summary") or {})
+            summary["suspicion_threshold"] = float(suspicion_threshold)
+            cached["summary"] = summary
             self.analysis_completed = True
             return cached
 
@@ -946,36 +1649,34 @@ class EstadoAplicacion:
             entidades=self.historial.entidades,
             suspicion_threshold=suspicion_threshold,
         )
+        agrupados, _ = agrupar_sospechas(
+            list(resultado.get("all_results", resultado.get("results", []))), suspicion_quiet_seconds
+        )
+        resultado["all_results"] = agrupados
+        resultado["results"] = agrupados[:1000]
+        resultado["top_results"] = agrupados[:1000]
         summary = dict(resultado.get("summary") or {})
+        summary["suspicion_threshold"] = float(suspicion_threshold)
+        summary["suspicion_quiet_seconds"] = suspicion_quiet_seconds
+        summary["grouping"] = resumen_episodios(agrupados)
+        summary["top_results"] = agrupados[:1000]
         summary["cache_hit"] = False
         summary["cache_path"] = str(self.analysis_cache_path) if self._es_historial_real_activo() else ""
         resultado["summary"] = summary
-        self.resultados = list(resultado.get("results", []))
-        contextual = self._analizar_contextual(
-            self.resultados,
-            self.historial.eventos,
-        )
+        # Los limites de visualizacion no deben recortar las entradas de F2.
+        self.resultados = list(resultado.get("all_results", resultado.get("results", [])))
+        contextual = self._analizar_contextual(self.resultados, self.historial.eventos)
         resultado["contextual"] = contextual
         summary["contextual_evaluated"] = int(contextual.get("summary", {}).get("evaluated", 0))
-        summary["contextual_elapsed_ms"] = float(
-            contextual.get("summary", {}).get("elapsed_ms", 0.0)
-        )
+        summary["contextual_elapsed_ms"] = float(contextual.get("summary", {}).get("elapsed_ms", 0.0))
         self.resultados_contextuales = list(contextual.get("results", []))
-        classification = self._analizar_clasificacion(
-            self.resultados,
-            self.resultados_contextuales,
-            source="historical",
+        self.resultados_contextuales = self._diagnosticar_contextuales(
+            self.resultados, self.resultados_contextuales, self.historial.eventos,
         )
-        resultado["classification"] = classification
-        summary["classification_evaluated"] = int(
-            classification.get("summary", {}).get("evaluated", 0)
-        )
-        summary["classification_elapsed_ms"] = float(
-            classification.get("summary", {}).get("elapsed_ms", 0.0)
-        )
-        self._guardar_estado_clasificacion(classification)
+        resultado["contextual"] = {**contextual, "results": self.resultados_contextuales}
+        resultado.update(self._salidas_pipeline(self.resultados, self.resultados_contextuales))
         self.analysis_completed = True
-        self._guardar_cache_analisis_real(suspicion_threshold, resultado)
+        self._guardar_cache_analisis_real(suspicion_threshold, resultado, suspicion_quiet_seconds)
         return resultado
 
     def vista_normalizacion(self) -> dict[str, Any]:
@@ -1042,21 +1743,47 @@ class EstadoAplicacion:
             raise ValueError("Primero debes cargar un historial.")
         payload = self._analizar_contextual(self.resultados, self.historial.eventos)
         self.resultados_contextuales = list(payload.get("results", []))
-        classification = self._analizar_clasificacion(
-            self.resultados,
-            self.resultados_contextuales,
-            source="historical",
+        self.resultados_contextuales = self._diagnosticar_contextuales(
+            self.resultados, self.resultados_contextuales, self.historial.eventos,
         )
-        self._guardar_estado_clasificacion(classification)
-        payload["classification"] = classification
+        payload["results"] = self.resultados_contextuales
+        payload.update(self._salidas_pipeline(self.resultados, self.resultados_contextuales))
         return payload
 
     def contexto_actual(self) -> dict[str, Any]:
-        resultados_origen = (
-            self.validation_contextual_results
-            if self.validation_replay_state
-            else self.resultados_contextuales
-        )
+        if self.validation_replay_state:
+            status = self.estado_reproduccion_validacion()
+            contextuales = self.resultados_reproduccion_validacion(
+                "contextual", 0, 500
+            )
+            ambientales = self.resultados_reproduccion_validacion(
+                "environmental", 0, 500
+            )
+            pendientes = self.resultados_reproduccion_validacion(
+                "pending", 0, 500
+            )
+            clasificados = self.resultados_reproduccion_validacion("classifier", 0, 500)
+            return {
+                "results": contextuales["items"],
+                "summary": status.get("contextual_summary", {}),
+                "environmental_count": status.get("environmental_count", 0),
+                "pending_classification_count": status.get(
+                    "pending_classification_count", 0
+                ),
+                "environmental_results": ambientales["items"],
+                "pending_classification_results": pendientes["items"],
+                "classifier_results": clasificados["items"],
+                "classification_count": status.get("classification_count", 0),
+                "indeterminate_count": status.get("indeterminate_count", 0),
+                "no_fault_count": status.get("no_fault_count", 0),
+                "pipeline_summary": status.get("pipeline_summary", {}),
+                "source": "validation_replay",
+                "map_quality": (self.validation_context_map or {}).get(
+                    "refresh", {}
+                ),
+            }
+
+        resultados_origen = self.resultados_contextuales
         resultados = sorted(
             resultados_origen,
             key=lambda item: pd.to_datetime(
@@ -1066,6 +1793,7 @@ class EstadoAplicacion:
         )
         summary: dict[str, Any] = {
             "evaluated": len(resultados),
+            **self.filtro_contextual.resumen_enrutamiento(resultados),
             "by_outcome": {},
             "possible_common_cause": 0,
         }
@@ -1075,341 +1803,21 @@ class EstadoAplicacion:
             summary["possible_common_cause"] += int(
                 bool(item.get("common_cause", {}).get("candidate"))
             )
+        summary["contextual_coincidences"] = sum(
+            bool(item.get("common_cause", {}).get("contextual_coincidence")) for item in resultados
+        )
         return {
-            "results": resultados,
+            "results": resultados[:500],
             "summary": summary,
-            "source": (
-                "validation_replay"
-                if self.validation_replay_state
-                else "historical"
+            **self._salidas_pipeline(
+                self.resultados,
+                resultados,
+                limit=500,
             ),
-            "map_quality": (
-                (self.mapa_contextual_cache or {}).get("refresh", {})
-            ),
+            "source": "historical",
+            "map_quality": (self.mapa_contextual_cache or {}).get("refresh", {}),
         }
 
-    def especificacion_clasificacion(self) -> dict[str, Any]:
-        specification = deepcopy(self.filtro_clasificacion.especificacion())
-        specification["runtime_validation_context"] = self._contexto_validacion_runtime()
-        return specification
-
-    def _contexto_validacion_runtime(self) -> dict[str, Any]:
-        if self.historial is None:
-            self.status()
-        start = None if self.historial is None else self.historial.metadatos.get("start")
-        end = None if self.historial is None else self.historial.metadatos.get("end")
-        start_dt = pd.to_datetime(start, errors="coerce", utc=True)
-        end_dt = pd.to_datetime(end, errors="coerce", utc=True)
-        observed_days = (
-            float((end_dt - start_dt).total_seconds() / 86400.0)
-            if pd.notna(start_dt) and pd.notna(end_dt) and end_dt >= start_dt
-            else 0.0
-        )
-        ground_truth = self.ground_truth_path
-        labels_available = bool(ground_truth and ground_truth.exists())
-        return {
-            "history_source": (
-                None
-                if self.historial is None
-                else self.historial.metadatos.get("source_type")
-            ),
-            "history_start": start,
-            "history_end": end,
-            "observed_days": round(observed_days, 3),
-            "planned_history_days": 150,
-            "history_requirement_met": observed_days >= 150.0,
-            "uses_simulated_dataset": False,
-            "ground_truth_path": str(ground_truth) if ground_truth else None,
-            "real_labels_available": labels_available,
-            "operational_status": "provisional_real_month",
-            "validation_status": (
-                "ready_for_temporal_validation"
-                if observed_days >= 150.0 and labels_available
-                else "pre_registered_pending_real_validation"
-            ),
-            "warning": (
-                "El clasificador puede operar sobre el mes real, pero sus metricas "
-                "finales no se estiman hasta disponer de cobertura temporal y "
-                "etiquetas reales suficientes."
-            ),
-        }
-
-    def analizar_clasificacion_actual(self) -> dict[str, Any]:
-        payload = self._analizar_clasificacion(
-            self.resultados,
-            self.resultados_contextuales,
-            source="historical",
-        )
-        self._guardar_estado_clasificacion(payload)
-        return payload
-
-    def clasificacion_actual(self) -> dict[str, Any]:
-        if self.validation_replay_state:
-            specification = self.especificacion_clasificacion()
-            resultados = sorted(
-                self.validation_classification_results,
-                key=lambda item: pd.to_datetime(
-                    item.get("timestamp"), errors="coerce", utc=True
-                ),
-                reverse=True,
-            )
-            return {
-                "schema_version": "classifier-results-v1",
-                "model": {
-                    "version": specification.get("model_version"),
-                    "type": specification.get("model_type"),
-                    "confidence_kind": specification.get("confidence_kind"),
-                    "selection_status": specification.get("selection_status"),
-                },
-                "summary": self._resumen_resultados_clasificacion(
-                    resultados,
-                    elapsed_ms=float(
-                        self.validation_replay_state.get(
-                            "classification_elapsed_ms", 0.0
-                        )
-                    ),
-                ),
-                "results": resultados,
-                "source": "validation_replay",
-            }
-        if self.ultimo_payload_clasificacion is not None:
-            return self.ultimo_payload_clasificacion
-        if self.resultados or self.resultados_contextuales:
-            return self.analizar_clasificacion_actual()
-        specification = self.especificacion_clasificacion()
-        return {
-            "schema_version": "classifier-results-v1",
-            "model": {
-                "version": specification.get("model_version"),
-                "type": specification.get("model_type"),
-                "confidence_kind": specification.get("confidence_kind"),
-                "selection_status": specification.get("selection_status"),
-            },
-            "summary": self._resumen_resultados_clasificacion([]),
-            "results": [],
-        }
-
-    def _analizar_clasificacion(
-        self,
-        resultados_estadisticos: list[dict[str, Any]],
-        resultados_contextuales: list[dict[str, Any]],
-        source: str,
-    ) -> dict[str, Any]:
-        return self.filtro_clasificacion.analizar(
-            resultados_estadisticos,
-            resultados_contextuales,
-            source=source,
-        )
-
-    def _guardar_estado_clasificacion(self, payload: dict[str, Any]) -> None:
-        self.resultados_clasificacion = list(payload.get("results", []))
-        self.ultimo_payload_clasificacion = payload
-        self.ultima_evaluacion_clasificacion = None
-
-    def _agregar_estado_clasificacion(self, payload: dict[str, Any]) -> None:
-        anteriores = self.ultimo_payload_clasificacion or {}
-        self.resultados_clasificacion.extend(payload.get("results", []))
-        elapsed_ms = float(anteriores.get("summary", {}).get("elapsed_ms", 0.0))
-        elapsed_ms += float(payload.get("summary", {}).get("elapsed_ms", 0.0))
-        self.ultimo_payload_clasificacion = {
-            "schema_version": payload.get(
-                "schema_version",
-                anteriores.get("schema_version", "classifier-results-v1"),
-            ),
-            "model": payload.get("model") or anteriores.get("model") or {},
-            "summary": self._resumen_resultados_clasificacion(
-                self.resultados_clasificacion,
-                elapsed_ms=elapsed_ms,
-            ),
-            "results": self.resultados_clasificacion,
-        }
-        self.ultima_evaluacion_clasificacion = None
-
-    def _resumen_resultados_clasificacion(
-        self,
-        resultados: list[dict[str, Any]],
-        elapsed_ms: float = 0.0,
-    ) -> dict[str, Any]:
-        by_class: dict[str, int] = {}
-        confidences: list[float] = []
-        low_confidence = 0
-        for item in resultados:
-            diagnostic_class = str(item.get("diagnostic_class", "indeterminate"))
-            by_class[diagnostic_class] = by_class.get(diagnostic_class, 0) + 1
-            confidence = pd.to_numeric(
-                pd.Series([item.get("confidence")]),
-                errors="coerce",
-            ).iloc[0]
-            if pd.notna(confidence):
-                numeric_confidence = float(confidence)
-                confidences.append(numeric_confidence)
-                low_confidence += int(numeric_confidence < 0.70)
-        return {
-            "evaluated": len(resultados),
-            "by_class": by_class,
-            "abstained": by_class.get("indeterminate", 0),
-            "low_confidence": low_confidence,
-            "confidence_mean": (
-                round(sum(confidences) / len(confidences), 6)
-                if confidences
-                else None
-            ),
-            "elapsed_ms": round(float(elapsed_ms), 3),
-        }
-
-    def evaluacion_clasificacion(
-        self,
-        partition: str = "test",
-        force: bool = False,
-    ) -> dict[str, Any]:
-        requested_partition = str(partition or "test").lower()
-        cached_partition = str(
-            (self.ultima_evaluacion_clasificacion or {})
-            .get("dataset", {})
-            .get("split", "")
-        ).lower()
-        if (
-            not force
-            and self.ultima_evaluacion_clasificacion is not None
-            and cached_partition == requested_partition
-        ):
-            return self.ultima_evaluacion_clasificacion
-
-        ground_truth_path = self.ground_truth_path
-        if ground_truth_path is None or not ground_truth_path.exists():
-            return self._evaluacion_no_disponible(
-                requested_partition,
-                (
-                    "No existe una base de verdad real asociada al conjunto cargado. "
-                    "Se requieren etiquetas reales para calcular las metricas."
-                ),
-            )
-        if not self.analysis_completed:
-            return self._evaluacion_no_disponible(
-                requested_partition,
-                "Primero debe ejecutarse el flujo completo sobre el historial real.",
-            )
-
-        ground_truth = pd.read_csv(
-            ground_truth_path,
-            dtype=str,
-            keep_default_na=False,
-        )
-        correspondence = self._correspondencia_ground_truth(ground_truth)
-        if not correspondence["matches"]:
-            return self._evaluacion_no_disponible(
-                requested_partition,
-                correspondence["warning"],
-            )
-        payload = self.evaluador_extremo_a_extremo.evaluar(
-            ground_truth=ground_truth,
-            resultados_estadisticos=self.resultados,
-            resultados_contextuales=self.resultados_contextuales,
-            resultados_clasificacion=self.resultados_clasificacion,
-            partition=requested_partition,
-            dataset_id="real-month-ground-truth",
-            timeline_start=self.historial.metadatos.get("start"),
-            timeline_end=self.historial.metadatos.get("end"),
-        )
-        payload.setdefault("dataset", {})["source"] = "real_labeled_history"
-        payload["dataset"]["path"] = str(ground_truth_path)
-        payload["dataset"]["correspondence"] = correspondence
-        payload["runtime_validation_context"] = self._contexto_validacion_runtime()
-        self.ultima_evaluacion_clasificacion = payload
-        return payload
-
-    def _correspondencia_ground_truth(
-        self,
-        ground_truth: pd.DataFrame,
-    ) -> dict[str, Any]:
-        if self.historial is None or ground_truth.empty:
-            return {
-                "matches": False,
-                "warning": "No hay historial activo o la base de verdad esta vacia.",
-            }
-        if "entity_id" not in ground_truth:
-            return {
-                "matches": False,
-                "warning": "La base de verdad real no contiene entity_id.",
-            }
-        timestamp_column = (
-            "start"
-            if "start" in ground_truth
-            else "timestamp"
-            if "timestamp" in ground_truth
-            else None
-        )
-        if timestamp_column is None:
-            return {
-                "matches": False,
-                "warning": "La base de verdad real no contiene timestamp ni start.",
-            }
-        active_entities = set(
-            self.historial.entidades["entity_id"].astype(str)
-        )
-        truth_entities = set(ground_truth["entity_id"].astype(str))
-        common_entities = active_entities.intersection(truth_entities)
-        truth_times = pd.to_datetime(
-            ground_truth[timestamp_column],
-            errors="coerce",
-            utc=True,
-        ).dropna()
-        history_times = pd.to_datetime(
-            self.historial.eventos["timestamp_dt"],
-            errors="coerce",
-            utc=True,
-        ).dropna()
-        temporal_overlap = bool(
-            not truth_times.empty
-            and not history_times.empty
-            and truth_times.max() >= history_times.min()
-            and truth_times.min() <= history_times.max()
-        )
-        matches = bool(common_entities and temporal_overlap)
-        return {
-            "matches": matches,
-            "common_entity_count": len(common_entities),
-            "temporal_overlap": temporal_overlap,
-            "warning": (
-                ""
-                if matches
-                else "La base de verdad no corresponde en entidades o tiempo "
-                "al mes real actualmente cargado."
-            ),
-        }
-
-    def _evaluacion_no_disponible(
-        self,
-        partition: str,
-        warning: str,
-    ) -> dict[str, Any]:
-        runtime = self._contexto_validacion_runtime()
-        payload = {
-            "schema_version": "classifier-evaluation-v1",
-            "available": False,
-            "status": "not_evaluated",
-            "dataset": {
-                "id": "real-month-pending-ground-truth",
-                "source": "real_history",
-                "split": partition,
-                "labeled_cases": None,
-                "months_available": round(
-                    float(runtime.get("observed_days", 0.0)) / 30.4375,
-                    3,
-                ),
-                "months_required": 5,
-                "uses_simulated_dataset": False,
-            },
-            "metric_policy": {
-                "gate_rejection_policy": "not_reached",
-                "indeterminate_policy": "abstention_and_non_true_positive",
-                "fixed_thresholds": True,
-            },
-            "runtime_validation_context": runtime,
-            "warnings": [warning, runtime["warning"]],
-        }
-        self.ultima_evaluacion_clasificacion = payload
-        return payload
 
     def _analizar_contextual(
         self,
@@ -1418,7 +1826,7 @@ class EstadoAplicacion:
     ) -> dict[str, Any]:
         mapa = self._asegurar_mapa_contextual()
         return self.filtro_contextual.analizar(
-            sospechas=resultados_estadisticos,
+            sospechas=[item for item in resultados_estadisticos if enviar_a_contextual(item)],
             eventos=eventos,
             entidades=self.historial.entidades,
             mapa=mapa,
@@ -1577,20 +1985,18 @@ class EstadoAplicacion:
     def _reset_analysis(self) -> None:
         self.resultados = []
         self.resultados_contextuales = []
-        self.resultados_clasificacion = []
-        self.ultimo_payload_clasificacion = None
-        self.ultima_evaluacion_clasificacion = None
         self.analysis_completed = False
 
     def _es_historial_real_activo(self) -> bool:
         return self.historial is not None and self.historial.metadatos.get("source_type") == "real"
 
-    def _identidad_historial_real(self, suspicion_threshold: float) -> dict[str, Any] | None:
+    def _identidad_historial_real(
+        self, suspicion_threshold: float, suspicion_quiet_seconds: int = DEFAULT_QUIET_SECONDS,
+    ) -> dict[str, Any] | None:
         if not self._es_historial_real_activo() or not self.real_history_path.exists():
             return None
         stat = self.real_history_path.stat()
         conf_path = self.filtro_estadistico.continuos.conf_path
-        classifier_specification = self.filtro_clasificacion.especificacion()
         contextual_map_path = self._ruta_cache_contextual()
         contextual_map_expired: bool | None = None
         if (
@@ -1618,13 +2024,18 @@ class EstadoAplicacion:
             except (OSError, json.JSONDecodeError):
                 contextual_map_expired = True
         return {
-            "cache_version": 17,
+            "cache_version": 20,
             "source_path": str(self.real_history_path),
             "source_size": int(stat.st_size),
             "source_mtime_ns": int(stat.st_mtime_ns),
             "source_sha256": self._sha256_archivo(self.real_history_path),
             "continuous_conf_sha256": self._sha256_archivo(conf_path) if conf_path.is_file() else "",
             "suspicion_threshold": round(float(suspicion_threshold), 6),
+            "episode_policy_version": EPISODE_POLICY_VERSION,
+            "suspicion_quiet_seconds": suspicion_quiet_seconds,
+            "episode_implementation_sha256": self._sha256_archivo(
+                Path(__file__).parent / "Filtro_Estadistico" / "Episodios.py"
+            ),
             "continuous_score_specification": (
                 self.filtro_estadistico.continuos.especificacion_puntaje()
             ),
@@ -1645,17 +2056,6 @@ class EstadoAplicacion:
                 else ""
             ),
             "contextual_map_expired": contextual_map_expired,
-            "classifier_version": classifier_specification.get("model_version"),
-            "classifier_implementation_sha256": (
-                classifier_specification.get("artifacts", {}).get(
-                    "implementation_sha256"
-                )
-            ),
-            "classifier_configuration_sha256": (
-                classifier_specification.get("artifacts", {}).get(
-                    "configuration_sha256"
-                )
-            ),
         }
 
     def _identidad_normalidad_real(self) -> dict[str, Any] | None:
@@ -1787,8 +2187,10 @@ class EstadoAplicacion:
             salida[entity_id] = base
         return salida
 
-    def _leer_cache_analisis_real(self, suspicion_threshold: float) -> dict[str, Any] | None:
-        identidad = self._identidad_historial_real(suspicion_threshold)
+    def _leer_cache_analisis_real(
+        self, suspicion_threshold: float, suspicion_quiet_seconds: int = DEFAULT_QUIET_SECONDS,
+    ) -> dict[str, Any] | None:
+        identidad = self._identidad_historial_real(suspicion_threshold, suspicion_quiet_seconds)
         if identidad is None or not self.analysis_cache_path.exists():
             return None
         try:
@@ -1809,8 +2211,11 @@ class EstadoAplicacion:
         payload["summary"] = summary
         return payload
 
-    def _guardar_cache_analisis_real(self, suspicion_threshold: float, resultado: dict[str, Any]) -> None:
-        identidad = self._identidad_historial_real(suspicion_threshold)
+    def _guardar_cache_analisis_real(
+        self, suspicion_threshold: float, resultado: dict[str, Any],
+        suspicion_quiet_seconds: int = DEFAULT_QUIET_SECONDS,
+    ) -> None:
+        identidad = self._identidad_historial_real(suspicion_threshold, suspicion_quiet_seconds)
         if identidad is None:
             return
         payload = serializable_json(resultado)
@@ -1850,9 +2255,9 @@ def crear_app() -> FastAPI:
         title="Artefacto de tesis",
         description=(
             "API para carga de historial, filtros estadistico-temporal y "
-            "contextual espacio-temporal, y clasificacion diagnostica reproducible."
+            "contextual con cierre ambiental. Tercer filtro pendiente de implementacion."
         ),
-        version="0.4.0",
+        version="0.5.0",
     )
     cors_origins = [
         origin.strip()
@@ -1871,9 +2276,19 @@ def crear_app() -> FastAPI:
 
 app = crear_app()
 ARTIFACT_ROOT = Path(__file__).resolve().parents[2]
+REVIEW_DATA_DIRECTORY = Path(
+    os.getenv("REVIEW_DATA_DIR", str(ARTIFACT_ROOT / "data/review"))
+)
+app.include_router(crear_router_revision(REVIEW_DATA_DIRECTORY))
 state = EstadoAplicacion(
     cargador=CargadorHistorial(),
     filtro_estadistico=FiltroEstadistico(),
+    filtro_contextual=FiltroContextualEspacioTemporal(ConfiguracionContextual(
+        continuous_max_age_seconds=float(os.getenv("CONTEXT_CONTINUOUS_MAX_AGE_SECONDS", "3600")),
+        continuous_max_age_seconds_by_entity=json.loads(
+            os.getenv("CONTEXT_CONTINUOUS_MAX_AGE_BY_ENTITY", "{}")
+        ),
+    )),
     static_history_dir=Path(
         os.getenv("STATIC_HISTORY_DIR", str(ARTIFACT_ROOT / "data/static_history"))
     ),
@@ -1901,13 +2316,9 @@ state = EstadoAplicacion(
             str(ARTIFACT_ROOT / "data/cache/contextual_map.json"),
         )
     ),
-    ground_truth_path=Path(
-        os.getenv(
-            "GROUND_TRUTH_PATH",
-            str(ARTIFACT_ROOT / "data/datosreales/ground_truth.csv"),
-        )
-    ),
+    diagnostic_workbench=DiagnosticWorkbench(REVIEW_DATA_DIRECTORY),
 )
+app.include_router(crear_router_diagnostico(state.diagnostic_workbench))
 
 
 @app.get("/health", tags=["health"])
@@ -1982,7 +2393,7 @@ def history_real_load_job(job_id: str) -> dict[str, Any]:
 @app.post("/history/analyze", tags=["history"])
 def history_analyze(request: AnalyzeRequest) -> dict[str, Any]:
     try:
-        return state.analizar_historial(request.suspicion_threshold)
+        return state.analizar_historial(request.suspicion_threshold, request.suspicion_quiet_seconds)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2013,6 +2424,43 @@ def validation_replay_status() -> dict[str, Any]:
     return state.estado_reproduccion_validacion()
 
 
+@app.get("/validation/replay/results", tags=["validation-replay"])
+def validation_replay_results(
+    kind: str = Query(
+        default="statistical",
+        pattern="^(statistical|contextual|environmental|pending|classifier)$",
+    ),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=500),
+) -> dict[str, Any]:
+    try:
+        return state.resultados_reproduccion_validacion(kind, offset, limit)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/validation/replay/start", tags=["validation-replay"])
+def validation_replay_start(
+    request: ValidationReplayAdvanceRequest,
+) -> dict[str, Any]:
+    try:
+        return state.iniciar_reproduccion_validacion(
+            batch_size=request.batch_size,
+            suspicion_threshold=request.suspicion_threshold,
+            suspicion_quiet_seconds=request.suspicion_quiet_seconds,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/validation/replay/pause", tags=["validation-replay"])
+def validation_replay_pause() -> dict[str, Any]:
+    try:
+        return state.pausar_reproduccion_validacion()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/validation/replay/advance", tags=["validation-replay"])
 def validation_replay_advance(
     request: ValidationReplayAdvanceRequest,
@@ -2021,6 +2469,7 @@ def validation_replay_advance(
         return state.avanzar_reproduccion_validacion(
             batch_size=request.batch_size,
             suspicion_threshold=request.suspicion_threshold,
+            suspicion_quiet_seconds=request.suspicion_quiet_seconds,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2079,45 +2528,6 @@ def contextual_results() -> dict[str, Any]:
     return state.contexto_actual()
 
 
-@app.get("/classifier/specification", tags=["classifier"])
-def classifier_specification() -> dict[str, Any]:
-    return state.especificacion_clasificacion()
-
-
-@app.post("/classifier/analyze", tags=["classifier"])
-def analyze_classifier() -> dict[str, Any]:
-    try:
-        return state.analizar_clasificacion_actual()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.get("/classifier/results", tags=["classifier"])
-def classifier_results() -> dict[str, Any]:
-    return state.clasificacion_actual()
-
-
-@app.get("/classifier/evaluation", tags=["classifier"])
-def classifier_evaluation(
-    partition: str = Query(default="test"),
-) -> dict[str, Any]:
-    try:
-        return state.evaluacion_clasificacion(partition=partition)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/classifier/evaluate", tags=["classifier"])
-def evaluate_classifier(
-    request: ClassifierEvaluationRequest,
-) -> dict[str, Any]:
-    try:
-        return state.evaluacion_clasificacion(
-            partition=request.partition,
-            force=True,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/history/timeline", tags=["history"])

@@ -19,10 +19,16 @@ import {
   Zap,
 } from "lucide-react";
 import { downloadCsv } from "./csv.js";
+import ReviewWorkspace from "./ReviewWorkspace.jsx";
+import DiagnosticWorkspace from "./DiagnosticWorkspace.jsx";
+import { isStatisticalSuspicion, statisticalCounts, episodeLabel } from "./statistical-routing.js";
+import { isEnvironmentalResult, contextRoutingLabel, contextRoutingReasonLabel, contextRoutingCounts, contextCoherenceLabel, contextObservationLabel, preciseContextTimestamp, contextCommonCause } from "./context-routing.js";
 import "./styles.css";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-const RED_SUSPICION_SCORE = 0.60;
+const DEFAULT_SUSPICION_THRESHOLD = 0.60;
+const MIN_SUSPICION_THRESHOLD = 0.01;
+const MAX_SUSPICION_THRESHOLD = 0.99;
 const MARKER_GROUP_GAP_MS = 15 * 60 * 1000;
 
 const EQUATIONS = [
@@ -172,6 +178,18 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+function replayResultKey(result) {
+  return result?.event_id || `${result?.entity_id || ""}@${result?.timestamp || ""}`;
+}
+
+function mergeReplayResults(current, incoming, limit = 500) {
+  const merged = new Map();
+  [...(incoming || []), ...(current || [])].forEach((item) => {
+    merged.set(replayResultKey(item), item);
+  });
+  return [...merged.values()].sort(compareResultsByExecutionDate).slice(0, limit);
+}
+
 function startHistoryUpload(file, onProgress) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
@@ -238,7 +256,7 @@ function wait(milliseconds) {
 
 function downloadResultsCsv(results) {
   downloadCsv([
-    ["Entidad", "Tiempo mayor-menor", "Score", "Raw", "Lectura", "Patron", "Indicadores", "Ecuacion"],
+    ["Entidad", "Tiempo mayor-menor", "Score", "Raw", "Lectura", "Patron", "Indicadores", "Ecuacion", "Episodio", "Agrupada", "Apariciones"],
     ...results.map((result) => [
       result.entity_id,
       shortDate(result.timestamp),
@@ -248,6 +266,9 @@ function downloadResultsCsv(results) {
       [result.suspected_pattern || result.pattern || "-", timeWindowLabel(result.time_window)].filter(Boolean).join(" / "),
       (result.triggered_indicators || []).join(", ") || "-",
       equationNames(result.triggered_indicators, result.sensor_kind),
+      result.episode?.episode_id || "",
+      result.suppressed_by_episode ? "si" : "no",
+      result.episode?.occurrences ?? "",
     ]),
   ], "resultados_filtro_estadistico.csv");
 }
@@ -259,7 +280,8 @@ function App() {
   const [timelines, setTimelines] = useState([]);
   const [historicalResults, setHistoricalResults] = useState([]);
   const [runSummary, setRunSummary] = useState(null);
-  const [suspicionThreshold, setSuspicionThreshold] = useState(RED_SUSPICION_SCORE);
+  const [suspicionThreshold, setSuspicionThreshold] = useState(DEFAULT_SUSPICION_THRESHOLD);
+  const [suspicionQuietMinutes, setSuspicionQuietMinutes] = useState(30);
   const [chartStart, setChartStart] = useState("");
   const [chartEnd, setChartEnd] = useState("");
   const [busy, setBusy] = useState("");
@@ -274,13 +296,23 @@ function App() {
   const [contextResults, setContextResults] = useState([]);
   const [contextSummary, setContextSummary] = useState(null);
   const [contextError, setContextError] = useState("");
-  const [classifierResults, setClassifierResults] = useState([]);
-  const [classifierSummary, setClassifierSummary] = useState(null);
-  const [classifierEvaluation, setClassifierEvaluation] = useState(null);
-  const [classifierSpecification, setClassifierSpecification] = useState(null);
-  const [classifierError, setClassifierError] = useState("");
   const [validationReplay, setValidationReplay] = useState(null);
   const [validationUpload, setValidationUpload] = useState(null);
+
+  function updateSuspicionThreshold(percent) {
+    const parsed = Number(percent);
+    if (!Number.isFinite(parsed)) return;
+    const normalized = Math.min(
+      MAX_SUSPICION_THRESHOLD,
+      Math.max(MIN_SUSPICION_THRESHOLD, parsed / 100),
+    );
+    setSuspicionThreshold(Math.round(normalized * 1000) / 1000);
+  }
+
+  const analyzedSuspicionThreshold = Number(runSummary?.suspicion_threshold);
+  const visibleSuspicionThreshold = Number.isFinite(analyzedSuspicionThreshold)
+    ? analyzedSuspicionThreshold
+    : suspicionThreshold;
   const [validationAutoRunning, setValidationAutoRunning] = useState(false);
   const [validationBatchSize, setValidationBatchSize] = useState(1000);
   const continuousEntities = useMemo(
@@ -322,14 +354,19 @@ function App() {
       .slice(0, 1000);
   }, [filteredAnalyzedResults]);
 
-  const suspiciousCount = allAnalyzedResults.filter(isRedSuspicion).length;
+  const statisticalSummary = statisticalCounts(allAnalyzedResults, runSummary || {});
+  const suspiciousCount = statisticalSummary.detected;
 
   useEffect(() => {
     runStep("init", async () => {
       setHealth(await api("/health"));
       const status = await api("/history/static/status?autoload=false");
       applyHistoryStatus(status);
-      applyValidationPipeline(await api("/validation/replay/status"));
+      const replay = await api("/validation/replay/status");
+      applyValidationPipeline(replay);
+      if (replay?.loaded) {
+        await loadValidationResultPages();
+      }
     });
   }, []);
 
@@ -339,35 +376,48 @@ function App() {
     }
   }, [activeModule]);
 
-  useEffect(() => {
-    if (activeModule === "clasificador") {
-      loadClassifierData();
-    }
-  }, [activeModule]);
 
   useEffect(() => {
-    if (
-      !validationAutoRunning
-      || Boolean(busy)
-      || validationReplay?.status === "completed"
-    ) {
+    if (!validationAutoRunning) {
       return undefined;
     }
-    const timer = window.setTimeout(async () => {
-      const payload = await advanceValidationReplay();
-      if (!payload || payload.status === "completed") {
-        setValidationAutoRunning(false);
+    let cancelled = false;
+    let timer;
+    const controller = new AbortController();
+
+    const poll = async () => {
+      try {
+        const payload = await api("/validation/replay/status", {
+          signal: controller.signal,
+        });
+        if (cancelled) {
+          return;
+        }
+        applyValidationPipeline(payload);
+        if (payload.status === "running") {
+          timer = window.setTimeout(poll, 900);
+        } else {
+          setValidationAutoRunning(false);
+          await loadValidationResultPages();
+          if (payload.status === "failed") {
+            setError(payload.last_error || "La reproduccion de Evaluacion fallo.");
+          }
+        }
+      } catch (err) {
+        if (!cancelled && err.name !== "AbortError") {
+          setValidationAutoRunning(false);
+          setError(err.message);
+        }
       }
-    }, 650);
-    return () => window.clearTimeout(timer);
-  }, [
-    validationAutoRunning,
-    validationReplay?.cursor,
-    validationReplay?.status,
-    validationBatchSize,
-    suspicionThreshold,
-    busy,
-  ]);
+    };
+
+    timer = window.setTimeout(poll, 500);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [validationAutoRunning]);
 
   async function runStep(label, action) {
     setBusy(label);
@@ -395,17 +445,6 @@ function App() {
     setContextResults([]);
     setContextSummary(null);
     setContextError("");
-    clearClassifierData();
-  }
-
-  function clearClassifierData({ keepSpecification = false } = {}) {
-    setClassifierResults([]);
-    setClassifierSummary(null);
-    setClassifierEvaluation(null);
-    setClassifierError("");
-    if (!keepSpecification) {
-      setClassifierSpecification(null);
-    }
   }
 
   function applyContextualPayload(payload) {
@@ -426,48 +465,6 @@ function App() {
       setContextSummary(payload.contextual_summary);
     } else if (payload?.summary?.contextual) {
       setContextSummary(payload.summary.contextual);
-    }
-  }
-
-  function applyClassifierPayload(payload, { replaceResults = false, source = "" } = {}) {
-    const embedded = payload?.classification;
-    const nextResults = Array.isArray(payload?.historical_classification_results)
-      ? payload.historical_classification_results
-      : Array.isArray(payload?.classification_results)
-        ? payload.classification_results
-        : Array.isArray(embedded?.results)
-          ? embedded.results
-          : null;
-    if (nextResults !== null) {
-      const taggedResults = source
-        ? nextResults.map((result) => result?.source ? result : { ...result, source })
-        : nextResults;
-      const shouldReplace = replaceResults || Array.isArray(payload?.historical_classification_results);
-      setClassifierResults((current) => (
-        shouldReplace ? taggedResults : mergeClassifierResults(current, taggedResults)
-      ));
-    }
-    if (embedded?.summary) {
-      setClassifierSummary(embedded.summary);
-    } else if (payload?.classification_summary) {
-      setClassifierSummary(payload.classification_summary);
-    } else if (payload?.summary?.classification) {
-      setClassifierSummary(payload.summary.classification);
-    }
-    if (embedded?.model) {
-      setClassifierSpecification((current) => ({
-        ...normalizeClassifierSpecificationPayload(current),
-        ...normalizeClassifierSpecificationPayload(embedded.model),
-      }));
-    }
-    if (embedded?.specification) {
-      setClassifierSpecification((current) => ({
-        ...normalizeClassifierSpecificationPayload(current),
-        ...normalizeClassifierSpecificationPayload(embedded.specification),
-      }));
-    }
-    if (embedded?.evaluation) {
-      setClassifierEvaluation(embedded.evaluation);
     }
   }
 
@@ -564,12 +561,12 @@ function App() {
     await runStep("analyze-history", async () => {
       const payload = await api("/history/analyze", {
         method: "POST",
-        body: JSON.stringify({ suspicion_threshold: suspicionThreshold }),
+        body: JSON.stringify({ suspicion_threshold: suspicionThreshold,
+          suspicion_quiet_seconds: suspicionQuietMinutes * 60 }),
       });
       setHistoricalResults((payload.results || []).filter((result) => ["continuous", "binary", "multistate"].includes(result.sensor_kind)));
       setRunSummary(payload.summary || {});
       applyContextualPayload(payload);
-      applyClassifierPayload(payload, { replaceResults: true, source: "historical" });
     });
   }
 
@@ -608,7 +605,6 @@ function App() {
       setContextError("");
       const nextMap = await api("/context/map/rebuild", { method: "POST" });
       setContextMap(nextMap);
-      clearClassifierData();
       try {
         const nextResults = await api("/context/results");
         setContextResults(nextResults.results || []);
@@ -617,59 +613,6 @@ function App() {
         setContextError(`Mapa reconstruido; resultados no disponibles: ${err.message}`);
       }
       return nextMap;
-    });
-  }
-
-  async function loadClassifierData() {
-    return runStep("classifier-load", async () => {
-      setClassifierError("");
-      const [resultsResponse, evaluationResponse, specificationResponse, mapResponse] = await Promise.allSettled([
-        api("/classifier/results"),
-        api("/classifier/evaluation"),
-        api("/classifier/specification"),
-        api("/context/map"),
-      ]);
-      const messages = [];
-      if (resultsResponse.status === "fulfilled") {
-        const payload = resultsResponse.value || {};
-        setClassifierResults(payload.results || []);
-        setClassifierSummary(payload.summary || {});
-        if (payload.model && specificationResponse.status !== "fulfilled") {
-          setClassifierSpecification(normalizeClassifierSpecificationPayload(payload.model));
-        }
-      } else {
-        messages.push(`Diagnosticos: ${resultsResponse.reason?.message || "no disponibles"}`);
-      }
-      if (evaluationResponse.status === "fulfilled") {
-        setClassifierEvaluation(evaluationResponse.value || {});
-      } else {
-        messages.push(`Evaluacion: ${evaluationResponse.reason?.message || "no disponible"}`);
-      }
-      if (specificationResponse.status === "fulfilled") {
-        setClassifierSpecification(normalizeClassifierSpecificationPayload(specificationResponse.value));
-      } else {
-        messages.push(`Modelo: ${specificationResponse.reason?.message || "no disponible"}`);
-      }
-      if (mapResponse.status === "fulfilled") {
-        setContextMap(mapResponse.value || null);
-      } else {
-        messages.push(`Mapa contextual: ${mapResponse.reason?.message || "no disponible"}`);
-      }
-      setClassifierError(messages.join(" / "));
-      if (
-        resultsResponse.status === "rejected"
-        && evaluationResponse.status === "rejected"
-        && specificationResponse.status === "rejected"
-        && mapResponse.status === "rejected"
-      ) {
-        throw new Error(messages.join(" / "));
-      }
-      return {
-        results: resultsResponse.status === "fulfilled" ? resultsResponse.value : null,
-        evaluation: evaluationResponse.status === "fulfilled" ? evaluationResponse.value : null,
-        specification: specificationResponse.status === "fulfilled" ? specificationResponse.value : null,
-        map: mapResponse.status === "fulfilled" ? mapResponse.value : null,
-      };
     });
   }
 
@@ -733,22 +676,51 @@ function App() {
 
   function applyValidationPipeline(payload) {
     setValidationReplay(payload);
+    setValidationAutoRunning(payload?.status === "running");
     if (!payload?.loaded) {
       return;
     }
-    setHistoricalResults(payload.results || []);
-    setContextResults(payload.contextual_results || []);
+    const incomingStatistical = payload.new_results?.length
+      ? payload.new_results
+      : payload.recent_results?.length
+        ? payload.recent_results
+        : payload.results || [];
+    const incomingContextual = payload.new_contextual_results?.length
+      ? payload.new_contextual_results
+      : payload.recent_contextual_results?.length
+        ? payload.recent_contextual_results
+        : payload.contextual_results || [];
+    if (incomingStatistical.length) {
+      setHistoricalResults((current) => mergeReplayResults(current, incomingStatistical));
+    }
+    if (incomingContextual.length) {
+      setContextResults((current) => mergeReplayResults(current, incomingContextual));
+    }
     setContextSummary(payload.contextual_summary || null);
-    setClassifierResults(payload.classification_results || []);
-    setClassifierSummary(payload.classification_summary || null);
     if (payload.last_batch) {
       setRunSummary({
         elapsed_ms: payload.last_batch.processing_elapsed_ms,
         timings_by_kind_ms: payload.last_batch.timings_by_kind_ms || {},
         cache_hit: false,
         source: "evaluation_replay",
+        suspicion_threshold: payload.suspicion_threshold,
+        suspicion_quiet_seconds: payload.suspicion_quiet_seconds,
+        grouping: payload.pipeline_summary?.grouping || {
+          detected: payload.detection_count,
+          forwarded: payload.contextual_count,
+          suppressed: 0,
+        },
       });
     }
+  }
+
+  async function loadValidationResultPages() {
+    const [statistical, contextual] = await Promise.all([
+      api("/validation/replay/results?kind=statistical&offset=0&limit=500"),
+      api("/validation/replay/results?kind=contextual&offset=0&limit=500"),
+    ]);
+    setHistoricalResults(statistical.items || []);
+    setContextResults(contextual.items || []);
   }
 
   async function uploadValidationHistory(event) {
@@ -757,6 +729,9 @@ function App() {
       return;
     }
     setValidationAutoRunning(false);
+    setHistoricalResults([]);
+    setContextResults([]);
+    setContextSummary(null);
     const completedUpload = await runStep("validation-upload", async () => {
       setValidationUpload({
         status: "uploading",
@@ -807,6 +782,31 @@ function App() {
         body: JSON.stringify({
           batch_size: validationBatchSize,
           suspicion_threshold: suspicionThreshold,
+          suspicion_quiet_seconds: suspicionQuietMinutes * 60,
+        }),
+      });
+      applyValidationPipeline(payload);
+      return payload;
+    });
+  }
+
+  async function toggleValidationReplay() {
+    if (validationAutoRunning || validationReplay?.status === "running") {
+      setValidationAutoRunning(false);
+      return runStep("validation-pause", async () => {
+        const payload = await api("/validation/replay/pause", { method: "POST" });
+        applyValidationPipeline(payload);
+        await loadValidationResultPages();
+        return payload;
+      });
+    }
+    return runStep("validation-start", async () => {
+      const payload = await api("/validation/replay/start", {
+        method: "POST",
+        body: JSON.stringify({
+          batch_size: validationBatchSize,
+          suspicion_threshold: suspicionThreshold,
+          suspicion_quiet_seconds: suspicionQuietMinutes * 60,
         }),
       });
       applyValidationPipeline(payload);
@@ -818,6 +818,9 @@ function App() {
     setValidationAutoRunning(false);
     return runStep("validation-reset", async () => {
       const payload = await api("/validation/replay/reset", { method: "POST" });
+      setHistoricalResults([]);
+      setContextResults([]);
+      setContextSummary(null);
       applyValidationPipeline(payload);
       return payload;
     });
@@ -831,7 +834,7 @@ function App() {
           <h1>Filtro estadistico-temporal para entidades continuas y de estado</h1>
           <p>
             Flujo actual: cargar un conjunto de datos reales, respetar su orden temporal y revisar
-            las sospechas detectadas por los tres filtros con sus ecuaciones.
+            las decisiones de los filtros estadístico y contextual y el diagnóstico de patrones de falla.
           </p>
         </div>
       </header>
@@ -843,7 +846,7 @@ function App() {
         </section>
       )}
 
-      <nav className="module-tabs" aria-label="Filtros del artefacto">
+      <nav className="module-tabs" aria-label="Módulos del artefacto">
         <ModuleTab
           active={activeModule === "estadistico"}
           icon={<BarChart3 size={17} />}
@@ -859,8 +862,14 @@ function App() {
         <ModuleTab
           active={activeModule === "clasificador"}
           icon={<FlaskConical size={17} />}
-          label="Clasificador"
+          label="Clasificador diagnóstico"
           onClick={() => setActiveModule("clasificador")}
+        />
+        <ModuleTab
+          active={activeModule === "revision"}
+          icon={<Eye size={17} />}
+          label="Revisión y etiquetado"
+          onClick={() => setActiveModule("revision")}
         />
       </nav>
 
@@ -870,8 +879,23 @@ function App() {
             <Metric icon={<Database />} label="Datos historicos" value={formatCount(historyStatus?.rows)} detail={formatHistoryRange(historyStatus)} />
             <Metric icon={<Activity />} label="Entidades historico" value={formatCount(historyStatus?.entity_count || entities.length)} detail={`${continuousEntities.length} continuas / ${binaryEntities.length} binarias`} />
             <Metric icon={<Database />} label="Base normalidad" value={formatCount(historyStatus?.normality_history?.rows)} detail={normalityDetail(historyStatus?.normality_history)} />
-            <Metric icon={<BarChart3 />} label="Sospechas estadisticas" value={suspiciousCount} detail={`rojo score >= ${RED_SUSPICION_SCORE.toFixed(2)}`} />
+            <Metric icon={<BarChart3 />} label="Sospechas estadisticas" value={suspiciousCount} detail={`score >= ${visibleSuspicionThreshold.toFixed(2)} (${formatSuspicionPercent(visibleSuspicionThreshold)})`} />
           </section>
+
+          <SuspicionThresholdControl
+            value={suspicionThreshold}
+            analyzedValue={Number.isFinite(analyzedSuspicionThreshold) ? analyzedSuspicionThreshold : null}
+            busy={Boolean(busy)}
+            replay={validationReplay}
+            onChange={updateSuspicionThreshold}
+          />
+          <EpisodeGroupingControl
+            minutes={suspicionQuietMinutes}
+            onChange={setSuspicionQuietMinutes}
+            busy={Boolean(busy)}
+            summary={statisticalSummary}
+            replay={validationReplay}
+          />
 
           <section className="workspace-grid lower single">
             <Panel title="Conjunto de datos real">
@@ -882,18 +906,6 @@ function App() {
                 <SummaryRow label="Filas normalidad" value={formatCount(historyStatus?.normality_history?.rows)} />
                 <SummaryRow label="Entidades" value={formatCount(historyStatus?.entity_count || entities.length)} />
                 <SummaryRow label="Rango" value={formatHistoryRange(historyStatus)} />
-              </div>
-              <div className="control-grid">
-                <label>
-                  Umbral de sospecha: {Math.round(suspicionThreshold * 100)}%
-                  <input
-                    type="range"
-                    min="1"
-                    max="99"
-                    value={Math.round(suspicionThreshold * 100)}
-                    onChange={(event) => setSuspicionThreshold(Number(event.target.value) / 100)}
-                  />
-                </label>
               </div>
               <div className="button-row">
                 <StepButton id="real-history" busy={busy} onClick={loadRealHistory} icon={<Database size={17} />} label="Cargar historico real" />
@@ -941,7 +953,7 @@ function App() {
             onUpload={uploadValidationHistory}
             onAdvance={advanceValidationReplay}
             onReset={resetValidationReplay}
-            onToggleAuto={() => setValidationAutoRunning((current) => !current)}
+            onToggleAuto={toggleValidationReplay}
             onBatchSize={setValidationBatchSize}
             onOpenModule={setActiveModule}
           />
@@ -972,6 +984,7 @@ function App() {
                   key={timeline.entity_id}
                   timeline={timeline}
                   results={allAnalyzedResults}
+                  suspicionThreshold={visibleSuspicionThreshold}
                   onResultClick={setSelectedResult}
                 />
               ))}
@@ -991,8 +1004,9 @@ function App() {
                   value={runSummary ? `${runSummary.multistate_eligibility?.eligible_entities || 0} / ${runSummary.multistate_eligibility?.entities || 0}` : "-"}
                 />
                 <SummaryRow label="Cache analisis" value={runSummary ? (runSummary.cache_hit ? "reutilizado" : "nuevo") : "-"} />
-                <SummaryRow label="Paso a contextual" value={allAnalyzedResults.filter(isRedSuspicion).length} />
-                <SummaryRow label="Resultados visibles" value={`${formatCount(displayResults.length)} / ${formatCount(allAnalyzedResults.length)}`} />
+                <SummaryRow label="Enviadas a contextual" value={formatCount(statisticalSummary.forwarded)} />
+                <SummaryRow label="Repeticiones agrupadas" value={formatCount(statisticalSummary.suppressed)} />
+                <SummaryRow label="Resultados visibles / total" value={`${formatCount(displayResults.length)} / ${formatCount(statisticalSummary.detected)}`} />
                 <button className="secondary-action inline" onClick={() => downloadResultsCsv(displayResults)} disabled={!displayResults.length}>
                   <Download size={17} />
                   Descargar tabla en CSV
@@ -1018,17 +1032,10 @@ function App() {
           onReload={loadContextualData}
           onRebuild={rebuildContextMap}
         />
+      ) : activeModule === "revision" ? (
+        <ReviewWorkspace apiBaseUrl={API_BASE_URL} />
       ) : (
-        <ClassifierWorkspace
-          results={classifierResults}
-          summary={classifierSummary}
-          evaluation={classifierEvaluation}
-          specification={classifierSpecification}
-          mapData={contextMap}
-          busy={busy}
-          error={classifierError}
-          onReload={loadClassifierData}
-        />
+        <DiagnosticWorkspace apiBaseUrl={API_BASE_URL} />
       )}
       {selectedResult && (
         <CalculationModal
@@ -1068,15 +1075,106 @@ function ModuleTab({ active, icon, label, onClick }) {
   );
 }
 
-function ProcessWindow({ title, description }) {
+function EpisodeGroupingControl({ minutes, onChange, busy, summary, replay }) {
+  const started = Number(replay?.processed_rows || 0) > 0;
+  const activeMinutes = Number(replay?.suspicion_quiet_seconds || 0) / 60;
   return (
-    <section className="process-window" aria-label={title}>
-      <div className="process-window-inner">
-        <span className="eyebrow">Modulo reservado</span>
-        <h2>{title}</h2>
-        <strong>en proceso</strong>
-        <p>{description}</p>
+    <section className="episode-grouping-panel" aria-labelledby="episode-grouping-title">
+      <div>
+        <span className="eyebrow">Salida del filtro estadistico</span>
+        <h2 id="episode-grouping-title">Agrupar sospechas repetidas</h2>
+        <p>La primera sospecha de cada entidad y patron se envia al filtro contextual.
+          Las repeticiones actualizan su episodio. Se abre otro tras el lapso elegido sin nuevas sospechas del mismo patron.</p>
       </div>
+      <label>
+        Tiempo sin repeticion para abrir otro episodio
+        <select value={minutes} onChange={(event) => onChange(Number(event.target.value))} disabled={busy}>
+          <option value="0">Desactivado · enviar todas</option>
+          <option value="5">5 minutos</option>
+          <option value="15">15 minutos</option>
+          <option value="30">30 minutos</option>
+          <option value="60">1 hora</option>
+          <option value="120">2 horas</option>
+          <option value="1440">24 horas</option>
+        </select>
+      </label>
+      <div className="summary-strip">
+        <SummaryRow label="Sospechas detectadas" value={formatCount(summary.detected)} />
+        <SummaryRow label="Enviadas a F2" value={formatCount(summary.forwarded)} />
+        <SummaryRow label="Repeticiones agrupadas" value={formatCount(summary.suppressed)} />
+      </div>
+      <p className="episode-grouping-note">F1 sigue evaluando todas las lecturas. Otro patron abre un episodio distinto.
+        El tiempo se mide con las fechas de los datos; pausar la reproduccion no cierra episodios.
+        Esta agrupacion se aplica despues de la supresion breve que F1 ya realiza.
+        {started ? ` Esta ejecucion conserva ${activeMinutes ? `${activeMinutes} minutos` : "la agrupacion desactivada"}; reinicia para aplicar otro valor.`
+          : " El ajuste se aplica al analizar el historico o iniciar una nueva evaluacion."}</p>
+    </section>
+  );
+}
+
+function SuspicionThresholdControl({ value, analyzedValue, busy, replay, onChange }) {
+  const percent = Math.round(value * 1000) / 10;
+  const replayStarted = Number(replay?.processed_rows || 0) > 0;
+  const replayThreshold = Number(replay?.suspicion_threshold);
+  const activeReplayThreshold = Number.isFinite(replayThreshold)
+    ? formatSuspicionPercent(replayThreshold)
+    : formatSuspicionPercent(value);
+  const pendingAnalysis = analyzedValue !== null && analyzedValue !== value;
+
+  return (
+    <section className="suspicion-threshold-panel" aria-labelledby="suspicion-threshold-title">
+      <div className="suspicion-threshold-copy">
+        <span className="eyebrow">Filtro 1 · estadistico-temporal</span>
+        <h2 id="suspicion-threshold-title">Umbral de sospecha</h2>
+        <p>
+          Una lectura se considera sospechosa cuando su score alcanza este valor.
+          Un umbral menor detecta más casos; uno mayor exige más evidencia.
+        </p>
+      </div>
+      <div className="suspicion-threshold-inputs">
+        <output aria-live="polite">{formatSuspicionPercent(value)}</output>
+        <label className="suspicion-range-label">
+          <span className="sr-only">Ajustar umbral de sospecha</span>
+          <input
+            type="range"
+            min="1"
+            max="99"
+            step="0.1"
+            value={percent}
+            onChange={(event) => onChange(event.target.value)}
+            disabled={busy}
+          />
+          <small><span>1 % · sensible</span><span>99 % · estricto</span></small>
+        </label>
+        <label className="suspicion-number-label">
+          <span>Valor (%)</span>
+          <input
+            type="number"
+            min="1"
+            max="99"
+            step="0.1"
+            inputMode="decimal"
+            value={percent}
+            onChange={(event) => onChange(event.target.value)}
+            disabled={busy}
+          />
+        </label>
+        <button
+          type="button"
+          className="secondary-action inline"
+          onClick={() => onChange(DEFAULT_SUSPICION_THRESHOLD * 100)}
+          disabled={busy || value === DEFAULT_SUSPICION_THRESHOLD}
+        >
+          Restaurar 60 %
+        </button>
+      </div>
+      <p className="suspicion-threshold-note">
+        {pendingAnalysis
+          ? `Los resultados visibles se calcularon con ${formatSuspicionPercent(analyzedValue)}. Pulsa “Analizar histórico” para aplicar ${formatSuspicionPercent(value)}.`
+          : "Se usará al analizar el histórico y al iniciar una nueva evaluación."} {replayStarted
+          ? `La evaluación en curso conserva ${activeReplayThreshold}; reiníciala para aplicar este valor desde el primer evento.`
+          : "El valor se envía al backend y forma parte de la identidad de la caché del análisis."}
+      </p>
     </section>
   );
 }
@@ -1102,6 +1200,7 @@ function FutureEvaluationControl({
   const uploadProgress = Math.min(100, Math.max(0, Number(upload?.progress || 0)));
   const lastBatch = replay?.last_batch || null;
   const pipeline = replay?.pipeline_summary || {};
+  const activeThreshold = Number(replay?.suspicion_threshold);
 
   return (
     <section className="workspace-grid lower single future-evaluation-control">
@@ -1112,7 +1211,8 @@ function FutureEvaluationControl({
             <span className="eyebrow">Continuacion causal del historico cargado</span>
             <p>
               Sube los eventos posteriores al historico. Al avanzar, las sospechas pasan por los
-              filtros Estadistico, Contextual y Clasificador que ya existen en el artefacto.
+              filtros Estadistico y Contextual. Los ambientales se cierran con alerta informativa;
+              el resto se evalúa en el clasificador diagnóstico.
             </p>
           </div>
           <span className="validation-replay-badge">
@@ -1210,12 +1310,16 @@ function FutureEvaluationControl({
               <button type="button" onClick={() => onOpenModule("clasificador")}>
                 <span>3 · Clasificador</span>
                 <strong>{formatCount(pipeline.classifier || 0)}</strong>
-                <small>diagnosticos</small>
+                <small>evaluados por F3</small>
               </button>
             </div>
             <p className="validation-results-note">
-              Los números abren las vistas existentes. No se crea una tabla paralela para Evaluacion.
-              Umbral estadistico actual: {Math.round(suspicionThreshold * 100)}%.
+              {formatCount(pipeline.environmental || 0)} anomalías ambientales cerradas en Contextual.
+              {pipeline.grouping && <> {formatCount(pipeline.grouping.suppressed)} repeticiones agrupadas; {formatCount(pipeline.grouping.forwarded)} sospechas enviadas a F2.</>}
+              {formatCount(pipeline.pending_classification || 0)} sospechas pendientes de diagnóstico.
+              Umbral estadistico de esta reproducción: {formatSuspicionPercent(
+                Number.isFinite(activeThreshold) ? activeThreshold : suspicionThreshold,
+              )}.
             </p>
           </>
         )}
@@ -1237,6 +1341,12 @@ function replayStatusText(status) {
   }
   if (status === "completed") {
     return "reproduccion completada";
+  }
+  if (status === "paused") {
+    return "reproduccion pausada";
+  }
+  if (status === "failed") {
+    return "reproduccion con error";
   }
   return status || "sin archivo";
 }
@@ -1263,7 +1373,8 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
     summary?.coverage,
     nodes.length ? coveredEntities / nodes.length : null,
   );
-  const outcomeCounts = contextOutcomeCounts(results);
+  const outcomeCounts = contextOutcomeCounts(results, summary);
+  const routingCounts = contextRoutingCounts(results, summary);
   const isLoading = busy === "context-load";
   const isRebuilding = busy === "context-rebuild";
 
@@ -1338,6 +1449,26 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
         />
       </section>
 
+      <Panel title="Salida del filtro contextual">
+        <div className="context-routing-summary" aria-label="Decisiones de la compuerta contextual">
+          <div className="context-outcome-card respaldado">
+            <span>Anomalias ambientales</span>
+            <strong>{formatCount(routingCounts.environmental)}</strong>
+            <small>Alerta informativa · terminan en F2</small>
+          </div>
+          <div className="context-outcome-card no_explicado">
+            <span>Pendientes de clasificacion</span>
+            <strong>{formatCount(routingCounts.pending)}</strong>
+            <small>Futuro filtro 3 · sin ejecutar</small>
+          </div>
+        </div>
+        <p className="context-method-note">
+          Las alertas ambientales quedan registradas aqui, sin enviar estos datos al clasificador.
+          No se envian notificaciones a Home Assistant. Los casos ambiguos conservan su evidencia
+          y quedan pendientes; aun no se ha elegido el modelo de la tercera etapa.
+        </p>
+      </Panel>
+
       <section className="context-main-grid">
         <Panel title="Mapa de covarianza y dependencias">
           <div className="context-panel-intro">
@@ -1397,15 +1528,15 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
 
       <Panel title="Resultados del filtro contextual">
         <div className="context-results-summary" aria-label="Resumen de resultados contextuales">
-          {["respaldado", "contradicho", "no_explicado", "cobertura_insuficiente"].map((outcome) => (
+          {["respaldado", "contradicho", "no_explicado", "cobertura_insuficiente", "sin_relaciones"].map((outcome) => (
             <div className={`context-outcome-card ${outcome}`} key={outcome}>
               <span>{contextOutcomeLabel(outcome)}</span>
               <strong>{formatCount(outcomeCounts[outcome])}</strong>
             </div>
           ))}
           <div className="context-outcome-card common-cause">
-            <span>Causa comun posible</span>
-            <strong>{formatCount(results.filter((result) => contextCommonCause(result).possible).length)}</strong>
+            <span>Coincidencia contextual</span>
+            <strong>{formatCount(summary?.contextual_coincidences ?? results.filter((result) => contextCommonCause(result).coincidence).length)}</strong>
           </div>
         </div>
         <ContextResultsTable
@@ -1594,8 +1725,11 @@ function ContextResultsTable({ results, mapStale, onResultClick }) {
             </span>
             <TimeStack value={result.timestamp} />
             <span role="cell">{formatNumber(contextStatScore(result))}</span>
-            <span role="cell">{formatNumber(contextCoherenceScore(result))}</span>
-            <span role="cell"><ContextStatusBadge value={outcome} /></span>
+            <span role="cell">{contextCoherenceLabel(result)}</span>
+            <span role="cell">
+              <ContextStatusBadge value={outcome} />
+              <small>{contextRoutingLabel(result)}</small>
+            </span>
             <span role="cell">
               {coverage.ratio === null ? "-" : formatContextPercent(coverage.ratio)}
               <small>{coverage.detail}</small>
@@ -1705,16 +1839,26 @@ function ContextResultModal({ result, fallbackMapStale, onClose }) {
           <div>
             <span>Validacion contextual espacio-temporal</span>
             <h2>{result.entity_id || result.target_entity_id || "-"}</h2>
-            <small>{shortDate(result.timestamp)} · mapa {mapQuality.version || result.map_version || "-"}</small>
+            <small>{preciseContextTimestamp(result.timestamp)} · mapa {mapQuality.version || result.map_version || "-"}</small>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Cerrar detalle">
             <X size={18} />
           </button>
         </header>
 
+        <article className="modal-block">
+          <h3>{contextRoutingLabel(result)}</h3>
+          <p>{contextRoutingReasonLabel(result)}</p>
+          <p className="context-method-note">
+            {isEnvironmentalResult(result)
+              ? "Alerta informativa registrada. Evento cerrado por el filtro contextual; no llega al clasificador."
+              : "La sospecha continúa al clasificador diagnóstico, que propone un patrón compatible o se abstiene si la evidencia es insuficiente."}
+          </p>
+        </article>
+
         <div className="modal-score-grid">
           <SummaryRow label="Score estadistico" value={formatNumber(contextStatScore(result))} />
-          <SummaryRow label="Coherencia contextual" value={formatNumber(contextCoherenceScore(result))} />
+          <SummaryRow label="Coherencia contextual" value={contextCoherenceLabel(result)} />
           <SummaryRow label="Resultado" value={contextOutcomeLabel(outcome)} />
           <SummaryRow label="Efecto en sospecha" value={result.suspicion_effect || result.effect_on_suspicion || "-"} />
           <SummaryRow label="Cobertura" value={coverage.ratio === null ? "-" : formatContextPercent(coverage.ratio)} />
@@ -1727,13 +1871,15 @@ function ContextResultModal({ result, fallbackMapStale, onClose }) {
             <KeyValueGrid rows={[
               { label: "Relaciones elegibles", value: formatCount(coverage.eligible) },
               { label: "Relaciones observadas", value: formatCount(coverage.observed) },
+              { label: "Ultimos valores reutilizados", value: formatCount(result.coverage?.carried_neighbors ?? 0) },
               { label: "Proporcion", value: coverage.ratio === null ? "-" : formatContextPercent(coverage.ratio) },
               { label: "Estado", value: coverage.status || (outcome === "cobertura_insuficiente" ? "insuficiente" : "suficiente") },
               { label: "Sin evidencia", value: formatCount(unknowns.length) },
             ]} />
             <p className="context-method-note">
               Falta de cobertura no se interpreta como contradiccion. Una contradiccion exige evidencia observable
-              opuesta al signo, estado o secuencia historicamente esperada.
+              incompatible con el signo, estado, secuencia o magnitud historicamente esperada.
+              Sin evidencia, la coherencia no es evaluable: no representa un 50 % de respaldo.
             </p>
           </article>
           <article className="modal-block">
@@ -1741,9 +1887,11 @@ function ContextResultModal({ result, fallbackMapStale, onClose }) {
             <ContextStatusBadge value={commonCause.key} label={commonCause.label} />
             <KeyValueGrid rows={[
               { label: "Identificable", value: commonCause.identifiable ? "si" : "no" },
-              { label: "Puntaje", value: formatContextValue(commonCause.score) },
+              { label: "Coincidencia contextual", value: commonCause.coincidence ? "Detectada; no implica causa comun" : "No detectada" },
+              { label: "Ventana pasada", value: formatSeconds(commonCause.windowSeconds) },
+              { label: "Entidades relacionadas observadas", value: commonCause.entities.join(", ") || "-" },
               { label: "Evidencia independiente", value: commonCause.independentEvidence ? "disponible" : "no disponible" },
-              { label: "Dominio", value: commonCause.domain || "-" },
+              { label: "Dominio identificado", value: commonCause.domain || "Ninguno" },
               { label: "Detalle", value: commonCause.detail || "El historico correlacional no permite atribuir una causa comun por si solo." },
             ]} />
           </article>
@@ -1766,7 +1914,24 @@ function ContextResultModal({ result, fallbackMapStale, onClose }) {
                 const status = contextEvidenceStatus(item);
                 return (
                   <div className="context-evidence-row" key={`${contextEvidenceEntity(item)}-${index}`}>
-                    <span>{contextEvidenceEntity(item)}</span>
+                    <span>
+                      {contextEvidenceEntity(item)}
+                      {item.observation_method && (
+                        <small className="context-observation-detail">
+                          {contextObservationLabel(item)}
+                          {item.observed_timestamp && <><br />Lectura: {preciseContextTimestamp(item.observed_timestamp)}</>}
+                          <br />Referencia: {preciseContextTimestamp(item.reference_timestamp)}
+                          <br />Antiguedad: {formatSeconds(item.observation_age_seconds)} · limite: {formatSeconds(item.max_age_seconds)}
+                          <br />Ventana de relacion: {formatSeconds(item.window_seconds)}
+                          {item.observed_value != null && <><br />Valor utilizado: {formatContextValue(item.observed_value)}</>}
+                          {item.magnitude_check?.expected_value != null && <>
+                            <br />Rango esperado: {formatContextValue(item.magnitude_check.lower)} a {formatContextValue(item.magnitude_check.upper)}
+                            <br />Magnitud: {item.magnitude_check.status === "compatible" ? "compatible" : "incompatible"}
+                            {item.magnitude_check.extrapolated && <> · extrapolacion fuera del rango de ajuste</>}
+                          </>}
+                        </small>
+                      )}
+                    </span>
                     <span>{item.relation_type || item.relation_family || item.metric || item.expected_sign || "-"}</span>
                     <span>{formatContextValue(item.weight ?? item.association)}</span>
                     <span>{formatSeconds(item.lag_seconds ?? item.lag)}</span>
@@ -1879,7 +2044,10 @@ function contextConfigRows(config = {}) {
   const definitions = [
     [["k", "top_k"], "Relaciones maximas (k)"],
     [["window_seconds", "window_size_seconds"], "Ventana temporal"],
-    [["lag_candidates_seconds", "lag_candidates"], "Desfases evaluados"],
+    [["lag_candidates_seconds", "lag_candidates"], "Desfases en ventana base"],
+    [["lag_candidates_by_window"], "Desfases por ventana (segundos)"],
+    [["window_candidates_seconds"], "Ventanas candidatas (segundos)"],
+    [["common_cause_window_seconds"], "Ventana de coincidencia"],
     [["max_lag_seconds"], "Desfase maximo"],
     [["association_threshold", "min_association", "association_min"], "Asociacion minima"],
     [["min_observations", "minimum_observations"], "Observaciones minimas"],
@@ -1888,6 +2056,8 @@ function contextConfigRows(config = {}) {
     [["min_stable_slices"], "Subventanas estables minimas"],
     [["min_pair_coverage", "coverage_threshold", "min_coverage"], "Cobertura historica minima"],
     [["runtime_coverage_threshold"], "Cobertura minima en ejecucion"],
+    [["continuous_max_age_seconds"], "Antiguedad maxima continua"],
+    [["continuous_max_age_seconds_by_entity"], "Antiguedad por sensor (segundos)"],
     [["max_map_age_days"], "Vigencia maxima (dias)"],
     [["max_age_seconds", "stale_after_seconds"], "Vigencia maxima"],
     [["acceptance_rule"], "Regla de aceptacion"],
@@ -2043,6 +2213,7 @@ function contextOutcome(result = {}) {
     || result.status
     || "no_explicado";
   const key = contextClassKey(raw);
+  if (["no_learned_relations", "sin_relaciones"].includes(key)) return "sin_relaciones";
   if (["respaldado", "supported", "backed", "coherent"].includes(key)) {
     return "respaldado";
   }
@@ -2062,6 +2233,7 @@ function contextOutcomeLabel(value) {
     contradicho: "Contradicho",
     no_explicado: "No explicado",
     cobertura_insuficiente: "Cobertura insuficiente",
+    sin_relaciones: "Sin relaciones aprendidas",
     supported: "Respaldado",
     contradicted: "Contradicho",
     possible: "Posible",
@@ -2088,16 +2260,23 @@ function contextClassKey(value) {
     .replace(/^_|_$/g, "");
 }
 
-function contextOutcomeCounts(results = []) {
+function contextOutcomeCounts(results = [], summary = {}) {
   const counts = {
     respaldado: 0,
     contradicho: 0,
     no_explicado: 0,
     cobertura_insuficiente: 0,
+    sin_relaciones: 0,
   };
   results.forEach((result) => {
     counts[contextOutcome(result)] += 1;
   });
+  if (summary?.by_outcome) {
+    Object.keys(counts).forEach((key) => { counts[key] = 0; });
+    Object.entries(summary.by_outcome).forEach(([outcome, count]) => {
+      counts[contextOutcome({ context_outcome: outcome })] += Number(count) || 0;
+    });
+  }
   return counts;
 }
 
@@ -2136,60 +2315,6 @@ function contextCoverage(result = {}) {
   };
 }
 
-function contextCommonCause(result = {}) {
-  const raw = result.common_cause;
-  const object = raw && typeof raw === "object" ? raw : {};
-  const explicitCandidate = object.candidate ?? object.possible ?? object.detected ?? result.common_cause_possible;
-  const status = contextClassKey(
-    object.status
-    || object.result
-    || (typeof raw === "string" ? raw : "")
-    || (contextBoolean(explicitCandidate) ? "possible" : "")
-    || (result.common_cause_identifiable === false ? "unidentifiable" : "unknown"),
-  );
-  const possible = ["possible", "probable", "detected", "common_cause_possible", "unidentifiable_without_independent_evidence"].includes(status)
-    || contextBoolean(explicitCandidate);
-  const independentEvidence = contextBoolean(
-    object.independent_signal_present
-    ?? object.independent_evidence
-    ?? object.independent_evidence_available
-    ?? result.independent_signal_present,
-  );
-  const identifiable = contextBoolean(object.identifiable ?? result.common_cause_identifiable)
-    || (possible && independentEvidence);
-  const explicitlyNotIndicated = explicitCandidate !== undefined
-    && explicitCandidate !== null
-    && !contextBoolean(explicitCandidate);
-  return {
-    key: possible && !identifiable
-      ? "possible_unidentifiable"
-      : possible
-        ? "possible"
-        : identifiable
-          ? "identifiable"
-          : explicitlyNotIndicated
-            ? "not_indicated"
-            : "unknown",
-    label: possible && !identifiable
-      ? "Posible · no identificable"
-      : possible
-        ? "Posible"
-        : identifiable
-          ? "Identificable"
-          : explicitlyNotIndicated
-            ? "No indicada"
-            : "No evaluada",
-    possible,
-    identifiable,
-    score: object.score ?? result.common_cause_score,
-    independentEvidence,
-    domain: object.domain
-      || object.failure_domain
-      || (object.independent_domains_required ? formatContextValue(object.independent_domains_required) : null)
-      || result.common_failure_domain,
-    detail: object.detail || object.explanation || object.interpretation || result.common_cause_explanation,
-  };
-}
 
 function contextResultMapIsStale(result, fallback) {
   const value = result?.map_quality?.stale
@@ -2200,10 +2325,6 @@ function contextResultMapIsStale(result, fallback) {
 
 function contextStatScore(result = {}) {
   return contextNumber(result.stat_score, result.statistical_score, result.suspicion_score);
-}
-
-function contextCoherenceScore(result = {}) {
-  return contextNumber(result.coherence_score, result.contextual_score, result.context_score, result.score);
 }
 
 function contextResultEvidence(result = {}) {
@@ -2267,1776 +2388,6 @@ function formatContextValue(value) {
     return Object.entries(value).map(([key, item]) => `${key}: ${formatContextValue(item)}`).join(" · ");
   }
   return String(value);
-}
-
-function ClassifierWorkspace({ results, summary, evaluation, specification, mapData, busy, error, onReload }) {
-  const [activeView, setActiveView] = useState("diagnosticos");
-  const modelVersion = classifierModelVersion(specification, summary);
-  const modelType = specification?.model_type || specification?.type || summary?.model_type || "-";
-  const specificationStatus = classifierSpecificationStatus(specification);
-  const mapAvailable = contextMapHasData(mapData) || Boolean(summary?.map_version);
-  const mapStale = summary?.map_stale !== undefined && summary?.map_stale !== null
-    ? contextBoolean(summary.map_stale)
-    : contextMapHasData(mapData)
-      ? contextMapIsStale(mapData)
-      : null;
-  const mapVersion = mapData?.map_version || summary?.map_version || "-";
-  const isLoading = busy === "classifier-load";
-  const mapStatus = !mapAvailable ? "no disponible" : mapStale ? "obsoleto" : "vigente";
-
-  return (
-    <div className="classifier-workspace">
-      <section className={`classifier-readiness-banner ${specificationStatus.key} ${mapStale ? "map-stale" : ""} ${!mapAvailable ? "map-missing" : ""}`}>
-        <div className="classifier-readiness-icon">
-          {specificationStatus.key === "ready" && mapStale === false
-            ? <FlaskConical size={22} />
-            : <AlertTriangle size={22} />}
-        </div>
-        <div className="classifier-readiness-copy">
-          <span className="eyebrow">Tercer filtro · decision diagnostica</span>
-          <h2>{specificationStatus.label}</h2>
-          <p>
-            Modelo {modelVersion} ({modelType}). Mapa contextual {mapVersion}: {mapStatus}.
-            La confianza expresa el criterio informado por el modelo; no se presenta como probabilidad si no esta calibrada.
-          </p>
-          {error && <small className="classifier-inline-error">{error}</small>}
-        </div>
-        <button type="button" className="secondary-action inline" onClick={onReload} disabled={Boolean(busy)}>
-          {isLoading ? <Loader2 className="spin" size={17} /> : <Eye size={17} />}
-          Actualizar clasificador
-        </button>
-      </section>
-
-      <nav className="classifier-subtabs" aria-label="Vistas del clasificador">
-        {[
-          ["diagnosticos", "Diagnosticos"],
-          ["evaluacion", "Evaluacion E2E"],
-          ["modelo", "Modelo y umbrales"],
-        ].map(([id, label]) => (
-          <button
-            type="button"
-            className={activeView === id ? "active" : ""}
-            aria-pressed={activeView === id}
-            onClick={() => setActiveView(id)}
-            key={id}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
-
-      {activeView === "diagnosticos" && (
-        <ClassifierDiagnosticsView
-          results={results}
-          summary={summary}
-          fallbackMapStale={mapStale}
-        />
-      )}
-      {activeView === "evaluacion" && (
-        <ClassifierEvaluationView evaluation={evaluation} />
-      )}
-      {activeView === "modelo" && (
-        <ClassifierSpecificationView specification={specification} />
-      )}
-    </div>
-  );
-}
-
-function ClassifierDiagnosticsView({ results = [], summary = {}, fallbackMapStale = false }) {
-  const [classFilter, setClassFilter] = useState("all");
-  const [entityQuery, setEntityQuery] = useState("");
-  const [minimumConfidence, setMinimumConfidence] = useState(0);
-  const [selectedDiagnosis, setSelectedDiagnosis] = useState(null);
-  const counts = classifierClassCounts(results, summary?.by_class);
-  const filteredResults = useMemo(() => {
-    const query = entityQuery.trim().toLowerCase();
-    return (results || []).filter((result) => {
-      const diagnosticClass = classifierResultClass(result);
-      const confidence = classifierConfidence(result);
-      if (classFilter !== "all" && diagnosticClass !== classFilter) {
-        return false;
-      }
-      if (query && !String(result.entity_id || "").toLowerCase().includes(query)) {
-        return false;
-      }
-      if (minimumConfidence > 0 && (confidence === null || normalizedConfidence(confidence) < minimumConfidence)) {
-        return false;
-      }
-      return true;
-    });
-  }, [results, classFilter, entityQuery, minimumConfidence]);
-  const evaluated = contextNumber(summary?.evaluated, summary?.classified, results.length);
-  const lowConfidence = contextNumber(summary?.low_confidence, results.filter(classifierIsLowConfidence).length);
-  const meanConfidence = contextNumber(summary?.confidence_mean, classifierMeanConfidence(results));
-
-  return (
-    <>
-      <section className="metric-grid classifier-metric-grid">
-        <Metric
-          icon={<BarChart3 />}
-          label="Evaluados"
-          value={formatCount(evaluated)}
-          detail="casos que llegaron al clasificador"
-        />
-        <Metric
-          icon={<Activity />}
-          label="Normal"
-          value={formatCount(counts.normal)}
-          detail="candidatos reclasificados"
-        />
-        <Metric
-          icon={<Zap />}
-          label="Anomalia ambiental"
-          value={formatCount(counts.environmental_anomaly)}
-          detail="evento coherente del entorno"
-        />
-        <Metric
-          icon={<AlertTriangle />}
-          label="Posible falla de sensor"
-          value={formatCount(counts.possible_sensor_fault)}
-          detail="requiere revision o alerta"
-        />
-        <Metric
-          icon={<Eye />}
-          label="Indeterminado"
-          value={formatCount(counts.indeterminate)}
-          detail="evidencia insuficiente o conflictiva"
-        />
-        <Metric
-          icon={<FlaskConical />}
-          label="Confianza"
-          value={formatClassifierConfidence(meanConfidence)}
-          detail={`${formatCount(lowConfidence)} bajo umbral`}
-        />
-      </section>
-
-      <Panel title="Diagnosticos del tercer filtro">
-        <div className="classifier-scope-note">
-          <AlertTriangle size={17} />
-          <span>
-            Esta tabla contiene solo casos recibidos por el clasificador. Los casos descartados antes aparecen
-            exclusivamente en Evaluacion E2E como <strong>not_reached</strong>, que no es una clase diagnostica.
-          </span>
-        </div>
-        <div className="classifier-filters">
-          <label>
-            Clase
-            <select value={classFilter} onChange={(event) => setClassFilter(event.target.value)}>
-              <option value="all">Todas</option>
-              <option value="normal">Normal</option>
-              <option value="environmental_anomaly">Anomalia ambiental</option>
-              <option value="possible_sensor_fault">Posible falla de sensor</option>
-              <option value="indeterminate">Indeterminado</option>
-            </select>
-          </label>
-          <label>
-            Buscar entidad
-            <input
-              type="search"
-              value={entityQuery}
-              placeholder="sensor..."
-              onChange={(event) => setEntityQuery(event.target.value)}
-            />
-          </label>
-          <label className="classifier-confidence-filter">
-            Confianza minima: {Math.round(minimumConfidence * 100)}%
-            <input
-              type="range"
-              min="0"
-              max="100"
-              value={Math.round(minimumConfidence * 100)}
-              onChange={(event) => setMinimumConfidence(Number(event.target.value) / 100)}
-            />
-          </label>
-          <button
-            type="button"
-            className="secondary-action inline"
-            onClick={() => {
-              setClassFilter("all");
-              setEntityQuery("");
-              setMinimumConfidence(0);
-            }}
-          >
-            <RotateCcw size={16} />
-            Limpiar
-          </button>
-          <div className="classifier-filter-count">
-            <span>Visibles</span>
-            <strong>{formatCount(filteredResults.length)} / {formatCount(results.length)}</strong>
-          </div>
-        </div>
-        <ClassifierResultsTable
-          results={filteredResults}
-          fallbackMapStale={fallbackMapStale}
-          onResultClick={setSelectedDiagnosis}
-        />
-      </Panel>
-
-      {selectedDiagnosis && (
-        <ClassifierResultModal
-          result={selectedDiagnosis}
-          fallbackMapStale={fallbackMapStale}
-          onClose={() => setSelectedDiagnosis(null)}
-        />
-      )}
-    </>
-  );
-}
-
-function ClassifierResultsTable({ results, fallbackMapStale, onResultClick }) {
-  return (
-    <div className="classifier-results-table" role="table" aria-label="Resultados del clasificador">
-      <div className="classifier-results-head" role="row">
-        <span role="columnheader">Entidad</span>
-        <span role="columnheader">Tiempo</span>
-        <span role="columnheader">Clase</span>
-        <span role="columnheader">Confianza</span>
-        <span role="columnheader">Subtipo</span>
-        <span role="columnheader">S. estadistico</span>
-        <span role="columnheader">Contexto / cobertura</span>
-        <span role="columnheader">Causa comun</span>
-        <span role="columnheader">Mapa</span>
-        <span role="columnheader">Accion</span>
-      </div>
-      {(results || []).map((result, index) => {
-        const confidence = classifierConfidence(result);
-        const coverage = classifierContextCoverage(result);
-        const commonCause = classifierCommonCause(result);
-        const stale = classifierResultMapStale(result, fallbackMapStale);
-        return (
-          <button
-            type="button"
-            role="row"
-            className="classifier-result-row"
-            key={result.diagnosis_id || `${result.entity_id}-${result.timestamp}-${index}`}
-            onClick={() => onResultClick(result)}
-            title="Ver traza completa del diagnostico"
-          >
-            <span role="cell">
-              <strong>{result.entity_id || "-"}</strong>
-              <small>{kindText(result.sensor_kind)}</small>
-            </span>
-            <TimeStack value={result.timestamp} />
-            <span role="cell"><DiagnosticClassBadge value={classifierResultClass(result)} /></span>
-            <span role="cell">
-              {formatClassifierConfidence(confidence)}
-              <small>{classifierConfidenceKindLabel(result.confidence_kind)}</small>
-            </span>
-            <span role="cell">{classifierSubtype(result)}</span>
-            <span role="cell">{formatNumber(classifierStatisticalScore(result))}</span>
-            <span role="cell">
-              {contextOutcomeLabel(classifierContextOutcome(result))}
-              <small>{coverage.ratio === null ? "cobertura -" : `cobertura ${formatContextPercent(coverage.ratio)}`}</small>
-            </span>
-            <span role="cell">
-              <ContextStatusBadge value={commonCause.key} label={commonCause.label} />
-            </span>
-            <span role="cell">
-              <ContextStatusBadge
-                value={stale === null ? "unknown" : stale ? "stale" : "current"}
-                label={stale === null ? "No informado" : stale ? "Obsoleto" : "Vigente"}
-              />
-            </span>
-            <span role="cell">{classifierActionLabel(result.suggested_action)}</span>
-          </button>
-        );
-      })}
-      {!results?.length && <Empty text="No hay diagnosticos que coincidan con los filtros." />}
-    </div>
-  );
-}
-
-function DiagnosticClassBadge({ value }) {
-  const key = classifierClassKey(value);
-  return (
-    <span className={`diagnostic-class-badge ${key}`}>
-      {classifierClassLabel(key)}
-      {key === "not_reached" && <small>perdida del pipeline</small>}
-    </span>
-  );
-}
-
-function ClassifierResultModal({ result, fallbackMapStale, onClose }) {
-  const diagnosticClass = classifierResultClass(result);
-  const confidence = classifierConfidence(result);
-  const pipeline = result.pipeline || {};
-  const statistical = pipeline.statistical || result.statistical || {};
-  const contextual = pipeline.contextual || result.contextual || {};
-  const classifier = pipeline.classifier || result.classifier || {};
-  const coverage = classifierContextCoverage(result);
-  const commonCause = classifierCommonCause(result);
-  const mapQuality = classifierMapQuality(result);
-  const stale = classifierResultMapStale(result, fallbackMapStale);
-  const evidenceRows = classifierEvidenceRows(result);
-  const reasonCodes = contextArray(result.reason_codes, classifier.reason_codes);
-  const limitations = contextArray(result.limitations, classifier.limitations);
-  const groundTruth = result.ground_truth || result.ground_truth_label;
-
-  return (
-    <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section
-        className="calculation-modal classifier-detail-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Detalle del diagnostico final"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header className="modal-header">
-          <div>
-            <span>Traza completa del tercer filtro</span>
-            <h2>{result.entity_id || "-"}</h2>
-            <small>{shortDate(result.timestamp)} · {result.diagnosis_id || result.event_id || "sin id de diagnostico"}</small>
-          </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="Cerrar detalle">
-            <X size={18} />
-          </button>
-        </header>
-
-        <div className="classifier-decision-header">
-          <DiagnosticClassBadge value={diagnosticClass} />
-          <div>
-            <span>Confianza</span>
-            <strong>{formatClassifierConfidence(confidence)}</strong>
-            <small>{classifierConfidenceKindLabel(result.confidence_kind)}</small>
-          </div>
-          <div>
-            <span>Subtipo</span>
-            <strong>{classifierSubtype(result)}</strong>
-          </div>
-          <div>
-            <span>Accion sugerida</span>
-            <strong>{classifierActionLabel(result.suggested_action)}</strong>
-          </div>
-          <div>
-            <span>Base de verdad</span>
-            <strong>{groundTruth ? classifierEvaluationLabel(groundTruth) : "Sin GT"}</strong>
-          </div>
-        </div>
-
-        {diagnosticClass === "not_reached" && (
-          <div className="classifier-not-reached-warning">
-            <AlertTriangle size={18} />
-            <span><strong>not_reached no es una clase.</strong> Este registro representa un caso perdido antes de ejecutar el clasificador.</span>
-          </div>
-        )}
-
-        <article className="modal-block">
-          <h3>Traza del flujo secuencial</h3>
-          <div className="classifier-pipeline-trace">
-            <ClassifierTraceStage
-              step="1"
-              title="Estadistico-temporal"
-              status={classifierStageStatus(statistical)}
-              rows={[
-                { label: "Score", value: formatNumber(statistical.score ?? statistical.suspicion_score) },
-                { label: "Umbral", value: formatNumber(statistical.threshold) },
-                { label: "Paso", value: classifierPassedText(statistical.passed) },
-                { label: "Patron", value: statistical.pattern || statistical.suspected_pattern || "-" },
-                { label: "Indicadores", value: formatContextValue(statistical.indicators || statistical.triggered_indicators) },
-                { label: "Tiempo", value: formatElapsed(statistical.elapsed_ms) },
-              ]}
-            />
-            <ClassifierTraceStage
-              step="2"
-              title="Contextual"
-              status={contextOutcome({ context_outcome: contextual.outcome || contextual.context_outcome })}
-              rows={[
-                { label: "Resultado", value: contextOutcomeLabel(classifierContextOutcome(result)) },
-                { label: "Coherencia", value: formatNumber(classifierContextScore(result)) },
-                { label: "Cobertura", value: coverage.ratio === null ? "-" : formatContextPercent(coverage.ratio) },
-                { label: "Observadas", value: `${formatCount(coverage.observed)} / ${formatCount(coverage.eligible)}` },
-                { label: "Causa comun", value: commonCause.label },
-                { label: "Tiempo", value: formatElapsed(contextual.elapsed_ms) },
-              ]}
-            />
-            <ClassifierTraceStage
-              step="3"
-              title="Clasificador"
-              status={diagnosticClass}
-              rows={[
-                { label: "Modelo", value: classifier.model_version || result.model_version || "-" },
-                { label: "Regla", value: result.decision_rule_id || classifier.decision_rule_id || "-" },
-                { label: "Clase", value: classifierClassLabel(diagnosticClass) },
-                { label: "Confianza", value: formatClassifierConfidence(confidence) },
-                { label: "Subtipo", value: classifierSubtype(result) },
-                { label: "Tiempo", value: formatElapsed(classifier.elapsed_ms) },
-              ]}
-            />
-          </div>
-        </article>
-
-        <div className="modal-columns">
-          <article className="modal-block">
-            <h3>Cobertura y mapa utilizados</h3>
-            <KeyValueGrid rows={[
-              { label: "Relaciones elegibles", value: formatCount(coverage.eligible) },
-              { label: "Relaciones observadas", value: formatCount(coverage.observed) },
-              { label: "Cobertura", value: coverage.ratio === null ? "-" : formatContextPercent(coverage.ratio) },
-              { label: "Version del mapa", value: mapQuality.version || mapQuality.map_version || "-" },
-              { label: "Vigencia al decidir", value: stale === null ? "no informada" : stale ? "obsoleto" : "vigente" },
-              { label: "Motivos", value: contextArray(mapQuality.stale_reasons).join(", ") || "ninguno" },
-            ]} />
-          </article>
-          <article className="modal-block">
-            <h3>Causa comun y limite causal</h3>
-            <ContextStatusBadge value={commonCause.key} label={commonCause.label} />
-            <KeyValueGrid rows={[
-              { label: "Candidata", value: commonCause.possible ? "si" : "no" },
-              { label: "Identificable", value: commonCause.identifiable ? "si" : "no" },
-              { label: "Evidencia independiente", value: commonCause.independentEvidence ? "disponible" : "no disponible" },
-              { label: "Dominio", value: commonCause.domain || "-" },
-              { label: "Interpretacion", value: commonCause.detail || "El historico asociativo no permite atribuir una causa raiz." },
-            ]} />
-          </article>
-        </div>
-
-        <article className="modal-block">
-          <h3>Evidencia y variables usadas</h3>
-          {evidenceRows.length ? (
-            <div className="classifier-evidence-table">
-              <div className="classifier-evidence-head">
-                <span>Variable / evidencia</span>
-                <span>Fuente</span>
-                <span>Valor</span>
-                <span>Aporte</span>
-                <span>Direccion / veredicto</span>
-                <span>Disponibilidad</span>
-              </div>
-              {evidenceRows.map((item, index) => (
-                <div className="classifier-evidence-row" key={`${item.name}-${index}`}>
-                  <span>{item.name}</span>
-                  <span>{item.source}</span>
-                  <span>{formatContextValue(item.value)}</span>
-                  <span>{formatContextValue(item.contribution)}</span>
-                  <span>{item.direction}</span>
-                  <span>{item.available ? "disponible" : "ausente"}</span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <Empty text="El backend no informo variables ni aportes para este diagnostico." />
-          )}
-        </article>
-
-        <div className="modal-columns">
-          <article className="modal-block">
-            <h3>Justificacion</h3>
-            <KeyValueGrid rows={[
-              { label: "Regla", value: result.decision_rule_id || classifier.decision_rule_id || "-" },
-              { label: "Codigos de razon", value: reasonCodes.length ? reasonCodes.join(", ") : "-" },
-              { label: "Explicacion", value: result.explanation || classifier.explanation || "-" },
-            ]} />
-          </article>
-          <article className="modal-block">
-            <h3>Limitaciones aplicadas</h3>
-            {limitations.length ? (
-              <ul className="classifier-limitation-list">
-                {limitations.map((limitation, index) => <li key={`${formatContextValue(limitation)}-${index}`}>{formatContextValue(limitation)}</li>)}
-              </ul>
-            ) : (
-              <Empty text="No se informaron limitaciones para este resultado." />
-            )}
-          </article>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function ClassifierTraceStage({ step, title, status, rows }) {
-  return (
-    <article className={`classifier-trace-stage ${contextClassKey(status)}`}>
-      <header>
-        <span>{step}</span>
-        <div>
-          <strong>{title}</strong>
-          <small>{classifierStageLabel(status)}</small>
-        </div>
-      </header>
-      <KeyValueGrid rows={rows} />
-    </article>
-  );
-}
-
-function ClassifierEvaluationView({ evaluation }) {
-  const payload = evaluation || {};
-  const available = classifierEvaluationAvailable(payload);
-  const warnings = contextArray(payload.warnings);
-  const dataset = payload.dataset || {};
-  const policy = payload.metric_policy || {};
-
-  if (!available) {
-    return (
-      <section className="classifier-evaluation-unavailable" aria-label="Evaluacion extremo a extremo no disponible">
-        <div className="classifier-evaluation-unavailable-icon"><AlertTriangle size={26} /></div>
-        <span className="eyebrow">Fuente actual · mes real</span>
-        <h2>Evaluacion E2E no disponible</h2>
-        <strong>Pendiente: 1 mes disponible de 5 y sin etiquetas reales suficientes</strong>
-        <p>
-          No se calculan matriz de confusion, precision, recall, F1 ni falsos negativos con denominadores
-          incompletos. La evaluacion se habilitara cuando los conjuntos de validacion o prueba incorporen
-          etiquetas reales suficientes.
-        </p>
-        <div className="classifier-validation-facts">
-          <SummaryRow label="Fuente actual" value="Mes real" />
-          <SummaryRow label="Cobertura temporal" value="1 mes de 5" />
-          <SummaryRow label="Etiquetas reales" value="insuficientes" />
-          <SummaryRow label="Metricas E2E" value="no disponibles" />
-        </div>
-        {warnings.length > 0 && (
-          <div className="classifier-evaluation-warnings">
-            <h3>Advertencias informadas</h3>
-            <ul>
-              {warnings.map((warning, index) => (
-                <li key={`${formatContextValue(warning)}-${index}`}>{formatContextValue(warning)}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </section>
-    );
-  }
-
-  const funnelStages = classifierFunnelStages(payload.funnel);
-  const losses = Array.isArray(payload.preclassifier_losses) ? payload.preclassifier_losses : [];
-  const endToEnd = payload.end_to_end || {};
-  const conditional = payload.classifier_conditional || {};
-  const fnBeforeClassifier = classifierPreclassifierFalseNegatives(losses, endToEnd);
-  const labeledCases = contextNumber(dataset.labeled_cases, dataset.total_labeled, funnelStages[0]?.value);
-  const reachedClassifier = classifierFunnelValue(payload.funnel, "reached_classifier");
-  const faultMetrics = classifierClassMetrics(endToEnd, "possible_sensor_fault");
-  const macroF1 = contextNumber(endToEnd.macro_f1, endToEnd.metrics?.macro_f1);
-  const abstentionRate = contextNumber(endToEnd.abstention_rate, endToEnd.metrics?.abstention_rate);
-
-  return (
-    <div className="classifier-evaluation-view">
-      <section className="evaluation-scope-banner">
-        <div>
-          <span className="eyebrow">Metricas del flujo completo</span>
-          <h2>Evaluacion extremo a extremo</h2>
-          <p>
-            Incluye todos los casos reales etiquetados del conjunto evaluable. Los casos que no llegaron al
-            clasificador se conservan como <strong>not_reached</strong>; no se convierten en una clase diagnostica.
-          </p>
-        </div>
-        <ContextStatusBadge value="current" label="GT disponible para esta ejecucion" />
-      </section>
-
-      <section className="metric-grid classifier-metric-grid">
-        <Metric icon={<Database />} label="Casos etiquetados" value={formatOptionalCount(labeledCases)} detail="denominador E2E" />
-        <Metric icon={<Activity />} label="Llegaron al clasificador" value={formatOptionalCount(reachedClassifier)} detail="subconjunto condicional" />
-        <Metric icon={<AlertTriangle />} label="FN antes del clasificador" value={formatOptionalCount(fnBeforeClassifier)} detail="perdidas de gates previos" />
-        <Metric icon={<BarChart3 />} label="Macro F1 E2E" value={formatOptionalMetric(macroF1)} detail="todos los casos etiquetados" />
-        <Metric icon={<Zap />} label="Recall posible falla" value={formatOptionalPercent(faultMetrics?.recall)} detail="incluye not_reached" />
-        <Metric icon={<Eye />} label="Abstencion" value={formatOptionalPercent(abstentionRate)} detail="prediccion indeterminada" />
-      </section>
-
-      <section className="classifier-evaluation-grid">
-        <Panel title="Embudo del pipeline">
-          <ClassifierFunnel stages={funnelStages} />
-        </Panel>
-        <Panel title="Fuente y politica de metricas">
-          <KeyValueGrid rows={[
-            { label: "Fuente actual", value: "Mes real" },
-            { label: "Cobertura temporal", value: dataset.months_available && dataset.months_required ? `${dataset.months_available} de ${dataset.months_required} meses` : "periodo real evaluable" },
-            { label: "Conjunto", value: dataset.id || dataset.dataset_id || "-" },
-            { label: "Particion", value: dataset.split || "-" },
-            { label: "Casos inciertos excluidos", value: formatOptionalCount(contextNumber(dataset.uncertain_excluded)) },
-            { label: "Politica indeterminado", value: formatContextValue(policy.indeterminate_policy) },
-            { label: "Politica gate", value: formatContextValue(policy.gate_rejection_policy || "not_reached") },
-            { label: "Umbrales fijos", value: policy.fixed_thresholds === undefined ? "-" : policy.fixed_thresholds ? "si" : "no" },
-          ]} />
-        </Panel>
-      </section>
-
-      <Panel title="Matriz de confusion del pipeline E2E">
-        <ClassifierConfusionMatrix matrix={payload.confusion_matrix_e2e} />
-      </Panel>
-
-      <Panel title="Falsos negativos descartados antes del clasificador">
-        <ClassifierPreclassifierLossTable losses={losses} />
-        <p className="classifier-method-note">
-          FN E2E(c) = FN antes del clasificador(c) + FN dentro del clasificador(c).
-          El recall E2E usa todos los casos reales etiquetados de la clase como denominador.
-        </p>
-      </Panel>
-
-      <section className="classifier-metric-scope-grid">
-        <ClassifierMetricScopePanel
-          title="Desempeno E2E"
-          scope="Todos los casos etiquetados, incluidos not_reached"
-          metrics={endToEnd}
-          highlight
-        />
-        <ClassifierMetricScopePanel
-          title="Desempeno condicional"
-          scope="Solo casos que recibio el clasificador"
-          metrics={conditional}
-        />
-      </section>
-
-      {warnings.length > 0 && (
-        <section className="classifier-evaluation-warnings">
-          <h3>Advertencias de evaluacion</h3>
-          <ul>
-            {warnings.map((warning, index) => (
-              <li key={`${formatContextValue(warning)}-${index}`}>{formatContextValue(warning)}</li>
-            ))}
-          </ul>
-        </section>
-      )}
-    </div>
-  );
-}
-
-function ClassifierFunnel({ stages }) {
-  if (!stages.length) {
-    return <Empty text="No se informaron conteos por etapa." />;
-  }
-  const base = stages.find((stage) => stage.value !== null)?.value;
-  return (
-    <div className="classifier-funnel">
-      {stages.map((stage, index) => {
-        const ratio = base && stage.value !== null ? stage.value / base : null;
-        return (
-          <React.Fragment key={stage.id}>
-            <article className={`classifier-funnel-stage ${stage.id}`}>
-              <span>{stage.label}</span>
-              <strong>{formatOptionalCount(stage.value)}</strong>
-              <small>{ratio === null ? "proporcion no informada" : formatContextPercent(ratio)}</small>
-            </article>
-            {index < stages.length - 1 && <div className="classifier-funnel-arrow" aria-hidden="true">→</div>}
-          </React.Fragment>
-        );
-      })}
-    </div>
-  );
-}
-
-function ClassifierConfusionMatrix({ matrix }) {
-  const normalized = normalizeClassifierConfusionMatrix(matrix);
-  if (!normalized.truthLabels.length || !normalized.predictedLabels.length || !normalized.values.length) {
-    return <Empty text="La matriz de confusion no esta disponible para esta ejecucion." />;
-  }
-  const maximum = Math.max(
-    ...normalized.values.flatMap((row) => row.map((value) => contextFiniteNumber(value) ?? 0)),
-    1,
-  );
-  return (
-    <>
-      <div className="classifier-confusion-scroll">
-        <table className="classifier-confusion-matrix">
-          <thead>
-            <tr>
-              <th scope="col">Real ↓ / Predicho →</th>
-              {normalized.predictedLabels.map((label) => (
-                <th scope="col" className={classifierClassKey(label)} key={label}>
-                  {classifierEvaluationLabel(label)}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {normalized.truthLabels.map((truth, rowIndex) => (
-              <tr key={truth}>
-                <th scope="row">{classifierEvaluationLabel(truth)}</th>
-                {normalized.predictedLabels.map((predicted, columnIndex) => {
-                  const value = contextFiniteNumber(normalized.values[rowIndex]?.[columnIndex]);
-                  return (
-                    <td
-                      className={classifierClassKey(predicted)}
-                      style={value === null ? undefined : { backgroundColor: classifierConfusionCellColor(truth, predicted, value, maximum) }}
-                      title={`${classifierEvaluationLabel(truth)} → ${classifierEvaluationLabel(predicted)}: ${formatOptionalCount(value)}`}
-                      key={predicted}
-                    >
-                      {formatOptionalCount(value)}
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <p className="classifier-method-note">
-        <strong>not_reached</strong> es una columna de perdida del pipeline: identifica casos reales que no
-        alcanzaron el tercer filtro. <strong>Indeterminado</strong> si es una salida diagnostica de abstencion.
-      </p>
-    </>
-  );
-}
-
-function ClassifierPreclassifierLossTable({ losses }) {
-  if (!losses.length) {
-    return <Empty text="No se informaron perdidas por etapa." />;
-  }
-  return (
-    <div className="classifier-loss-table">
-      <div className="classifier-loss-head">
-        <span>Gate</span>
-        <span>Clase real</span>
-        <span>Soporte antes</span>
-        <span>Descartados</span>
-        <span>FN atribuibles</span>
-        <span>Motivo</span>
-      </div>
-      {losses.map((loss, index) => (
-        <div className="classifier-loss-row" key={`${loss.gate}-${loss.truth_class}-${index}`}>
-          <span>{classifierStageLabel(loss.gate)}</span>
-          <span>{classifierClassLabel(loss.truth_class)}</span>
-          <span>{formatOptionalCount(contextNumber(loss.support_before_gate, loss.support))}</span>
-          <span>{formatOptionalCount(contextNumber(loss.rejected, loss.not_reached))}</span>
-          <span className="danger-value">{formatOptionalCount(contextNumber(loss.false_negatives, loss.fn))}</span>
-          <span>{formatContextValue(loss.reason || loss.reason_code)}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function ClassifierMetricScopePanel({ title, scope, metrics, highlight = false }) {
-  const payload = metrics?.metrics || metrics || {};
-  const byClass = metrics?.by_class || payload.by_class || {};
-  const summaryRows = [
-    ["Accuracy", payload.accuracy],
-    ["Macro F1", payload.macro_f1],
-    ["F1 ponderado", payload.weighted_f1],
-    ["Balanced accuracy", payload.balanced_accuracy],
-    ["Tasa de abstencion", payload.abstention_rate],
-  ].filter(([, value]) => contextFiniteNumber(value) !== null);
-  return (
-    <section className={`panel classifier-metric-scope ${highlight ? "highlight" : ""}`}>
-      <div className="classifier-metric-scope-heading">
-        <div>
-          <h2>{title}</h2>
-          <span>{scope}</span>
-        </div>
-        <ContextStatusBadge value={highlight ? "current" : "neutral"} label={highlight ? "Metrica principal" : "Vista condicional"} />
-      </div>
-      {summaryRows.length ? (
-        <div className="classifier-scope-metrics">
-          {summaryRows.map(([label, value]) => (
-            <SummaryRow
-              label={label}
-              value={label.toLowerCase().includes("tasa") ? formatOptionalPercent(value) : formatOptionalMetric(value)}
-              key={label}
-            />
-          ))}
-        </div>
-      ) : (
-        <Empty text="No se informaron metricas agregadas para este alcance." />
-      )}
-      <ClassifierClassMetricsTable byClass={byClass} conditional={!highlight} />
-    </section>
-  );
-}
-
-function ClassifierClassMetricsTable({ byClass, conditional }) {
-  const entries = Object.entries(byClass || {}).filter(([, value]) => value && typeof value === "object");
-  if (!entries.length) {
-    return null;
-  }
-  return (
-    <div className="classifier-class-metrics">
-      <div className="classifier-class-metrics-head">
-        <span>Clase</span>
-        <span>Soporte</span>
-        <span>TP</span>
-        <span>FP</span>
-        <span>FN</span>
-        {!conditional && <span>FN antes</span>}
-        <span>Precision</span>
-        <span>Recall</span>
-        <span>F1</span>
-      </div>
-      {entries.map(([diagnosticClass, metrics]) => (
-        <div className="classifier-class-metrics-row" key={diagnosticClass}>
-          <span><DiagnosticClassBadge value={diagnosticClass} /></span>
-          <span>{formatOptionalCount(contextNumber(metrics.support_all, metrics.support))}</span>
-          <span>{formatOptionalCount(contextNumber(metrics.tp))}</span>
-          <span>{formatOptionalCount(contextNumber(metrics.fp))}</span>
-          <span>{formatOptionalCount(contextNumber(metrics.fn_e2e, metrics.fn))}</span>
-          {!conditional && <span className="danger-value">{formatOptionalCount(contextNumber(metrics.fn_before_classifier))}</span>}
-          <span>{formatOptionalPercent(metrics.precision)}</span>
-          <span>{formatOptionalPercent(metrics.recall)}</span>
-          <span>{formatOptionalMetric(metrics.f1)}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function ClassifierSpecificationView({ specification }) {
-  const spec = normalizeClassifierSpecificationPayload(specification);
-  const status = classifierSpecificationStatus(spec);
-  const config = spec.config && typeof spec.config === "object" ? spec.config : {};
-  const features = normalizeClassifierFeatures(spec.features);
-  const decisions = normalizeClassifierDecisionTable(spec.decision_table);
-  const protocol = spec.validation_protocol && typeof spec.validation_protocol === "object"
-    ? spec.validation_protocol
-    : {};
-  const hasSpecification = Boolean(
-    spec.model_version
-    || spec.version
-    || spec.model_type
-    || Object.keys(config).length
-    || features.length
-    || decisions.length,
-  );
-
-  if (!hasSpecification) {
-    return (
-      <section className="classifier-specification-empty">
-        <FlaskConical size={28} />
-        <h2>Especificacion no disponible</h2>
-        <p>El backend aun no informa version, variables, reglas ni umbrales del clasificador.</p>
-      </section>
-    );
-  }
-
-  return (
-    <div className="classifier-specification-view">
-      <section className={`classifier-specification-banner ${status.key}`}>
-        <div>
-          <span className="eyebrow">Especificacion versionada</span>
-          <h2>{classifierModelVersion(spec)} · {spec.model_type || spec.type || "tipo no informado"}</h2>
-          <p>{status.label}. La interfaz muestra las reglas del backend y no completa umbrales ausentes.</p>
-        </div>
-        <DiagnosticClassBadge value={status.key === "ready" ? "normal" : "indeterminate"} />
-      </section>
-
-      <section className="classifier-specification-grid">
-        <Panel title="Configuracion del modelo">
-          <KeyValueGrid rows={[
-            { label: "Version", value: classifierModelVersion(spec) },
-            { label: "Tipo", value: spec.model_type || spec.type || "-" },
-            { label: "Estado", value: status.label },
-            { label: "Esquema", value: spec.schema_version || "-" },
-            { label: "Confianza", value: spec.confidence_kind || config.confidence_kind || "-" },
-            ...Object.entries(config).map(([key, value]) => ({ label: key, value: formatContextValue(value) })),
-          ]} />
-        </Panel>
-        <Panel title="Estado de validacion">
-          <div className="classifier-validation-state">
-            <AlertTriangle size={18} />
-            <strong>Pendiente: 1 mes disponible de 5 y sin etiquetas reales suficientes</strong>
-          </div>
-          <KeyValueGrid rows={[
-            { label: "Fuente actual", value: "Mes real" },
-            { label: "Cobertura temporal", value: "1 mes de 5" },
-            { label: "Evaluacion E2E", value: "no disponible" },
-            { label: "Protocolo", value: formatContextValue(protocol.status || status.label) },
-            { label: "Umbrales congelados", value: protocol.fixed_thresholds === undefined ? "-" : protocol.fixed_thresholds ? "si" : "no" },
-          ]} />
-          <p className="classifier-method-note">
-            La validacion cuantitativa se habilitara con etiquetas reales suficientes en los conjuntos de validacion o prueba.
-          </p>
-        </Panel>
-      </section>
-
-      <Panel title="Variables de entrada">
-        <ClassifierFeaturesTable features={features} />
-      </Panel>
-
-      <Panel title="Tabla de decision">
-        <ClassifierDecisionTable decisions={decisions} />
-      </Panel>
-    </div>
-  );
-}
-
-function ClassifierFeaturesTable({ features }) {
-  if (!features.length) {
-    return <Empty text="No se informaron variables del modelo." />;
-  }
-  return (
-    <div className="classifier-features-table">
-      <div className="classifier-features-head">
-        <span>Variable</span>
-        <span>Fuente</span>
-        <span>Tipo</span>
-        <span>Requerida</span>
-        <span>Normalizacion / dominio</span>
-      </div>
-      {features.map((feature, index) => (
-        <div className="classifier-features-row" key={`${feature.name}-${index}`}>
-          <span>{feature.name}</span>
-          <span>{feature.source}</span>
-          <span>{feature.type}</span>
-          <span>{feature.required === null ? "-" : feature.required ? "si" : "no"}</span>
-          <span>{feature.detail}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function ClassifierDecisionTable({ decisions }) {
-  if (!decisions.length) {
-    return <Empty text="No se informaron reglas o nodos de decision." />;
-  }
-  return (
-    <div className="classifier-decision-table">
-      <div className="classifier-decision-head">
-        <span>Regla</span>
-        <span>Condiciones</span>
-        <span>Clase</span>
-        <span>Subtipo</span>
-        <span>Confianza / umbral</span>
-        <span>Accion</span>
-      </div>
-      {decisions.map((decision, index) => (
-        <div className="classifier-decision-row" key={`${decision.id}-${index}`}>
-          <span>{decision.id}</span>
-          <span>{decision.conditions}</span>
-          <span>{decision.diagnosticClass ? <DiagnosticClassBadge value={decision.diagnosticClass} /> : "-"}</span>
-          <span>{decision.subtype}</span>
-          <span>{decision.confidence}</span>
-          <span>{classifierActionLabel(decision.action)}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function classifierModelVersion(specification = {}, summary = {}) {
-  if (typeof specification === "string" && specification.trim()) {
-    return specification;
-  }
-  const model = specification?.model;
-  const summaryModel = summary?.model;
-  if (typeof model === "string" && model.trim()) {
-    return model;
-  }
-  if (typeof summaryModel === "string" && summaryModel.trim()) {
-    return summaryModel;
-  }
-  return specification?.model_version
-    || specification?.version
-    || model?.version
-    || summary?.model_version
-    || summaryModel?.version
-    || "-";
-}
-
-function normalizeClassifierSpecificationPayload(value) {
-  if (!value) {
-    return {};
-  }
-  if (typeof value === "string" || typeof value === "number") {
-    return { model_version: String(value) };
-  }
-  if (typeof value !== "object" || Array.isArray(value)) {
-    return {};
-  }
-  return value;
-}
-
-function classifierSpecificationStatus(specification = {}) {
-  const spec = normalizeClassifierSpecificationPayload(specification);
-  const hasSpecification = Boolean(
-    spec
-    && (
-      spec.model_version
-      || spec.version
-      || spec.model_type
-      || spec.type
-      || spec.config
-      || spec.features
-      || spec.decision_table
-    )
-  );
-  if (!hasSpecification) {
-    return { key: "unavailable", label: "Especificacion no disponible" };
-  }
-  const rawStatus = typeof spec.status === "object"
-    ? spec.status.key || spec.status.status || spec.status.value
-    : spec.status;
-  const key = contextClassKey(rawStatus || "pending");
-  if (["ready", "active", "configured", "operational", "validated"].includes(key)) {
-    return { key: "ready", label: "Modelo configurado" };
-  }
-  if (["invalid", "error", "blocked", "disabled"].includes(key)) {
-    return { key: "invalid", label: "Especificacion requiere correccion" };
-  }
-  return { key: "pending", label: "Especificacion pendiente de validacion" };
-}
-
-function classifierClassKey(value) {
-  const rawValue = value && typeof value === "object"
-    ? value.diagnostic_class || value.class || value.label || value.value
-    : value;
-  const key = contextClassKey(rawValue || "unknown");
-  const aliases = {
-    normal_operation: "normal",
-    healthy: "normal",
-    ambiental_anomaly: "environmental_anomaly",
-    anomalia_ambiental: "environmental_anomaly",
-    environmental_event: "environmental_anomaly",
-    environment_anomaly: "environmental_anomaly",
-    possible_fault: "possible_sensor_fault",
-    possible_device_fault: "possible_sensor_fault",
-    device_fault: "possible_sensor_fault",
-    possible_sensor_failure: "possible_sensor_fault",
-    possible_failure: "possible_sensor_fault",
-    falla_posible: "possible_sensor_fault",
-    posible_falla: "possible_sensor_fault",
-    posible_falla_de_sensor: "possible_sensor_fault",
-    uncertain: "indeterminate",
-    inconclusive: "indeterminate",
-    insufficient_evidence: "indeterminate",
-    no_determinado: "indeterminate",
-    no_reached: "not_reached",
-    not_evaluated: "not_reached",
-    rejected_before_classifier: "not_reached",
-    pipeline_loss: "not_reached",
-  };
-  return aliases[key] || key;
-}
-
-function classifierClassLabel(value) {
-  const key = classifierClassKey(value);
-  const labels = {
-    normal: "Normal",
-    environmental_anomaly: "Anomalia ambiental",
-    possible_sensor_fault: "Posible falla de sensor",
-    sensor_fault: "Falla de sensor",
-    indeterminate: "Indeterminado",
-    not_reached: "No alcanzo el clasificador",
-    unknown: "No informado",
-  };
-  if (labels[key]) {
-    return labels[key];
-  }
-  return String(value || "Indeterminado")
-    .replace(/[_-]+/g, " ")
-    .replace(/^\w/, (letter) => letter.toUpperCase());
-}
-
-function classifierResultClass(result = {}) {
-  const key = classifierClassKey(
-    result.diagnostic_class
-    || result.classification
-    || result.predicted_class
-    || result.class
-    || result.pipeline?.classifier?.diagnostic_class
-    || result.pipeline?.classifier?.predicted_class
-    || "unknown",
-  );
-  return key === "sensor_fault" ? "possible_sensor_fault" : key;
-}
-
-function classifierClassCounts(results = [], summaryByClass = {}) {
-  const computed = {
-    normal: 0,
-    environmental_anomaly: 0,
-    possible_sensor_fault: 0,
-    indeterminate: 0,
-  };
-  (results || []).forEach((result) => {
-    const key = classifierResultClass(result);
-    if (Object.prototype.hasOwnProperty.call(computed, key)) {
-      computed[key] += 1;
-    }
-  });
-  const reported = {};
-  if (Array.isArray(summaryByClass)) {
-    summaryByClass.forEach((item) => {
-      if (!item || typeof item !== "object") {
-        return;
-      }
-      const key = classifierResultClass({
-        diagnostic_class: item.diagnostic_class || item.class || item.label,
-      });
-      const count = contextNumber(item.count, item.value, item.total);
-      if (count !== null) {
-        reported[key] = (reported[key] || 0) + count;
-      }
-    });
-  } else if (summaryByClass && typeof summaryByClass === "object") {
-    Object.entries(summaryByClass).forEach(([diagnosticClass, value]) => {
-      const key = classifierResultClass({ diagnostic_class: diagnosticClass });
-      const count = contextNumber(
-        typeof value === "object" ? value.count : value,
-        typeof value === "object" ? value.total : null,
-      );
-      if (count !== null) {
-        reported[key] = (reported[key] || 0) + count;
-      }
-    });
-  }
-  return Object.fromEntries(
-    Object.entries(computed).map(([key, value]) => [
-      key,
-      Object.prototype.hasOwnProperty.call(reported, key) ? reported[key] : value,
-    ]),
-  );
-}
-
-function mergeClassifierResults(current = [], incoming = []) {
-  const merged = new Map();
-  [...(current || []), ...(incoming || [])].forEach((result, index) => {
-    const compositeKey = [
-      result?.entity_id,
-      result?.timestamp,
-      classifierResultClass(result || {}),
-    ].filter(Boolean).join("|");
-    const key = result?.diagnosis_id
-      || result?.event_id
-      || compositeKey
-      || `result-${index}`;
-    merged.set(key, result);
-  });
-  return [...merged.values()].sort((left, right) => {
-    const leftTime = Date.parse(left?.timestamp || "");
-    const rightTime = Date.parse(right?.timestamp || "");
-    if (!Number.isFinite(leftTime) || !Number.isFinite(rightTime)) {
-      return 0;
-    }
-    return rightTime - leftTime;
-  });
-}
-
-function classifierConfidence(result = {}) {
-  return contextNumber(
-    result.confidence,
-    result.pipeline?.classifier?.confidence,
-    result.classifier?.confidence,
-  );
-}
-
-function normalizedConfidence(value) {
-  const number = contextFiniteNumber(value);
-  if (number === null || number < 0) {
-    return null;
-  }
-  const normalized = number > 1 ? number / 100 : number;
-  return normalized >= 0 && normalized <= 1 ? normalized : null;
-}
-
-function classifierIsLowConfidence(result = {}) {
-  if (result.low_confidence !== undefined && result.low_confidence !== null) {
-    return contextBoolean(result.low_confidence);
-  }
-  const confidence = normalizedConfidence(classifierConfidence(result));
-  const threshold = normalizedConfidence(contextNumber(
-    result.confidence_threshold,
-    result.low_confidence_threshold,
-    result.pipeline?.classifier?.confidence_threshold,
-  ));
-  return confidence !== null && threshold !== null ? confidence < threshold : false;
-}
-
-function classifierMeanConfidence(results = []) {
-  const values = (results || [])
-    .map(classifierConfidence)
-    .map(normalizedConfidence)
-    .filter((value) => value !== null);
-  if (!values.length) {
-    return null;
-  }
-  return values.reduce((total, value) => total + value, 0) / values.length;
-}
-
-function formatClassifierConfidence(value) {
-  const normalized = normalizedConfidence(value);
-  return normalized === null ? "-" : `${(normalized * 100).toFixed(1)}%`;
-}
-
-function classifierSubtype(result = {}) {
-  const value = result.subtype
-    || result.diagnostic_subtype
-    || result.pipeline?.classifier?.subtype
-    || result.classifier?.subtype;
-  return value ? formatContextValue(value) : "-";
-}
-
-function classifierContextBlock(result = {}) {
-  return result.pipeline?.contextual || result.contextual || {};
-}
-
-function classifierContextCoverage(result = {}) {
-  const contextual = classifierContextBlock(result);
-  const coverage = contextual.coverage
-    ?? contextual.context_coverage
-    ?? result.context_coverage
-    ?? result.coverage;
-  return contextCoverage({
-    coverage,
-    eligible_relations: contextual.eligible_relations ?? result.eligible_relations,
-    observed_relations: contextual.observed_relations ?? result.observed_relations,
-    coverage_ratio: contextual.coverage_ratio ?? result.coverage_ratio,
-    coverage_status: contextual.coverage_status ?? result.coverage_status,
-  });
-}
-
-function classifierCommonCause(result = {}) {
-  const contextual = classifierContextBlock(result);
-  const raw = contextual.common_cause ?? result.common_cause;
-  return contextCommonCause({
-    common_cause: raw,
-    common_cause_possible: contextual.common_cause_possible ?? result.common_cause_possible,
-    common_cause_identifiable: contextual.common_cause_identifiable ?? result.common_cause_identifiable,
-    independent_signal_present: contextual.independent_signal_present ?? result.independent_signal_present,
-    common_cause_score: contextual.common_cause_score ?? result.common_cause_score,
-    common_failure_domain: contextual.common_failure_domain ?? result.common_failure_domain,
-    common_cause_explanation: contextual.common_cause_explanation ?? result.common_cause_explanation,
-  });
-}
-
-function classifierMapQuality(result = {}) {
-  const contextual = classifierContextBlock(result);
-  const quality = contextual.map_quality
-    || contextual.map
-    || result.map_quality
-    || result.map
-    || {};
-  if (!quality || typeof quality !== "object") {
-    return {};
-  }
-  return {
-    ...quality,
-    version: quality.version || quality.map_version || contextual.map_version || result.map_version,
-    stale: quality.stale ?? contextual.map_stale ?? result.map_stale,
-    stale_reasons: contextArray(quality.stale_reasons, contextual.stale_reasons, result.stale_reasons),
-  };
-}
-
-function classifierResultMapStale(result = {}, fallback = null) {
-  const quality = classifierMapQuality(result);
-  const value = quality.stale
-    ?? result.pipeline?.contextual?.map_stale
-    ?? result.contextual?.map_stale
-    ?? result.map_stale;
-  if (value === undefined || value === null) {
-    return fallback === undefined || fallback === null ? null : Boolean(fallback);
-  }
-  return contextBoolean(value);
-}
-
-function classifierStatisticalScore(result = {}) {
-  const statistical = result.pipeline?.statistical || result.statistical || {};
-  return contextNumber(
-    statistical.score,
-    statistical.suspicion_score,
-    result.statistical_score,
-    result.stat_score,
-    result.suspicion_score,
-  );
-}
-
-function classifierContextOutcome(result = {}) {
-  const contextual = classifierContextBlock(result);
-  return contextOutcome({
-    context_outcome: contextual.outcome
-      || contextual.context_outcome
-      || contextual.status
-      || result.context_outcome
-      || result.contextual_status,
-  });
-}
-
-function classifierContextScore(result = {}) {
-  const contextual = classifierContextBlock(result);
-  return contextNumber(
-    contextual.coherence_score,
-    contextual.contextual_score,
-    contextual.score,
-    result.coherence_score,
-    result.contextual_score,
-    result.context_score,
-  );
-}
-
-function classifierActionLabel(action) {
-  if (action === undefined || action === null || action === "") {
-    return "-";
-  }
-  if (typeof action === "object") {
-    return formatContextValue(action.label || action.action || action.code || action);
-  }
-  const key = contextClassKey(action);
-  const labels = {
-    none: "Sin accion",
-    no_action: "Sin accion",
-    monitor: "Monitorear",
-    continue_monitoring: "Continuar monitoreo",
-    inspect: "Inspeccionar",
-    inspect_sensor: "Inspeccionar sensor",
-    review_sensor: "Revisar sensor",
-    maintenance: "Derivar a mantenimiento",
-    create_alert: "Emitir alerta",
-    alert: "Emitir alerta",
-    suppress_alert: "No alertar",
-    request_more_context: "Solicitar mas contexto",
-    collect_more_evidence: "Recopilar mas evidencia",
-    accept_candidate_as_normal: "Aceptar candidato como normal",
-    observe_environmental_event: "Observar evento ambiental",
-    alert_and_hold_sensitive_automation_recommended: "Alertar; retencion automatica recomendada",
-    inspect_sensor_before_automation: "Inspeccionar sensor antes de automatizar",
-    collect_context_or_independent_evidence: "Recopilar contexto o evidencia independiente",
-  };
-  return labels[key] || String(action).replace(/[_-]+/g, " ");
-}
-
-function classifierConfidenceKindLabel(value) {
-  const key = contextClassKey(value);
-  const labels = {
-    evidence_strength_not_calibrated_probability: "Fuerza de evidencia; no es probabilidad calibrada",
-  };
-  return labels[key] || value || "Tipo no informado";
-}
-
-function classifierEvidenceRows(result = {}) {
-  const classifier = result.pipeline?.classifier || result.classifier || {};
-  const sources = [
-    ["evidencia", result.evidence ?? classifier.evidence],
-    ["variable", result.features_used ?? classifier.features_used],
-  ];
-  const rows = [];
-  const append = (sourceLabel, item, fallbackName = "") => {
-    if (item === undefined || item === null) {
-      return;
-    }
-    if (typeof item !== "object" || Array.isArray(item)) {
-      rows.push({
-        name: fallbackName || String(item),
-        source: sourceLabel,
-        value: fallbackName ? item : "-",
-        contribution: "-",
-        direction: "-",
-        available: true,
-      });
-      return;
-    }
-    const available = item.available === undefined && item.missing === undefined
-      ? true
-      : item.available !== undefined
-        ? contextBoolean(item.available)
-        : !contextBoolean(item.missing);
-    rows.push({
-      name: item.name
-        || item.feature
-        || item.indicator
-        || item.entity_id
-        || item.related_entity_id
-        || fallbackName
-        || "evidencia",
-      source: item.source || item.stage || item.origin || sourceLabel,
-      value: item.value ?? item.observed_value ?? item.score ?? item.c_j ?? "-",
-      contribution: item.contribution
-        ?? item.weighted_contribution
-        ?? item.weight
-        ?? item.importance
-        ?? "-",
-      direction: formatContextValue(
-        item.direction
-        ?? item.verdict
-        ?? item.status
-        ?? item.effect
-        ?? "-",
-      ),
-      available,
-    });
-  };
-  sources.forEach(([sourceLabel, collection]) => {
-    if (Array.isArray(collection)) {
-      collection.forEach((item) => append(sourceLabel, item));
-      return;
-    }
-    if (!collection || typeof collection !== "object") {
-      if (collection !== undefined && collection !== null) {
-        append(sourceLabel, collection);
-      }
-      return;
-    }
-    const items = Array.isArray(collection.items) ? collection.items : null;
-    if (items) {
-      items.forEach((item) => append(sourceLabel, item));
-      return;
-    }
-    Object.entries(collection).forEach(([name, item]) => append(sourceLabel, item, name));
-  });
-  const unique = new Map();
-  rows.forEach((row) => {
-    const key = `${contextClassKey(row.name)}|${contextClassKey(row.source)}`;
-    if (!unique.has(key)) {
-      unique.set(key, row);
-    }
-  });
-  return [...unique.values()];
-}
-
-function classifierStageStatus(stage = {}) {
-  if (typeof stage === "string") {
-    return contextClassKey(stage);
-  }
-  const raw = stage.status || stage.outcome || stage.result;
-  if (raw) {
-    return contextClassKey(raw);
-  }
-  if (stage.passed === true) {
-    return "passed";
-  }
-  if (stage.passed === false) {
-    return "rejected";
-  }
-  return "unknown";
-}
-
-function classifierPassedText(value) {
-  if (value === undefined || value === null) {
-    return "-";
-  }
-  return contextBoolean(value) ? "si" : "no";
-}
-
-function classifierStageLabel(status) {
-  const key = contextClassKey(status);
-  const labels = {
-    passed: "Paso",
-    pass: "Paso",
-    accepted: "Aceptado",
-    rejected: "Descartado",
-    failed: "No paso",
-    not_reached: "No alcanzado",
-    statistical: "Estadistico-temporal",
-    statistical_temporal: "Estadistico-temporal",
-    contextual: "Contextual",
-    classifier: "Clasificador",
-    respaldado: "Respaldado",
-    contradicho: "Contradicho",
-    no_explicado: "No explicado",
-    cobertura_insuficiente: "Cobertura insuficiente",
-    unknown: "Estado no informado",
-  };
-  return labels[key] || classifierClassLabel(key);
-}
-
-function classifierEvaluationAvailable(payload = {}) {
-  if (payload.available !== true) {
-    return false;
-  }
-  const matrix = normalizeClassifierConfusionMatrix(payload.confusion_matrix_e2e);
-  const hasMatrixValue = matrix.values.some((row) => row.some((value) => contextFiniteNumber(value) !== null));
-  const hasFunnelValue = classifierFunnelStages(payload.funnel)
-    .some((stage) => contextFiniteNumber(stage.value) !== null);
-  const metricBlocks = [
-    payload.end_to_end,
-    payload.end_to_end?.metrics,
-    payload.classifier_conditional,
-    payload.classifier_conditional?.metrics,
-  ];
-  const hasMetric = metricBlocks.some((block) => (
-    block
-    && typeof block === "object"
-    && Object.entries(block).some(([key, value]) => key !== "by_class" && contextFiniteNumber(value) !== null)
-  ));
-  const hasClassMetric = [payload.end_to_end, payload.classifier_conditional].some((block) => {
-    const byClass = block?.by_class || block?.metrics?.by_class;
-    return byClass && typeof byClass === "object" && Object.values(byClass).some((metrics) => (
-      metrics
-      && typeof metrics === "object"
-      && Object.values(metrics).some((value) => contextFiniteNumber(value) !== null)
-    ));
-  });
-  return hasMatrixValue || hasFunnelValue || hasMetric || hasClassMetric;
-}
-
-function classifierFunnelStages(funnel) {
-  const rawStages = Array.isArray(funnel)
-    ? funnel
-    : Array.isArray(funnel?.stages)
-      ? funnel.stages
-      : null;
-  if (rawStages) {
-    return rawStages.map((stage, index) => {
-      if (stage && typeof stage === "object") {
-        const id = contextClassKey(stage.id || stage.key || stage.stage || `stage_${index + 1}`);
-        return {
-          id,
-          label: stage.label || classifierFunnelStageLabel(id),
-          value: contextNumber(stage.value, stage.count, stage.total),
-        };
-      }
-      return {
-        id: `stage_${index + 1}`,
-        label: `Etapa ${index + 1}`,
-        value: contextFiniteNumber(stage),
-      };
-    });
-  }
-  if (!funnel || typeof funnel !== "object") {
-    return [];
-  }
-  const definitions = [
-    ["all_labeled", ["all_labeled", "labeled_cases", "total_labeled"]],
-    ["passed_statistical", ["passed_statistical", "statistical_passed"]],
-    ["contextual_evaluated", ["contextual_evaluated", "passed_contextual", "contextual_passed"]],
-    ["reached_classifier", ["reached_classifier", "classifier_inputs"]],
-    ["classified", ["classified", "classifier_outputs"]],
-    ["indeterminate", ["indeterminate", "abstained"]],
-  ];
-  return definitions.flatMap(([id, keys]) => {
-    const key = keys.find((candidate) => funnel[candidate] !== undefined && funnel[candidate] !== null);
-    if (!key) {
-      return [];
-    }
-    return [{
-      id,
-      label: classifierFunnelStageLabel(id),
-      value: contextFiniteNumber(funnel[key]),
-    }];
-  });
-}
-
-function classifierFunnelStageLabel(value) {
-  const key = contextClassKey(value);
-  const labels = {
-    all_labeled: "Casos reales etiquetados",
-    labeled_cases: "Casos reales etiquetados",
-    passed_statistical: "Pasan filtro estadistico",
-    contextual_evaluated: "Evaluados por contexto",
-    reached_classifier: "Llegan al clasificador",
-    classified: "Salida diagnostica",
-    indeterminate: "Salida indeterminada",
-  };
-  return labels[key] || classifierStageLabel(key);
-}
-
-function classifierFunnelValue(funnel, target) {
-  const targetKey = contextClassKey(target);
-  const stage = classifierFunnelStages(funnel).find((item) => item.id === targetKey);
-  return stage ? contextFiniteNumber(stage.value) : null;
-}
-
-function classifierPreclassifierFalseNegatives(losses = [], endToEnd = {}) {
-  const values = [];
-  (losses || []).forEach((loss) => {
-    const value = contextNumber(loss?.false_negatives, loss?.fn);
-    if (value !== null) {
-      values.push(value);
-    }
-  });
-  if (!values.length) {
-    const byClass = endToEnd?.by_class || endToEnd?.metrics?.by_class;
-    if (byClass && typeof byClass === "object") {
-      Object.values(byClass).forEach((metrics) => {
-        const value = contextFiniteNumber(metrics?.fn_before_classifier);
-        if (value !== null) {
-          values.push(value);
-        }
-      });
-    }
-  }
-  return values.length ? values.reduce((total, value) => total + value, 0) : null;
-}
-
-function classifierClassMetrics(metrics = {}, targetClass) {
-  const byClass = metrics?.by_class || metrics?.metrics?.by_class || {};
-  const entries = Array.isArray(byClass)
-    ? byClass.map((item) => [item?.class || item?.label || item?.diagnostic_class, item])
-    : Object.entries(byClass);
-  const target = classifierClassKey(targetClass);
-  const aliases = target === "possible_sensor_fault"
-    ? ["possible_sensor_fault", "sensor_fault", "possible_fault"]
-    : target === "sensor_fault"
-      ? ["sensor_fault", "possible_sensor_fault", "possible_fault"]
-      : [target];
-  for (const alias of aliases) {
-    const match = entries.find(([key]) => contextClassKey(key) === contextClassKey(alias));
-    if (match?.[1] && typeof match[1] === "object") {
-      return match[1];
-    }
-  }
-  return null;
-}
-
-function formatOptionalCount(value) {
-  const number = contextFiniteNumber(value);
-  return number === null ? "-" : formatCount(number);
-}
-
-function formatOptionalMetric(value) {
-  const number = contextFiniteNumber(value);
-  return number === null ? "-" : number.toFixed(3);
-}
-
-function formatOptionalPercent(value) {
-  const number = contextFiniteNumber(value);
-  if (number === null) {
-    return "-";
-  }
-  return number > 1 ? `${number.toFixed(1)}%` : `${(number * 100).toFixed(1)}%`;
-}
-
-function normalizeClassifierConfusionMatrix(matrix) {
-  if (!matrix) {
-    return { truthLabels: [], predictedLabels: [], values: [] };
-  }
-  if (Array.isArray(matrix)) {
-    if (!matrix.length) {
-      return { truthLabels: [], predictedLabels: [], values: [] };
-    }
-    if (Array.isArray(matrix[0])) {
-      const labels = matrix.map((_, index) => `class_${index + 1}`);
-      return { truthLabels: labels, predictedLabels: labels, values: matrix };
-    }
-    const rows = matrix.filter((row) => row && typeof row === "object");
-    const predictedLabels = [...new Set(rows.flatMap((row) => (
-      row.predictions && typeof row.predictions === "object"
-        ? Object.keys(row.predictions)
-        : Object.keys(row).filter((key) => !["truth", "truth_class", "actual", "label"].includes(key))
-    )))];
-    return {
-      truthLabels: rows.map((row, index) => row.truth || row.truth_class || row.actual || row.label || `class_${index + 1}`),
-      predictedLabels,
-      values: rows.map((row) => predictedLabels.map((label) => (
-        row.predictions?.[label] ?? row[label] ?? null
-      ))),
-    };
-  }
-  if (typeof matrix !== "object") {
-    return { truthLabels: [], predictedLabels: [], values: [] };
-  }
-  const values = matrix.values || matrix.matrix || matrix.counts;
-  const truthLabels = matrix.truth_labels || matrix.actual_labels || matrix.rows || matrix.labels;
-  const predictedLabels = matrix.predicted_labels || matrix.prediction_labels || matrix.columns || matrix.labels;
-  if (Array.isArray(values) && Array.isArray(truthLabels) && Array.isArray(predictedLabels)) {
-    return { truthLabels, predictedLabels, values };
-  }
-  const nested = matrix.by_truth || matrix.data || matrix.cells;
-  const objectRows = nested && typeof nested === "object" && !Array.isArray(nested)
-    ? nested
-    : Object.fromEntries(
-      Object.entries(matrix).filter(([, value]) => value && typeof value === "object" && !Array.isArray(value)),
-    );
-  const nestedEntries = Object.entries(objectRows);
-  if (!nestedEntries.length) {
-    return { truthLabels: [], predictedLabels: [], values: [] };
-  }
-  const nestedPredicted = [...new Set(nestedEntries.flatMap(([, row]) => Object.keys(row)))];
-  return {
-    truthLabels: nestedEntries.map(([truth]) => truth),
-    predictedLabels: nestedPredicted,
-    values: nestedEntries.map(([, row]) => nestedPredicted.map((predicted) => row[predicted] ?? null)),
-  };
-}
-
-function classifierEvaluationLabel(label) {
-  const rawKey = contextClassKey(label);
-  if (rawKey === "sensor_fault") {
-    return "Falla de sensor";
-  }
-  if (classifierClassKey(rawKey) === "not_reached") {
-    return "No alcanzo el clasificador";
-  }
-  return classifierClassLabel(rawKey);
-}
-
-function classifierConfusionCellColor(truth, predicted, value, maximum) {
-  const truthKey = classifierClassKey(truth) === "sensor_fault"
-    ? "possible_sensor_fault"
-    : classifierClassKey(truth);
-  const predictedKey = classifierClassKey(predicted) === "sensor_fault"
-    ? "possible_sensor_fault"
-    : classifierClassKey(predicted);
-  const ratio = Math.min(1, Math.max(0, Number(value) / Math.max(Number(maximum), 1)));
-  const alpha = (0.08 + ratio * 0.68).toFixed(3);
-  if (truthKey === predictedKey) {
-    return `rgba(45, 212, 191, ${alpha})`;
-  }
-  if (predictedKey === "not_reached") {
-    return `rgba(244, 63, 94, ${alpha})`;
-  }
-  if (predictedKey === "indeterminate") {
-    return `rgba(245, 158, 11, ${alpha})`;
-  }
-  return `rgba(167, 139, 250, ${alpha})`;
-}
-
-function normalizeClassifierFeatures(features) {
-  if (!features) {
-    return [];
-  }
-  const entries = Array.isArray(features)
-    ? features.map((feature, index) => [feature?.name || feature?.id || `feature_${index + 1}`, feature])
-    : typeof features === "object"
-      ? Object.entries(features)
-      : [];
-  return entries.map(([fallbackName, feature]) => {
-    if (typeof feature === "string") {
-      return {
-        name: feature,
-        source: "-",
-        type: "-",
-        required: null,
-        detail: "-",
-      };
-    }
-    if (!feature || typeof feature !== "object") {
-      return {
-        name: fallbackName,
-        source: "-",
-        type: typeof feature,
-        required: null,
-        detail: formatContextValue(feature),
-      };
-    }
-    const required = feature.required === undefined || feature.required === null
-      ? null
-      : contextBoolean(feature.required);
-    return {
-      name: feature.name || feature.id || fallbackName,
-      source: feature.source || feature.stage || feature.origin || "-",
-      type: feature.type || feature.data_type || feature.kind || "-",
-      required,
-      detail: formatContextValue(
-        feature.normalization
-        ?? feature.domain
-        ?? feature.range
-        ?? feature.description
-        ?? "-",
-      ),
-    };
-  });
-}
-
-function normalizeClassifierDecisionTable(decisionTable) {
-  if (!decisionTable) {
-    return [];
-  }
-  const entries = Array.isArray(decisionTable)
-    ? decisionTable.map((decision, index) => [decision?.id || decision?.rule_id || `rule_${index + 1}`, decision])
-    : typeof decisionTable === "object"
-      ? Object.entries(decisionTable)
-      : [];
-  return entries.map(([fallbackId, decision]) => {
-    const payload = decision && typeof decision === "object"
-      ? decision
-      : { conditions: decision };
-    const rawClass = payload.diagnostic_class
-      || payload.predicted_class
-      || payload.class
-      || payload.output;
-    const diagnosticClass = rawClass
-      ? classifierResultClass({ diagnostic_class: rawClass })
-      : "";
-    const confidence = contextNumber(
-      payload.confidence,
-      payload.confidence_threshold,
-      payload.min_confidence,
-      payload.threshold,
-    );
-    return {
-      id: payload.id || payload.rule_id || fallbackId,
-      conditions: formatContextValue(payload.conditions ?? payload.when ?? payload.condition ?? "-"),
-      diagnosticClass,
-      subtype: formatContextValue(payload.subtype ?? payload.diagnostic_subtype ?? "-"),
-      confidence: confidence === null ? "-" : formatClassifierConfidence(confidence),
-      action: payload.suggested_action ?? payload.action,
-    };
-  });
 }
 
 function ContinuousConfigEditor({ configs, busy, onChange, onSave }) {
@@ -4205,6 +2556,7 @@ function ResultsTable({ results, onResultClick }) {
           <span>{formatReading(result)}</span>
           <span>
             {result.suspected_pattern || result.pattern || "-"}
+            {result.episode && <small>{episodeLabel(result)}</small>}
             <small>
               {timeWindowLabel(result.time_window)}
               {result.replay ? ` / retraso ${formatDuration(result.replay.detection_delay_seconds)}` : ""}
@@ -4275,6 +2627,18 @@ function CalculationModal({ result, onClose }) {
           <SummaryRow label="Consistencia temporal" value={temporalConsistencyText(temporalContext.temporal_consistency)} />
           <SummaryRow label="Paso contextual" value={result.passed_to_contextual_filter ? "si" : "no"} />
         </div>
+        {result.episode && <article className="modal-block">
+          <h3>Episodio de sospecha</h3>
+          <KeyValueGrid rows={[
+            { label: "Decision de envio", value: episodeLabel(result) },
+            { label: "Identificador", value: result.episode.episode_id },
+            { label: "Primera sospecha", value: preciseContextTimestamp(result.episode.first_seen) },
+            { label: "Ultima aparicion registrada", value: preciseContextTimestamp(result.episode.last_seen) },
+            { label: "Apariciones hasta este evento", value: formatCount(result.episode.occurrences) },
+            { label: "Score maximo hasta este evento", value: formatNumber(result.episode.max_score) },
+            { label: "Lapso para abrir otro", value: formatSeconds(result.episode.quiet_seconds) },
+          ]} />
+        </article>}
 
         <div className="modal-columns">
           <article className="modal-block">
@@ -4454,12 +2818,14 @@ function KeyValueGrid({ rows }) {
   );
 }
 
-function TimelineChart({ timeline, results, onResultClick }) {
+function TimelineChart({ timeline, results, suspicionThreshold, onResultClick }) {
   const width = 720;
   const height = 240;
   const padding = { top: 18, right: 24, bottom: 34, left: 58 };
   const basePoints = timeline.points || [];
-  const points = mergeTimelineWithSuspiciousPoints(basePoints, results, timeline);
+  const points = mergeTimelineWithSuspiciousPoints(
+    basePoints, results, timeline, suspicionThreshold,
+  );
   const isBinary = timeline.sensor_kind === "binary" || timeline.chart_kind === "active_percentage";
   const isMultistate = timeline.sensor_kind === "multistate" || timeline.chart_kind === "categorical_state";
   const categoryEntries = Object.entries(timeline.categories || {})
@@ -4620,15 +2986,15 @@ function TimelineChart({ timeline, results, onResultClick }) {
         {isBinary && <span>bucket: {formatBucketSeconds(timeline.bucket_seconds)}</span>}
         {isMultistate && <span>{multistateStatusText(timeline.analysis_status)}</span>}
         {points.length > basePoints.length && <span>{points.length - basePoints.length} sospechas encontradas</span>}
-        <span>{`rojo: score >= ${RED_SUSPICION_SCORE.toFixed(2)} agrupado`}</span>
+        <span>{`rojo: score >= ${suspicionThreshold.toFixed(2)} agrupado`}</span>
         {gapBands.length > 0 && <span>zona punteada: sin lectura valida</span>}
       </div>
     </article>
   );
 }
 
-function isRedSuspicion(result) {
-  return Boolean(result?.is_suspicious) && Number(result?.suspicion_score || 0) >= RED_SUSPICION_SCORE;
+function isRedSuspicion(result, suspicionThreshold) {
+  return isStatisticalSuspicion(result);
 }
 
 function compareResultsByExecutionDate(left, right) {
@@ -4642,7 +3008,7 @@ function compareResultsByExecutionDate(left, right) {
   return Number(right?.suspicion_score || 0) - Number(left?.suspicion_score || 0);
 }
 
-function mergeTimelineWithSuspiciousPoints(points, results, timeline) {
+function mergeTimelineWithSuspiciousPoints(points, results, timeline, suspicionThreshold) {
   const byTime = new Map();
   const entityId = timeline.entity_id;
   let firstVisibleTime = Infinity;
@@ -4662,7 +3028,7 @@ function mergeTimelineWithSuspiciousPoints(points, results, timeline) {
   }
 
   for (const result of results || []) {
-    if (result.entity_id !== entityId || !isRedSuspicion(result)) {
+    if (result.entity_id !== entityId || !isRedSuspicion(result, suspicionThreshold)) {
       continue;
     }
     const time = Date.parse(result.timestamp);
@@ -5257,6 +3623,15 @@ function formatHistoryRange(history) {
     return "sin historico cargado";
   }
   return `${shortDate(history.start).slice(0, 16)} -> ${shortDate(history.end).slice(0, 16)}`;
+}
+
+function formatSuspicionPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "-";
+  return `${(Math.round(numeric * 1000) / 10).toLocaleString("es-CL", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 1,
+  })} %`;
 }
 
 function normalityDetail(normality) {
