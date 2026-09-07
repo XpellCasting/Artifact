@@ -204,10 +204,17 @@ exclusión de Git. Los originales importados permanecen intactos.
 | `POST /diagnostics/train` | Entrenar versión candidata con `dataset_id` |
 | `POST /diagnostics/models/{model_id}/evaluate` | Evaluar con `dataset_id` y `partition` |
 | `POST /diagnostics/models/{model_id}/activate` | Activar; `allow_exploratory` permite el modo experimental |
+| `POST /diagnostics/models/{model_id}/deactivate` | Desactivar sin borrar la versión ni sus evaluaciones; las nuevas ejecuciones vuelven al catálogo |
 | `GET /diagnostics/results` | Decisiones persistidas por origen y paginadas |
 
 Construcción, entrenamiento y evaluación son trabajos con progreso. Consultar
 resultados lee decisiones guardadas; no vuelve a ejecutar el clasificador.
+
+En «Modelos y evaluación», la versión activa ofrece «Desactivar versión».
+La evaluación puede repetirse tanto activa como desactivada, seleccionando un
+conjunto con ejemplos de Validación o Prueba. Desactivar conserva el modelo y
+sus métricas. Las reproducciones iniciadas mantienen su versión fijada hasta
+reiniciarlas; las nuevas ejecuciones usan el catálogo mientras no haya modelo activo.
 
 El motor está en `backend/app/Diagnostico_Patrones.py`; la preparación y
 persistencia, en `backend/app/Diagnostico_Trabajo.py`; la integración, en

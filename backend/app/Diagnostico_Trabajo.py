@@ -469,6 +469,16 @@ class DiagnosticWorkbench:
             _write(self.directory / "active.json", {"model_id": model_id, "activated_at": _now(), "experimental": not trained["validated"]})
         return dict(self._model_summary(trained), active=True)
 
+    def deactivate(self, model_id):
+        trained = self._read("models", model_id)
+        with self.lock:
+            active = self._active()
+            if active is not None and active != model_id:
+                raise ReviewError("Otra versión está activa. Actualiza la lista antes de desactivarla.", 409)
+            if active == model_id:
+                _write(self.directory / "active.json", {"model_id": None, "deactivated_at": _now(), "previous_model_id": model_id})
+        return dict(self._model_summary(trained), active=False)
+
     def export_dataset(self, identifier):
         dataset = self._read("datasets", identifier)
         handle, name = tempfile.mkstemp(prefix="diagnostic-examples-", suffix=".zip", dir=self.review.temporary)
@@ -633,6 +643,10 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
         if set(payload) - {"allow_exploratory"} or not isinstance(payload.get("allow_exploratory", False), bool):
             raise HTTPException(400, "allow_exploratory debe ser booleano.")
         return translate(workbench.activate, model_id, payload.get("allow_exploratory", False))
+
+    @router.post("/models/{model_id}/deactivate")
+    def deactivate(model_id: str):
+        return translate(workbench.deactivate, model_id)
 
     @router.get("/results")
     def results(source: Literal["history", "validation_replay"] | None = None, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=500)):

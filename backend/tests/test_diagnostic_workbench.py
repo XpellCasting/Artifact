@@ -105,6 +105,33 @@ class DiagnosticWorkbenchTests(unittest.TestCase):
         self.assertTrue(workbench._leaks(dict(group_id="a", entity_id="s", baseline_start="2026-01-01T00:00Z", baseline_end="2026-01-02T00:00Z", window_start="2026-01-01T00:00Z", window_end="2026-01-02T00:00Z"),
             dict(group_id="b", entity_id="s", baseline_start="2026-01-02T00:00Z", baseline_end="2026-01-03T00:00Z", window_start="2026-01-02T00:00Z", window_end="2026-01-03T00:00Z")))
 
+    def test_deactivate_preserves_model_evaluation_and_existing_run(self):
+        workbench = self.workbench
+        dataset, _, _ = self.dataset()
+        heldout, _, _ = self.dataset(2, "validation")
+        model_id = workbench.train(dataset["dataset_id"])["model_id"]
+        workbench.evaluate(model_id, heldout["dataset_id"])
+        workbench.activate(model_id)
+        snapshot = workbench._run_snapshot("validation_replay", "before")
+        # Evaluation remains available even while the model is active.
+        workbench.evaluate(model_id, heldout["dataset_id"])
+        before = workbench._read("models", model_id)
+        self.assertFalse(workbench.deactivate(model_id)["active"])
+        self.assertEqual(workbench._read("models", model_id), before)
+        self.assertEqual(workbench.status()["mode"], "catalogue")
+        self.assertEqual(workbench._run_snapshot("validation_replay", "before"), snapshot)
+        self.assertIsNone(workbench._run_snapshot("validation_replay", "after")["model"])
+        self.assertFalse(workbench.deactivate(model_id)["active"])
+        reevaluated = workbench.evaluate(model_id, heldout["dataset_id"])
+        self.assertEqual(len(reevaluated["evaluations"]), 3)
+        self.assertTrue(workbench.activate(model_id)["active"])
+        other = workbench.train(dataset["dataset_id"])["model_id"]
+        workbench.activate(other, allow_exploratory=True)
+        with self.assertRaises(ReviewError) as error:
+            workbench.deactivate(model_id)
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(workbench.status()["active_model_id"], other)
+
     def test_training_reports_excluded_incomplete_windows(self):
         dataset, _, _ = self.dataset()
         saved = self.workbench._read("datasets", dataset["dataset_id"])
