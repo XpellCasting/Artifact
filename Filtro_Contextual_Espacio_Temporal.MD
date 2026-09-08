@@ -14,11 +14,11 @@ para sensores de estado de `ye2016detecting`.
 
 ## Regla reproducible de construcción
 
-La versión `contextual-spatiotemporal-v2` usa estos valores por defecto:
+La versión `contextual-spatiotemporal-v3` usa estos valores por defecto:
 
 | Parámetro | Valor |
 |---|---:|
-| Ventanas candidatas | 300, 900 y 3600 s; elegidas por cadencia de Desarrollo |
+| Ventanas candidatas | 300, 900 y 3600 s; menor resolución temporal que supera todos los controles |
 | Desfases evaluados | Hasta 7200 s hacia el pasado; candidatos por ventana en `lag_candidates_by_window` |
 | Observaciones pareadas mínimas | 30 |
 | Cobertura histórica mínima del par | 0,60 |
@@ -49,12 +49,18 @@ Las aristas aceptadas exponen `lag_candidates` con motivos de descarte. En las
 rechazadas se conserva el diagnóstico seleccionado, sin duplicar los parámetros
 de inferencia de todos los pares en la caché.
 
-Con al menos 30 intervalos positivos en Desarrollo se escoge la menor ventana
-candidata que cubra la mediana del intervalo entre reportes; para el par se usa
-la mayor ventana de sus dos entidades. Sin muestra suficiente se usa 3600 s.
+Para cada par se evalúan todas las ventanas y se escoge la de menor duración
+que supera todos los controles, antes de aplicar top_k. Si ninguna cumple,
+se muestra la más fina como diagnóstico rechazado. `window_candidates` conserva
+los resultados de cada resolución, incluso en aristas rechazadas. La cadencia
+de Desarrollo sigue determinando la antigüedad máxima de las lecturas; elegir
+una ventana mayor no amplía ese límite.
 El catálogo de ventanas y desfases es una política operacional, no una búsqueda
-exhaustiva ni una estimación causal del tiempo de respuesta. La covarianza cruda
-visible conserva la grilla base; las asociaciones usan la grilla de cada arista.
+exhaustiva ni una estimación causal del tiempo de respuesta. La matriz y el
+detalle presentan la asociación calculada con la ventana y el desfase de cada
+arista. La covarianza descriptiva se ha retirado del mapa y de la API porque no
+interviene en sus controles de aceptación. Se conserva el cálculo interno de
+covarianza necesario para ajustar la respuesta lineal contextual.
 
 Estos umbrales son decisiones operacionales versionadas del prototipo; las
 referencias sustentan las familias de análisis, no estos valores numéricos
@@ -62,8 +68,7 @@ específicos. Deben tratarse como hiperparámetros en la evaluación experimenta
 
 ## Familias de relación
 
-- Continua–continua: correlación de Pearson sobre medianas por ventana. La
-  matriz visible conserva además la covarianza cruda.
+- Continua–continua: correlación de Pearson sobre medianas por ventana.
 - Estado–estado: coeficiente phi, coocurrencia y probabilidad condicional sobre
   el estado activo o sobre indicadores uno-contra-el-resto.
 - Mixta continua–estado: correlación punto-biserial. Esto cubre explícitamente
@@ -241,10 +246,10 @@ mediante `POST /context/map/rebuild`.
   memoria.
 - `GET /context/results`: resultados contextuales acumulados.
 
-La pestaña **Contextual** muestra por defecto la matriz de covarianza calculada
-del histórico. La vista **Asociación** permite comparar relaciones continuas,
-de estado y mixtas en una escala \([-1,1]\). Una celda `N/D` en covarianza
-significa “no aplicable”; no se sustituye por cero.
+La pestaña **Contextual** muestra el mapa de asociaciones entre sensores
+continuos, de estado y mixtos en una escala \([-1,1]\). El detalle identifica
+la métrica, ventana, desfase y controles. Las marcas distinguen las aristas
+aceptadas de las rechazadas.
 
 ## Trazabilidad de las seis debilidades
 

@@ -1352,7 +1352,6 @@ function replayStatusText(status) {
 }
 
 function ContextualWorkspace({ mapData, results, summary, busy, error, onReload, onRebuild }) {
-  const [matrixMode, setMatrixMode] = useState("covariance");
   const [selectedEdge, setSelectedEdge] = useState(null);
   const [selectedContextResult, setSelectedContextResult] = useState(null);
   const nodes = contextMapNodes(mapData);
@@ -1470,32 +1469,14 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
       </Panel>
 
       <section className="context-main-grid">
-        <Panel title="Mapa de covarianza y dependencias">
+        <Panel title="Mapa de asociaciones">
           <div className="context-panel-intro">
             <p>
-              La covarianza cruda se muestra para pares continuos. Cambia a asociacion normalizada para comparar
-              relaciones continuas, de estado y mixtas en una escala comun.
+              Asociaciones entre sensores en una escala de -1 a 1. Las marcas distinguen las relaciones
+              aceptadas de las que no cumplen los controles.
             </p>
-            <div className="context-matrix-switch" role="group" aria-label="Metrica visible en el mapa">
-              <button
-                type="button"
-                className={matrixMode === "covariance" ? "active" : ""}
-                aria-pressed={matrixMode === "covariance"}
-                onClick={() => setMatrixMode("covariance")}
-              >
-                Covarianza
-              </button>
-              <button
-                type="button"
-                className={matrixMode === "association" ? "active" : ""}
-                aria-pressed={matrixMode === "association"}
-                onClick={() => setMatrixMode("association")}
-              >
-                Asociacion
-              </button>
-            </div>
           </div>
-          <ContextMatrix mapData={mapData} mode={matrixMode} onSelectEdge={setSelectedEdge} />
+          <ContextMatrix mapData={mapData} onSelectEdge={setSelectedEdge} />
         </Panel>
 
         <Panel title="Parametros reproducibles">
@@ -1564,25 +1545,16 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
   );
 }
 
-function ContextMatrix({ mapData, mode, onSelectEdge }) {
+function ContextMatrix({ mapData, onSelectEdge }) {
   const matrices = mapData?.matrices || {};
   const nodes = contextMapNodes(mapData);
   const edges = contextMapEdges(mapData);
   const entities = Array.isArray(matrices.entities) && matrices.entities.length
     ? matrices.entities.map((entity) => typeof entity === "string" ? entity : entity?.entity_id).filter(Boolean)
     : nodes.map((node) => node.entity_id || node.id).filter(Boolean);
-  const values = mode === "association" ? matrices.association : matrices.covariance;
+  const values = matrices.association;
   const accepted = matrices.accepted;
-  const numericValues = Array.isArray(values)
-    ? values.flatMap((row, rowIndex) =>
-      Array.isArray(row)
-        ? row.map((value, columnIndex) => rowIndex === columnIndex ? null : contextFiniteNumber(value)).filter((value) => value !== null)
-        : [],
-    )
-    : [];
-  const scale = mode === "association"
-    ? 1
-    : Math.max(...numericValues.map((value) => Math.abs(value)), 0.0001);
+  const scale = 1;
   const edgeIndex = new Map();
   edges.forEach((edge) => {
     const source = contextEdgeSource(edge);
@@ -1628,7 +1600,6 @@ function ContextMatrix({ mapData, mode, onSelectEdge }) {
                 {entities.map((columnEntity, columnIndex) => {
                   const value = contextMatrixCell(values, rowIndex, columnIndex);
                   const numeric = contextFiniteNumber(value);
-                  const covariance = contextMatrixCell(matrices.covariance, rowIndex, columnIndex);
                   const association = contextMatrixCell(matrices.association, rowIndex, columnIndex);
                   const matrixAccepted = contextMatrixCell(accepted, rowIndex, columnIndex);
                   const edge = edgeIndex.get(`${rowEntity}\u0000${columnEntity}`)
@@ -1640,12 +1611,11 @@ function ContextMatrix({ mapData, mode, onSelectEdge }) {
                   const isDiagonal = rowIndex === columnIndex;
                   const available = numeric !== null;
                   const title = available
-                    ? `${rowEntity} ↔ ${columnEntity}: ${formatContextMatrixValue(numeric, mode)} · ${isAccepted ? "aceptada" : "no aceptada"}`
+                    ? `${rowEntity} ↔ ${columnEntity}: ${formatContextMatrixValue(numeric)} · ${isAccepted ? "aceptada" : "no aceptada"}`
                     : `${rowEntity} ↔ ${columnEntity}: no aplicable`;
                   const detail = edge || {
                     source_entity_id: rowEntity,
                     target_entity_id: columnEntity,
-                    covariance,
                     association,
                     accepted: isAccepted,
                     relation_family: "matrix",
@@ -1666,7 +1636,7 @@ function ContextMatrix({ mapData, mode, onSelectEdge }) {
                         aria-label={title}
                         onClick={() => onSelectEdge(detail)}
                       >
-                        {available ? formatContextMatrixValue(numeric, mode) : "N/D"}
+                        {available ? formatContextMatrixValue(numeric) : "N/D"}
                       </button>
                     </td>
                   );
@@ -1677,16 +1647,14 @@ function ContextMatrix({ mapData, mode, onSelectEdge }) {
         </table>
       </div>
       <div className="context-matrix-scale">
-        <span>{formatContextMatrixValue(-scale, mode)}</span>
+        <span>{formatContextMatrixValue(-scale)}</span>
         <div aria-hidden="true" />
         <span>0</span>
         <div aria-hidden="true" />
-        <span>{formatContextMatrixValue(scale, mode)}</span>
+        <span>{formatContextMatrixValue(scale)}</span>
       </div>
       <p className="context-matrix-note">
-        {mode === "covariance"
-          ? "N/D identifica pares cuya covarianza cruda no es aplicable, por ejemplo relaciones mixtas o entre estados. Haz clic en una celda para auditar la arista."
-          : "La asociacion normalizada conserva el tipo de metrica calculada por el backend. Haz clic en una celda para ver muestra, desfase y estabilidad."}
+        Haz clic en una celda para ver la metrica de asociacion, muestra, ventana, desfase y controles de aceptacion.
       </p>
     </>
   );
@@ -1773,7 +1741,6 @@ function ContextEdgeModal({ edge, mapVersion, onClose }) {
         </header>
         <div className="modal-score-grid">
           <SummaryRow label="Aceptada" value={accepted ? "si" : "no"} />
-          <SummaryRow label="Covarianza" value={formatContextValue(edge.covariance ?? edge.raw_covariance)} />
           <SummaryRow label="Asociacion" value={formatContextValue(edge.association ?? edge.association_signed ?? edge.weight)} />
           <SummaryRow label="Estabilidad" value={stability === null ? "-" : formatContextPercent(stability)} />
         </div>
@@ -1787,6 +1754,7 @@ function ContextEdgeModal({ edge, mapVersion, onClose }) {
               { label: "Metrica", value: edge.metric || edge.method || "-" },
               { label: "Signo esperado", value: edge.expected_sign || edge.sign || edge.expected_response || "-" },
               { label: "Desfase", value: formatSeconds(edge.lag_seconds ?? edge.lag) },
+              { label: "Ventana", value: formatSeconds(edge.window_seconds) },
             ]} />
           </article>
           <article className="modal-block">
@@ -1816,6 +1784,24 @@ function ContextEdgeModal({ edge, mapVersion, onClose }) {
             <Empty text="No se informaron subventanas de estabilidad para esta arista." />
           )}
         </article>
+        {edge.window_candidates?.length > 0 && (
+          <article className="modal-block">
+            <h3>Ventanas evaluadas</h3>
+            <p>Se elige la menor ventana que cumple los controles. Despues se seleccionan hasta cinco relaciones por entidad.</p>
+            {edge.window_candidates.map((candidate) => (
+              <div key={candidate.window_seconds}>
+                <strong>{formatSeconds(candidate.window_seconds)}{candidate.window_seconds === edge.window_seconds ? " · seleccionada" : ""}</strong>
+                <KeyValueGrid rows={[
+                  { label: "Observaciones", value: formatCount(candidate.n_observations) },
+                  { label: "Cobertura", value: formatContextPercent(candidate.coverage_ratio) },
+                  { label: "Asociacion", value: formatContextValue(candidate.association_signed) },
+                  { label: "Desfase", value: formatSeconds(candidate.lag_seconds) },
+                  { label: "Controles", value: candidate.threshold_eligible ? "cumple" : candidate.rejection_reasons.join(", ") },
+                ]} />
+              </div>
+            ))}
+          </article>
+        )}
       </section>
     </div>
   );
@@ -2175,18 +2161,12 @@ function contextHeatColor(value, scale) {
   return "rgba(148, 163, 184, 0.12)";
 }
 
-function formatContextMatrixValue(value, mode) {
+function formatContextMatrixValue(value) {
   const number = contextFiniteNumber(value);
   if (number === null) {
     return "N/D";
   }
-  if (mode === "association") {
-    return number.toFixed(2);
-  }
-  if (Math.abs(number) >= 10000 || (Math.abs(number) > 0 && Math.abs(number) < 0.001)) {
-    return number.toExponential(2);
-  }
-  return formatCalc(number);
+  return number.toFixed(2);
 }
 
 function contextEdgeSource(edge = {}) {

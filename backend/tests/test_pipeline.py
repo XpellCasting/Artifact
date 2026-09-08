@@ -791,7 +791,7 @@ class CargaHistorialTest(unittest.TestCase):
             )
             self.assertEqual(
                 cache["identity"]["contextual_filter_version"],
-                "contextual-spatiotemporal-v2",
+                "contextual-spatiotemporal-v3",
             )
             self.assertTrue(
                 cache["identity"]["contextual_implementation_sha256"]

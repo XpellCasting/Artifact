@@ -67,6 +67,7 @@ class ConfiguracionContextual:
     def como_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["window_candidates_seconds"] = list(self.window_candidates_seconds)
+        payload["window_selection"] = "smallest_eligible_else_smallest"
         payload["lag_candidates_seconds"] = [
             lag * self.window_seconds for lag in range(self.max_lag_windows + 1)
         ]
@@ -103,7 +104,7 @@ class FiltroContextualEspacioTemporal:
     observaciones futuras para explicar una sospecha.
     """
 
-    MAP_VERSION = "contextual-spatiotemporal-v2"
+    MAP_VERSION = "contextual-spatiotemporal-v3"
 
     def __init__(self, config: ConfiguracionContextual | None = None) -> None:
         self.config = config or ConfiguracionContextual()
@@ -189,9 +190,8 @@ class FiltroContextualEspacioTemporal:
         catalogo = self._catalogo(entidades, trabajo)
         signals, availability, stats, full_index = self._construir_senales(trabajo, catalogo)
         entity_ids = sorted(signals)
-        covariance = self._matriz_covarianza(signals, catalogo, entity_ids)
         temporal = self._calibrar_tiempos(trabajo, catalogo)
-        resolutions = {item["window_seconds"] for item in temporal.values()}
+        resolutions = set(self.config.ventanas())
         grids = {self.config.window_seconds: (signals, availability, stats, full_index)}
         for seconds in sorted(resolutions - grids.keys()):
             grids[seconds] = self._construir_senales(trabajo, catalogo, seconds)
@@ -201,22 +201,11 @@ class FiltroContextualEspacioTemporal:
             for target in entity_ids:
                 if source == target:
                     continue
-                seconds = max(temporal[source]["window_seconds"], temporal[target]["window_seconds"])
-                pair_signals, _, pair_stats, pair_index = grids[seconds]
-                relation = self._mejor_relacion(
-                    source,
-                    target,
-                    pair_signals[source],
-                    pair_signals[target],
-                    catalogo[source]["sensor_kind"],
-                    catalogo[target]["sensor_kind"],
-                    len(pair_index),
-                    window_seconds=seconds,
-                )
+                relation = self._seleccionar_ventana(source, target, catalogo, grids)
+                _, _, pair_stats, _ = grids[relation["window_seconds"]]
                 relation["source_stats"] = pair_stats[source]
                 relation["target_stats"] = pair_stats[target]
                 relation["max_age_seconds"] = temporal[target]["max_age_seconds"]
-                relation["raw_covariance"] = self._valor_matriz(covariance, source, target)
                 edges.append(relation)
 
         self._aplicar_top_k(edges)
@@ -254,7 +243,7 @@ class FiltroContextualEspacioTemporal:
                 }
             )
 
-        matrices = self._construir_matrices(entity_ids, covariance, edges)
+        matrices = self._construir_matrices(entity_ids, edges)
         fingerprint = self.fingerprint(trabajo, entidades)
         drift = self._comparar_mapas(mapa_anterior, edges, nodes)
         rebuild_reasons = [trigger] if trigger else []
@@ -593,23 +582,6 @@ class FiltroContextualEspacioTemporal:
             stats[entity_id] = node_stats
         return signals, availability, stats, full_index
 
-    def _matriz_covarianza(
-        self,
-        signals: dict[str, pd.Series],
-        catalogo: dict[str, dict[str, Any]],
-        entity_ids: list[str],
-    ) -> pd.DataFrame:
-        continuous = [
-            entity_id
-            for entity_id in entity_ids
-            if catalogo[entity_id]["sensor_kind"] == "continuous"
-        ]
-        if not continuous:
-            return pd.DataFrame()
-        frame = pd.concat([pd.to_numeric(signals[entity_id], errors="coerce") for entity_id in continuous], axis=1)
-        frame.columns = continuous
-        return frame.cov(min_periods=self.config.min_observations)
-
     def _calibrar_tiempos(self, eventos, catalogo) -> dict[str, dict[str, Any]]:
         """Politica acotada de cadencia, aprendida exclusivamente en Desarrollo.
 
@@ -663,6 +635,31 @@ class FiltroContextualEspacioTemporal:
             "fit_observations": len(train), "calibration_observations": len(calibration),
             "context_min": float(train["target"].min()), "context_max": float(train["target"].max()),
         }
+
+    def _seleccionar_ventana(self, source, target, catalogo, grids) -> dict[str, Any]:
+        candidates = []
+        for seconds in sorted(grids):
+            signals, _, _, index = grids[seconds]
+            candidates.append(self._mejor_relacion(
+                source, target, signals[source], signals[target],
+                catalogo[source]["sensor_kind"], catalogo[target]["sensor_kind"],
+                len(index), window_seconds=seconds,
+            ))
+        # La resolucion mas fina elegible prevalece sobre una correlacion mayor.
+        # Sin candidatas elegibles, mostrar la mas fina para auditar el rechazo.
+        selected = next((item for item in candidates if item["threshold_eligible"]), candidates[0])
+        selected["window_selection"] = "smallest_eligible_else_smallest"
+        selected["window_candidates"] = [
+            {key: item[key] for key in (
+                "window_seconds", "lag_seconds", "n_observations", "coverage_ratio",
+                "association_signed", "stable_slices", "sign_consistency",
+                "threshold_eligible", "rejection_reasons",
+            )} for item in candidates
+        ]
+        # Copiar motivos: top_k se aplica despues y no es un control de ventana.
+        for item in selected["window_candidates"]:
+            item["rejection_reasons"] = list(item["rejection_reasons"])
+        return selected
 
     def _mejor_relacion(
         self,
@@ -770,7 +767,6 @@ class FiltroContextualEspacioTemporal:
             "target_state": best.get("target_state"),
             "conditional_probability": self._redondear_o_none(conditional_probability),
             "cooccurrence_count": int(cooccurrence),
-            "raw_covariance": None,
             "threshold_eligible": threshold_eligible,
             "accepted": False,
             "rejection_reasons": rejection_reasons,
@@ -937,33 +933,26 @@ class FiltroContextualEspacioTemporal:
     def _construir_matrices(
         self,
         entity_ids: list[str],
-        covariance: pd.DataFrame,
         edges: list[dict[str, Any]],
     ) -> dict[str, Any]:
         edge_lookup = {(edge["source"], edge["target"]): edge for edge in edges}
-        covariance_values = []
         association_values = []
         accepted_values = []
         for source in entity_ids:
-            covariance_row = []
             association_row = []
             accepted_row = []
             for target in entity_ids:
                 if source == target:
-                    covariance_row.append(self._valor_matriz(covariance, source, target))
                     association_row.append(1.0)
                     accepted_row.append(True)
                     continue
                 edge = edge_lookup.get((source, target))
-                covariance_row.append(self._valor_matriz(covariance, source, target))
                 association_row.append(edge.get("association_signed") if edge else None)
                 accepted_row.append(bool(edge and edge.get("accepted")))
-            covariance_values.append(covariance_row)
             association_values.append(association_row)
             accepted_values.append(accepted_row)
         return {
             "entities": entity_ids,
-            "covariance": covariance_values,
             "association": association_values,
             "accepted": accepted_values,
         }
@@ -1542,13 +1531,6 @@ class FiltroContextualEspacioTemporal:
         if pd.isna(old) or pd.isna(new) or new <= old:
             return False
         return ((old.month - 1) // 3) != ((new.month - 1) // 3) or old.year != new.year
-
-    def _valor_matriz(
-        self, matrix: pd.DataFrame, source: str, target: str
-    ) -> float | None:
-        if matrix.empty or source not in matrix.index or target not in matrix.columns:
-            return None
-        return self._redondear_o_none(matrix.loc[source, target])
 
     def _timestamp_o_none(self, value: Any) -> str | None:
         return None if pd.isna(value) else pd.Timestamp(value).isoformat()

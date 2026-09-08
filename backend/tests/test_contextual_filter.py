@@ -84,7 +84,7 @@ class ContextualFilterTests(unittest.TestCase):
         )
         self.filtro = FiltroContextualEspacioTemporal(self.config)
 
-    def test_mapa_expone_regla_reproducible_covarianza_y_relacion_mixta(self):
+    def test_mapa_expone_regla_reproducible_asociacion_y_relacion_mixta(self):
         eventos, entidades = construir_historial()
 
         mapa = self.filtro.construir_mapa(eventos, entidades)
@@ -98,14 +98,16 @@ class ContextualFilterTests(unittest.TestCase):
         self.assertEqual(mapa["config"]["min_observations"], 30)
         self.assertIn("acceptance_rule", mapa["config"])
         self.assertEqual(
-            len(mapa["matrices"]["covariance"]),
+            len(mapa["matrices"]["association"]),
             len(mapa["matrices"]["entities"]),
         )
         temp_index = mapa["matrices"]["entities"].index("sensor.temperature")
         humidity_index = mapa["matrices"]["entities"].index("sensor.humidity")
         climate_index = mapa["matrices"]["entities"].index("binary_sensor.climate")
-        self.assertIsNotNone(mapa["matrices"]["covariance"][temp_index][humidity_index])
-        self.assertIsNone(mapa["matrices"]["covariance"][temp_index][climate_index])
+        self.assertIsNotNone(mapa["matrices"]["association"][temp_index][humidity_index])
+        self.assertIsNotNone(mapa["matrices"]["association"][temp_index][climate_index])
+        self.assertNotIn("covariance", mapa["matrices"])
+        self.assertTrue(all("raw_covariance" not in edge for edge in mapa["edges"]))
         mixed = next(
             edge
             for edge in mapa["edges"]
