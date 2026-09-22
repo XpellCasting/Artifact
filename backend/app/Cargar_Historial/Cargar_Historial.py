@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
+from ..Tipos_Entidad import infer_kind, KINDS
+from ..Estados_Validos import valid_state
 
 
 ESTADOS_INVALIDOS = {"", "unknown", "unavailable", "none", "null", "nan"}
@@ -196,7 +198,7 @@ class CargadorHistorial:
             42.0,
             f"{len(trabajo):,} filas con entidad y fecha validas",
         )
-        trabajo["is_valid_value"] = ~trabajo["state"].str.lower().isin(ESTADOS_INVALIDOS)
+        trabajo["is_valid_value"] = trabajo["state"].map(valid_state)
         # La fecha serializada tambien es una clave y un corte causal: no truncar.
         trabajo["timestamp"] = trabajo["timestamp_dt"].map(
             lambda value: value.isoformat().replace("+00:00", "Z")
@@ -209,32 +211,25 @@ class CargadorHistorial:
         dominio = dominio.mask(dominio.eq(""), trabajo["entity_id"].str.split(".").str[0].str.lower())
         estado = trabajo["state"].str.lower()
         valores_numericos = pd.to_numeric(estado, errors="coerce")
-        if "sensor_kind" in trabajo.columns:
-            sensor_kind_declarado = trabajo["sensor_kind"].astype(str).str.strip()
-        else:
-            sensor_kind_declarado = pd.Series("", index=trabajo.index)
-        sensor_kind_base = pd.Series("multistate", index=trabajo.index, dtype="object")
-        declarado_valido = sensor_kind_declarado.isin({"continuous", "binary", "multistate"})
-        sensor_kind_base.loc[declarado_valido] = sensor_kind_declarado.loc[declarado_valido]
-        sin_declarar = ~declarado_valido
-        sensor_kind_base.loc[sin_declarar & dominio.eq("binary_sensor")] = "binary"
-        sensor_kind_base.loc[sin_declarar & dominio.isin({"select", "input_select", "climate"})] = "multistate"
-        pendiente = sin_declarar & ~dominio.eq("binary_sensor") & ~dominio.isin({"select", "input_select", "climate"})
-        sensor_kind_base.loc[pendiente & valores_numericos.notna()] = "continuous"
-        sensor_kind_base.loc[pendiente & valores_numericos.isna() & estado.isin(ESTADOS_ACTIVOS | ESTADOS_INACTIVOS)] = "binary"
-        trabajo["_sensor_kind_candidate"] = sensor_kind_base.where(trabajo["is_valid_value"], "")
-        tipo_por_entidad = (
-            trabajo[trabajo["_sensor_kind_candidate"].ne("")]
-            .groupby("entity_id")["_sensor_kind_candidate"]
-            .first()
-            .to_dict()
-        )
-        trabajo["sensor_kind"] = trabajo["_sensor_kind_candidate"]
-        trabajo["sensor_kind"] = trabajo["sensor_kind"].mask(
-            trabajo["sensor_kind"].eq(""),
-            trabajo["entity_id"].map(tipo_por_entidad),
-        )
-        trabajo["sensor_kind"] = trabajo["sensor_kind"].fillna(sensor_kind_base)
+        tipo_por_entidad = {}
+        for entity_id, grupo in trabajo.groupby("entity_id", sort=False):
+            def metadata(column):
+                if column not in grupo:
+                    return ""
+                values = grupo[column].astype(str).str.strip()
+                values = values[values.ne("")]
+                return values.iloc[0] if len(values) else ""
+
+            declarations = set(grupo["sensor_kind"].astype(str).str.strip().str.lower()) & KINDS if "sensor_kind" in grupo else set()
+            if len(declarations) > 1:
+                raise ValueError(f"Tipos declarados incompatibles para {entity_id}: {sorted(declarations)}")
+            valid_states = grupo.loc[grupo["is_valid_value"], "state"].unique()
+            tipo_por_entidad[entity_id] = infer_kind(
+                str(entity_id), valid_states, declared=next(iter(declarations), ""),
+                domain=metadata("domain"), unit=metadata("unit_of_measurement"),
+                device_class=metadata("device_class"),
+            )
+        trabajo["sensor_kind"] = trabajo["entity_id"].map(tipo_por_entidad)
         self._reportar_progreso(
             progress_callback,
             "classifying_entities",
@@ -339,20 +334,9 @@ class CargadorHistorial:
             callback(phase, float(progress), message)
 
     def _clasificar_fila(self, fila: pd.Series) -> str:
-        if str(fila.get("sensor_kind", "")).strip() in {"continuous", "binary", "multistate"}:
-            return str(fila["sensor_kind"]).strip()
-        estado = str(fila.get("state", "")).strip().lower()
-        entity_id = str(fila.get("entity_id", "")).lower()
-        dominio = str(fila.get("domain", "")).lower() or entity_id.split(".")[0]
-        if dominio == "binary_sensor":
-            return "binary"
-        if dominio in {"select", "input_select", "climate"}:
-            return "multistate"
-        if pd.to_numeric(pd.Series([estado]), errors="coerce").notna().iloc[0]:
-            return "continuous"
-        if estado in ESTADOS_ACTIVOS or estado in ESTADOS_INACTIVOS:
-            return "binary"
-        return "multistate"
+        return infer_kind(str(fila.get("entity_id", "")), [fila.get("state", "")],
+                          declared=fila.get("sensor_kind", ""), domain=fila.get("domain", ""),
+                          unit=fila.get("unit_of_measurement", ""), device_class=fila.get("device_class", ""))
 
     def _valor_numerico(self, fila: pd.Series) -> float | None:
         tipo = str(fila["sensor_kind"])

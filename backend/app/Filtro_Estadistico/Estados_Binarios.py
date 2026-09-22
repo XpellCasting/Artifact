@@ -109,6 +109,7 @@ class FiltroEstadoBinarioEstadistico:
                 resultados.append(
                     {
                         "entity_id": entity_id,
+                        "source_raw_index": fila.get("_raw_index"),
                         "timestamp": str(fila["timestamp"]),
                         "window_start": str(fila["window_start"]),
                         "window_end": str(fila["timestamp"]),
@@ -202,9 +203,10 @@ class FiltroEstadoBinarioEstadistico:
             0.0,
         )
 
-        salida = trabajo[
-            ["entity_id", "timestamp", "timestamp_dt", "state", "value"]
-        ].copy()
+        columnas = ["entity_id", "timestamp", "timestamp_dt", "state", "value"]
+        if "_raw_index" in trabajo.columns:
+            columnas.append("_raw_index")
+        salida = trabajo[columnas].copy()
         salida["window_start"] = (
             trabajo["timestamp_dt"]
             - pd.Timedelta(seconds=perfil.window_seconds)

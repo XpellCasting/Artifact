@@ -4,23 +4,20 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
-  Clock3,
   Download,
   X,
   Database,
   Eye,
   FlaskConical,
+  GitBranch,
   Loader2,
-  Pause,
-  Play,
   RotateCcw,
-  SkipForward,
-  Upload,
   Zap,
 } from "lucide-react";
 import { downloadCsv } from "./csv.js";
 import ReviewWorkspace from "./ReviewWorkspace.jsx";
 import DiagnosticWorkspace from "./DiagnosticWorkspace.jsx";
+import FlowLab from "./FlowLab.jsx";
 import { isStatisticalSuspicion, statisticalCounts, episodeLabel } from "./statistical-routing.js";
 import { isEnvironmentalResult, contextRoutingLabel, contextRoutingReasonLabel, contextRoutingCounts, contextCoherenceLabel, contextObservationLabel, preciseContextTimestamp, contextCommonCause } from "./context-routing.js";
 import "./styles.css";
@@ -314,7 +311,6 @@ function App() {
     ? analyzedSuspicionThreshold
     : suspicionThreshold;
   const [validationAutoRunning, setValidationAutoRunning] = useState(false);
-  const [validationBatchSize, setValidationBatchSize] = useState(1000);
   const continuousEntities = useMemo(
     () => entities.filter((entity) => entity.sensor_kind === "continuous"),
     [entities],
@@ -723,6 +719,24 @@ function App() {
     setContextResults(contextual.items || []);
   }
 
+  async function uploadLabelledEvaluation(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setValidationAutoRunning(false);
+    await runStep("labelled-upload", async () => {
+      const response = await fetch(`${API_BASE_URL}/validation/labelled/upload`, {
+        method: "POST", headers: { "Content-Type": "text/csv", "X-Filename": encodeURIComponent(file.name) }, body: file,
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "No se pudo cargar el conjunto etiquetado.");
+      setHistoricalResults([]); setContextResults([]); setContextSummary(null);
+      applyValidationPipeline(payload);
+      setValidationUpload({ status: "completed", progress: 100, message: "Datos etiquetados cargados; eventos futuros preparados sin etiquetas", file_size_bytes: file.size });
+      return payload;
+    });
+    event.target.value = "";
+  }
+
   async function uploadValidationHistory(event) {
     const file = event.target.files?.[0];
     if (!file) {
@@ -775,67 +789,12 @@ function App() {
     event.target.value = "";
   }
 
-  async function advanceValidationReplay() {
-    return runStep("validation-advance", async () => {
-      const payload = await api("/validation/replay/advance", {
-        method: "POST",
-        body: JSON.stringify({
-          batch_size: validationBatchSize,
-          suspicion_threshold: suspicionThreshold,
-          suspicion_quiet_seconds: suspicionQuietMinutes * 60,
-        }),
-      });
-      applyValidationPipeline(payload);
-      return payload;
-    });
-  }
-
-  async function toggleValidationReplay() {
-    if (validationAutoRunning || validationReplay?.status === "running") {
-      setValidationAutoRunning(false);
-      return runStep("validation-pause", async () => {
-        const payload = await api("/validation/replay/pause", { method: "POST" });
-        applyValidationPipeline(payload);
-        await loadValidationResultPages();
-        return payload;
-      });
-    }
-    return runStep("validation-start", async () => {
-      const payload = await api("/validation/replay/start", {
-        method: "POST",
-        body: JSON.stringify({
-          batch_size: validationBatchSize,
-          suspicion_threshold: suspicionThreshold,
-          suspicion_quiet_seconds: suspicionQuietMinutes * 60,
-        }),
-      });
-      applyValidationPipeline(payload);
-      return payload;
-    });
-  }
-
-  async function resetValidationReplay() {
-    setValidationAutoRunning(false);
-    return runStep("validation-reset", async () => {
-      const payload = await api("/validation/replay/reset", { method: "POST" });
-      setHistoricalResults([]);
-      setContextResults([]);
-      setContextSummary(null);
-      applyValidationPipeline(payload);
-      return payload;
-    });
-  }
-
   return (
     <main className="app-shell">
       <header className="app-header">
         <div>
-          <span className="eyebrow">Artefacto de tesis</span>
-          <h1>Filtro estadistico-temporal para entidades continuas y de estado</h1>
-          <p>
-            Flujo actual: cargar un conjunto de datos reales, respetar su orden temporal y revisar
-            las decisiones de los filtros estadístico y contextual y el diagnóstico de patrones de falla.
-          </p>
+          <span className="eyebrow"></span>
+          <h1>Filtro estadistico-temporal</h1>
         </div>
       </header>
 
@@ -868,12 +827,16 @@ function App() {
         <ModuleTab
           active={activeModule === "revision"}
           icon={<Eye size={17} />}
-          label="Revisión y etiquetado"
+          label="Analisis y etiquetado"
           onClick={() => setActiveModule("revision")}
         />
+        <ModuleTab active={activeModule === "evaluacion"} icon={<BarChart3 size={17} />} label="Evaluación" onClick={() => setActiveModule("evaluacion")} />
+        <ModuleTab active={activeModule === "flujos"} icon={<GitBranch size={17} />} label="Evaluación de flujos" onClick={() => setActiveModule("flujos")} />
       </nav>
 
-      {activeModule === "estadistico" ? (
+      {activeModule === "flujos" ? (
+        <FlowLab apiBaseUrl={API_BASE_URL} historyReady={Boolean(historyStatus?.exists && historyStatus?.future_evaluation_ready)} replay={validationReplay} upload={validationUpload} uploadBusy={Boolean(busy)} onUpload={uploadValidationHistory} onLabelledUpload={uploadLabelledEvaluation} />
+      ) : activeModule === "estadistico" ? (
         <>
           <section className="metric-grid">
             <Metric icon={<Database />} label="Datos historicos" value={formatCount(historyStatus?.rows)} detail={formatHistoryRange(historyStatus)} />
@@ -886,7 +849,6 @@ function App() {
             value={suspicionThreshold}
             analyzedValue={Number.isFinite(analyzedSuspicionThreshold) ? analyzedSuspicionThreshold : null}
             busy={Boolean(busy)}
-            replay={validationReplay}
             onChange={updateSuspicionThreshold}
           />
           <EpisodeGroupingControl
@@ -895,67 +857,6 @@ function App() {
             busy={Boolean(busy)}
             summary={statisticalSummary}
             replay={validationReplay}
-          />
-
-          <section className="workspace-grid lower single">
-            <Panel title="Conjunto de datos real">
-              <div className="history-summary">
-                <SummaryRow label="API" value={health?.status || "-"} />
-                <SummaryRow label="Origen" value={historyStatus?.source_type || "-"} />
-                <SummaryRow label="Filas" value={formatCount(historyStatus?.rows)} />
-                <SummaryRow label="Filas normalidad" value={formatCount(historyStatus?.normality_history?.rows)} />
-                <SummaryRow label="Entidades" value={formatCount(historyStatus?.entity_count || entities.length)} />
-                <SummaryRow label="Rango" value={formatHistoryRange(historyStatus)} />
-              </div>
-              <div className="button-row">
-                <StepButton id="real-history" busy={busy} onClick={loadRealHistory} icon={<Database size={17} />} label="Cargar historico real" />
-                <label className="file-action">
-                  Subir historico real
-                  <input type="file" accept=".csv,text/csv" onChange={uploadRealHistory} disabled={Boolean(busy)} />
-                </label>
-                <StepButton id="analyze-history" busy={busy} onClick={analyzeHistory} icon={<BarChart3 size={17} />} label="Analizar historico" disabled={!historyStatus?.exists} />
-                <StepButton id="normalization-preview" busy={busy} onClick={openNormalizationPreview} icon={<Eye size={17} />} label="Ver normalizacion" disabled={!historyStatus?.exists} />
-                <StepButton id="continuous-config" busy={busy} onClick={loadContinuousConfig} icon={<Eye size={17} />} label="Parametros continuos" disabled={!historyStatus?.exists} />
-              </div>
-              {historyLoad && <HistoryLoadProgress job={historyLoad} />}
-              {continuousConfig.length > 0 && (
-                <ContinuousConfigEditor
-                  configs={continuousConfig}
-                  busy={busy}
-                  onChange={updateContinuousConfig}
-                  onSave={saveContinuousConfig}
-                />
-              )}
-              <div className="entity-list compact">
-                {analyzableEntities.map((entity) => (
-                  <div className="entity-row" key={entity.entity_id}>
-                    <span>
-                      <strong>{entity.entity_id}</strong>
-                      <small>{entityLabel(entity)} / {entity.unit_of_measurement || entity.unit || "sin unidad"}</small>
-                    </span>
-                  </div>
-                ))}
-                {!analyzableEntities.length && <Empty text="No hay entidades continuas, binarias o multivaloricas cargadas." />}
-              </div>
-            </Panel>
-          </section>
-
-          <FutureEvaluationControl
-            replay={validationReplay}
-            upload={validationUpload}
-            historyReady={Boolean(
-              historyStatus?.exists && historyStatus?.future_evaluation_ready
-            )}
-            busy={busy}
-            autoRunning={validationAutoRunning}
-            batchSize={validationBatchSize}
-            suspicionThreshold={suspicionThreshold}
-            onUpload={uploadValidationHistory}
-            onAdvance={advanceValidationReplay}
-            onReset={resetValidationReplay}
-            onToggleAuto={toggleValidationReplay}
-            onBatchSize={setValidationBatchSize}
-            onOpenModule={setActiveModule}
           />
 
           <section className="charts-panel">
@@ -1022,6 +923,52 @@ function App() {
             </Panel>
           </section>
         </>
+      ) : activeModule === "evaluacion" ? (
+        <>
+          <section className="workspace-grid lower single">
+            <Panel title="Conjunto de datos">
+              <div className="history-summary">
+                <SummaryRow label="API" value={health?.status || "-"} />
+                <SummaryRow label="Origen" value={historyStatus?.source_type || "-"} />
+                <SummaryRow label="Filas" value={formatCount(historyStatus?.rows)} />
+                <SummaryRow label="Filas normalidad" value={formatCount(historyStatus?.normality_history?.rows)} />
+                <SummaryRow label="Entidades" value={formatCount(historyStatus?.entity_count || entities.length)} />
+                <SummaryRow label="Base de normalidad" value={historyStatus?.baseline_id ? historyStatus.baseline_id.slice(0, 16) : "Sin procedencia registrada"} />
+                <SummaryRow label="Rango" value={formatHistoryRange(historyStatus)} />
+              </div>
+              <div className="button-row">
+                <StepButton id="real-history" busy={busy} onClick={loadRealHistory} icon={<Database size={17} />} label="Cargar historico" />
+                <label className="file-action">
+                  Subir historico
+                  <input type="file" accept=".csv,text/csv" onChange={uploadRealHistory} disabled={Boolean(busy)} />
+                </label>
+                <StepButton id="analyze-history" busy={busy} onClick={analyzeHistory} icon={<BarChart3 size={17} />} label="Analizar historico" disabled={!historyStatus?.exists} />
+                <StepButton id="normalization-preview" busy={busy} onClick={openNormalizationPreview} icon={<Eye size={17} />} label="Ver normalizacion" disabled={!historyStatus?.exists} />
+                <StepButton id="continuous-config" busy={busy} onClick={loadContinuousConfig} icon={<Eye size={17} />} label="Parametros continuos" disabled={!historyStatus?.exists} />
+              </div>
+              {historyLoad && <HistoryLoadProgress job={historyLoad} />}
+              {continuousConfig.length > 0 && (
+                <ContinuousConfigEditor
+                  configs={continuousConfig}
+                  busy={busy}
+                  onChange={updateContinuousConfig}
+                  onSave={saveContinuousConfig}
+                />
+              )}
+              <div className="entity-list compact">
+                {analyzableEntities.map((entity) => (
+                  <div className="entity-row" key={entity.entity_id}>
+                    <span>
+                      <strong>{entity.entity_id}</strong>
+                      <small>{entityLabel(entity)} / {entity.unit_of_measurement || entity.unit || "sin unidad"}</small>
+                    </span>
+                  </div>
+                ))}
+                {!analyzableEntities.length && <Empty text="No hay entidades continuas, binarias o multivaloricas cargadas." />}
+              </div>
+            </Panel>
+          </section>
+        </>
       ) : activeModule === "contextual" ? (
         <ContextualWorkspace
           mapData={contextMap}
@@ -1083,8 +1030,6 @@ function EpisodeGroupingControl({ minutes, onChange, busy, summary, replay }) {
       <div>
         <span className="eyebrow">Salida del filtro estadistico</span>
         <h2 id="episode-grouping-title">Agrupar sospechas repetidas</h2>
-        <p>La primera sospecha de cada entidad y patron se envia al filtro contextual.
-          Las repeticiones actualizan su episodio. Se abre otro tras el lapso elegido sin nuevas sospechas del mismo patron.</p>
       </div>
       <label>
         Tiempo sin repeticion para abrir otro episodio
@@ -1103,22 +1048,17 @@ function EpisodeGroupingControl({ minutes, onChange, busy, summary, replay }) {
         <SummaryRow label="Enviadas a F2" value={formatCount(summary.forwarded)} />
         <SummaryRow label="Repeticiones agrupadas" value={formatCount(summary.suppressed)} />
       </div>
-      <p className="episode-grouping-note">F1 sigue evaluando todas las lecturas. Otro patron abre un episodio distinto.
-        El tiempo se mide con las fechas de los datos; pausar la reproduccion no cierra episodios.
-        Esta agrupacion se aplica despues de la supresion breve que F1 ya realiza.
-        {started ? ` Esta ejecucion conserva ${activeMinutes ? `${activeMinutes} minutos` : "la agrupacion desactivada"}; reinicia para aplicar otro valor.`
-          : " El ajuste se aplica al analizar el historico o iniciar una nueva evaluacion."}</p>
+      {started && activeMinutes !== minutes && (
+        <p className="episode-grouping-note">
+          Esta ejecucion conserva {activeMinutes ? `${activeMinutes} minutos` : "la agrupacion desactivada"}.
+        </p>
+      )}
     </section>
   );
 }
 
-function SuspicionThresholdControl({ value, analyzedValue, busy, replay, onChange }) {
+function SuspicionThresholdControl({ value, analyzedValue, busy, onChange }) {
   const percent = Math.round(value * 1000) / 10;
-  const replayStarted = Number(replay?.processed_rows || 0) > 0;
-  const replayThreshold = Number(replay?.suspicion_threshold);
-  const activeReplayThreshold = Number.isFinite(replayThreshold)
-    ? formatSuspicionPercent(replayThreshold)
-    : formatSuspicionPercent(value);
   const pendingAnalysis = analyzedValue !== null && analyzedValue !== value;
 
   return (
@@ -1126,10 +1066,6 @@ function SuspicionThresholdControl({ value, analyzedValue, busy, replay, onChang
       <div className="suspicion-threshold-copy">
         <span className="eyebrow">Filtro 1 · estadistico-temporal</span>
         <h2 id="suspicion-threshold-title">Umbral de sospecha</h2>
-        <p>
-          Una lectura se considera sospechosa cuando su score alcanza este valor.
-          Un umbral menor detecta más casos; uno mayor exige más evidencia.
-        </p>
       </div>
       <div className="suspicion-threshold-inputs">
         <output aria-live="polite">{formatSuspicionPercent(value)}</output>
@@ -1144,7 +1080,7 @@ function SuspicionThresholdControl({ value, analyzedValue, busy, replay, onChang
             onChange={(event) => onChange(event.target.value)}
             disabled={busy}
           />
-          <small><span>1 % · sensible</span><span>99 % · estricto</span></small>
+          <small><span>1 %</span><span>99 %</span></small>
         </label>
         <label className="suspicion-number-label">
           <span>Valor (%)</span>
@@ -1168,187 +1104,13 @@ function SuspicionThresholdControl({ value, analyzedValue, busy, replay, onChang
           Restaurar 60 %
         </button>
       </div>
-      <p className="suspicion-threshold-note">
-        {pendingAnalysis
-          ? `Los resultados visibles se calcularon con ${formatSuspicionPercent(analyzedValue)}. Pulsa “Analizar histórico” para aplicar ${formatSuspicionPercent(value)}.`
-          : "Se usará al analizar el histórico y al iniciar una nueva evaluación."} {replayStarted
-          ? `La evaluación en curso conserva ${activeReplayThreshold}; reiníciala para aplicar este valor desde el primer evento.`
-          : "El valor se envía al backend y forma parte de la identidad de la caché del análisis."}
-      </p>
+      {pendingAnalysis && (
+        <p className="suspicion-threshold-note">
+          Resultados mostrados calculados con {formatSuspicionPercent(analyzedValue)}. Pulsa “Analizar historico” para aplicar {formatSuspicionPercent(value)}.
+        </p>
+      )}
     </section>
   );
-}
-
-function FutureEvaluationControl({
-  replay,
-  upload,
-  historyReady,
-  busy,
-  autoRunning,
-  batchSize,
-  suspicionThreshold,
-  onUpload,
-  onAdvance,
-  onReset,
-  onToggleAuto,
-  onBatchSize,
-  onOpenModule,
-}) {
-  const loaded = Boolean(replay?.loaded);
-  const completed = replay?.status === "completed";
-  const progress = Math.min(100, Math.max(0, Number(replay?.progress || 0)));
-  const uploadProgress = Math.min(100, Math.max(0, Number(upload?.progress || 0)));
-  const lastBatch = replay?.last_batch || null;
-  const pipeline = replay?.pipeline_summary || {};
-  const activeThreshold = Number(replay?.suspicion_threshold);
-
-  return (
-    <section className="workspace-grid lower single future-evaluation-control">
-      <Panel title="Evaluacion con eventos futuros">
-        <div className="future-evaluation-heading">
-          <div className="validation-replay-icon"><Clock3 size={22} /></div>
-          <div>
-            <span className="eyebrow">Continuacion causal del historico cargado</span>
-            <p>
-              Sube los eventos posteriores al historico. Al avanzar, las sospechas pasan por los
-              filtros Estadistico y Contextual. Los ambientales se cierran con alerta informativa;
-              el resto se evalúa en el clasificador diagnóstico.
-            </p>
-          </div>
-          <span className="validation-replay-badge">
-            {loaded ? replayStatusText(replay.status) : "sin evaluacion"}
-          </span>
-        </div>
-
-        <div className="validation-upload-row">
-          <label className="file-action validation-file-action">
-            <Upload size={17} />
-            Subir eventos de Evaluacion
-            <input
-              type="file"
-              accept=".csv,text/csv"
-              onChange={onUpload}
-              disabled={!historyReady || Boolean(busy) || autoRunning}
-            />
-          </label>
-          <span>
-            {loaded
-              ? `${replay.filename} · ${formatCount(replay.rows)} eventos futuros`
-              : historyReady
-                ? "Deben comenzar despues del ultimo timestamp del historico cargado"
-                : "Espera a que el historico termine de preparar el estado del detector"}
-          </span>
-        </div>
-
-        {upload && (
-          <div className={`validation-upload-progress ${upload.status === "completed" ? "ready" : ""}`}>
-            <div className="history-load-heading">
-              <span>{upload.message}</span>
-              <strong>{Math.round(uploadProgress)}%</strong>
-            </div>
-            <div className="progress-track"><span style={{ width: `${uploadProgress}%` }} /></div>
-            <small>{formatBytes(upload.file_size_bytes)}</small>
-          </div>
-        )}
-
-        {loaded && (
-          <>
-            <div className="future-evaluation-status">
-              <SummaryRow label="Historico disponible hasta" value={shortDate(replay.development_end)} />
-              <SummaryRow label="Reloj de Evaluacion" value={shortDate(replay.current_timestamp)} />
-              <SummaryRow label="Procesados" value={`${formatCount(replay.processed_rows)} / ${formatCount(replay.rows)}`} />
-              <SummaryRow label="Rendimiento ultimo lote" value={lastBatch ? `${formatCount(Math.round(lastBatch.events_per_second))} eventos/s` : "-"} />
-            </div>
-
-            <div className="validation-progress-wrap future-evaluation-progress">
-              <div className="progress-track" role="progressbar" aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100">
-                <span style={{ width: `${progress}%` }} />
-              </div>
-              <strong>{progress.toFixed(2)}%</strong>
-            </div>
-
-            <div className="validation-controls future-evaluation-actions">
-              <label>
-                Eventos por avance
-                <select value={batchSize} onChange={(event) => onBatchSize(Number(event.target.value))} disabled={autoRunning || Boolean(busy)}>
-                  <option value="100">100 · detallado</option>
-                  <option value="500">500</option>
-                  <option value="1000">1.000 · normal</option>
-                  <option value="5000">5.000 · rapido</option>
-                  <option value="10000">10.000 · maximo</option>
-                </select>
-              </label>
-              <div className="validation-control-buttons">
-                <button className="primary-action" type="button" onClick={onToggleAuto} disabled={completed || (Boolean(busy) && !autoRunning)}>
-                  {autoRunning ? <Pause size={17} /> : <Play size={17} />}
-                  {autoRunning ? "Pausar" : "Reproducir"}
-                </button>
-                <button className="secondary-action" type="button" onClick={onAdvance} disabled={completed || autoRunning || Boolean(busy)}>
-                  {busy === "validation-advance" ? <Loader2 className="spin" size={17} /> : <SkipForward size={17} />}
-                  Un avance
-                </button>
-                <button className="secondary-action" type="button" onClick={onReset} disabled={autoRunning || Boolean(busy)}>
-                  <RotateCcw size={17} />
-                  Reiniciar
-                </button>
-              </div>
-            </div>
-
-            <div className="future-pipeline-strip" aria-label="Avance por el pipeline existente">
-              <button type="button" onClick={() => onOpenModule("estadistico")}>
-                <span>1 · Estadistico</span>
-                <strong>{formatCount(pipeline.statistical || 0)}</strong>
-                <small>sospechas</small>
-              </button>
-              <i aria-hidden="true">→</i>
-              <button type="button" onClick={() => onOpenModule("contextual")}>
-                <span>2 · Contextual</span>
-                <strong>{formatCount(pipeline.contextual || 0)}</strong>
-                <small>evaluadas</small>
-              </button>
-              <i aria-hidden="true">→</i>
-              <button type="button" onClick={() => onOpenModule("clasificador")}>
-                <span>3 · Clasificador</span>
-                <strong>{formatCount(pipeline.classifier || 0)}</strong>
-                <small>evaluados por F3</small>
-              </button>
-            </div>
-            <p className="validation-results-note">
-              {formatCount(pipeline.environmental || 0)} anomalías ambientales cerradas en Contextual.
-              {pipeline.grouping && <> {formatCount(pipeline.grouping.suppressed)} repeticiones agrupadas; {formatCount(pipeline.grouping.forwarded)} sospechas enviadas a F2.</>}
-              {formatCount(pipeline.pending_classification || 0)} sospechas pendientes de diagnóstico.
-              Umbral estadistico de esta reproducción: {formatSuspicionPercent(
-                Number.isFinite(activeThreshold) ? activeThreshold : suspicionThreshold,
-              )}.
-            </p>
-          </>
-        )}
-
-        {!loaded && !upload && (
-          <Empty text="Carga primero el historico de Desarrollo y luego sube sus eventos futuros de Evaluacion." />
-        )}
-      </Panel>
-    </section>
-  );
-}
-
-function replayStatusText(status) {
-  if (status === "ready") {
-    return "listo para iniciar";
-  }
-  if (status === "running") {
-    return "reproduccion en curso";
-  }
-  if (status === "completed") {
-    return "reproduccion completada";
-  }
-  if (status === "paused") {
-    return "reproduccion pausada";
-  }
-  if (status === "failed") {
-    return "reproduccion con error";
-  }
-  return status || "sin archivo";
 }
 
 function ContextualWorkspace({ mapData, results, summary, busy, error, onReload, onRebuild }) {
@@ -1388,10 +1150,10 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
           <h2>{!hasMap ? "Mapa contextual no disponible" : stale ? "Mapa contextual obsoleto" : "Mapa contextual vigente"}</h2>
           <p>
             {!hasMap
-              ? "Construye el mapa desde el historico normalizado antes de evaluar las sospechas estadisticas."
+              ? "Sin mapa generado."
               : stale
-                ? `Las decisiones deben interpretarse con cautela${staleReasons.length ? `: ${staleReasons.join(", ")}` : "."}`
-                : `Version ${mapData?.map_version || "-"} construida ${contextBuiltAtText(mapData)}. Las asociaciones son evidencia contextual, no causalidad.`}
+                ? (staleReasons.length ? staleReasons.join(", ") : "Mapa desactualizado.")
+                : `Version ${mapData?.map_version || "-"} (${contextBuiltAtText(mapData)})`}
           </p>
           {error && <small className="context-inline-error">{error}</small>}
         </div>
@@ -1438,7 +1200,7 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
           icon={<AlertTriangle />}
           label="Cobertura insuficiente"
           value={formatCount(outcomeCounts.cobertura_insuficiente)}
-          detail="no equivale a contradiccion"
+          detail=""
         />
         <Metric
           icon={<Eye />}
@@ -1453,29 +1215,18 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
           <div className="context-outcome-card respaldado">
             <span>Anomalias ambientales</span>
             <strong>{formatCount(routingCounts.environmental)}</strong>
-            <small>Alerta informativa · terminan en F2</small>
+            <small>Filtro 2</small>
           </div>
           <div className="context-outcome-card no_explicado">
             <span>Pendientes de clasificacion</span>
             <strong>{formatCount(routingCounts.pending)}</strong>
-            <small>Futuro filtro 3 · sin ejecutar</small>
+            <small>Filtro 3</small>
           </div>
         </div>
-        <p className="context-method-note">
-          Las alertas ambientales quedan registradas aqui, sin enviar estos datos al clasificador.
-          No se envian notificaciones a Home Assistant. Los casos ambiguos conservan su evidencia
-          y quedan pendientes; aun no se ha elegido el modelo de la tercera etapa.
-        </p>
       </Panel>
 
       <section className="context-main-grid">
         <Panel title="Mapa de asociaciones">
-          <div className="context-panel-intro">
-            <p>
-              Asociaciones entre sensores en una escala de -1 a 1. Las marcas distinguen las relaciones
-              aceptadas de las que no cumplen los controles.
-            </p>
-          </div>
           <ContextMatrix mapData={mapData} onSelectEdge={setSelectedEdge} />
         </Panel>
 
@@ -1500,10 +1251,6 @@ function ContextualWorkspace({ mapData, results, summary, busy, error, onReload,
               <Empty text="El backend aun no informa la configuracion del mapa." />
             )}
           </div>
-          <p className="context-method-note">
-            Una arista debe exponer observaciones, cobertura, fuerza y estabilidad antes de ingresar al top-k.
-            El frontend presenta estos valores; no completa parametros ausentes ni presume causalidad.
-          </p>
         </Panel>
       </section>
 
@@ -1653,9 +1400,6 @@ function ContextMatrix({ mapData, onSelectEdge }) {
         <div aria-hidden="true" />
         <span>{formatContextMatrixValue(scale)}</span>
       </div>
-      <p className="context-matrix-note">
-        Haz clic en una celda para ver la metrica de asociacion, muestra, ventana, desfase y controles de aceptacion.
-      </p>
     </>
   );
 }
@@ -1733,7 +1477,6 @@ function ContextEdgeModal({ edge, mapVersion, onClose }) {
           <div>
             <span>Arista del mapa · version {mapVersion || "-"}</span>
             <h2>{contextEdgeSource(edge)} ↔ {contextEdgeTarget(edge)}</h2>
-            <small>Asociacion historica utilizada como evidencia contextual, no como atribucion causal.</small>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Cerrar detalle">
             <X size={18} />
@@ -1787,7 +1530,6 @@ function ContextEdgeModal({ edge, mapVersion, onClose }) {
         {edge.window_candidates?.length > 0 && (
           <article className="modal-block">
             <h3>Ventanas evaluadas</h3>
-            <p>Se elige la menor ventana que cumple los controles. Despues se seleccionan hasta cinco relaciones por entidad.</p>
             {edge.window_candidates.map((candidate) => (
               <div key={candidate.window_seconds}>
                 <strong>{formatSeconds(candidate.window_seconds)}{candidate.window_seconds === edge.window_seconds ? " · seleccionada" : ""}</strong>
@@ -1835,11 +1577,6 @@ function ContextResultModal({ result, fallbackMapStale, onClose }) {
         <article className="modal-block">
           <h3>{contextRoutingLabel(result)}</h3>
           <p>{contextRoutingReasonLabel(result)}</p>
-          <p className="context-method-note">
-            {isEnvironmentalResult(result)
-              ? "Alerta informativa registrada. Evento cerrado por el filtro contextual; no llega al clasificador."
-              : "La sospecha continúa al clasificador diagnóstico, que propone un patrón compatible o se abstiene si la evidencia es insuficiente."}
-          </p>
         </article>
 
         <div className="modal-score-grid">
@@ -1850,6 +1587,24 @@ function ContextResultModal({ result, fallbackMapStale, onClose }) {
           <SummaryRow label="Cobertura" value={coverage.ratio === null ? "-" : formatContextPercent(coverage.ratio)} />
           <SummaryRow label="Vigencia del mapa" value={stale ? "obsoleto" : "vigente"} />
         </div>
+
+        {result.decision_method && (
+          <article className="modal-block">
+            <h3>Decisión contextual calibrada</h3>
+            <KeyValueGrid rows={[
+              { label: "Método", value: result.decision_method },
+              { label: "Familias disponibles", value: (result.available_families || []).join(", ") || "ninguna" },
+              { label: "Puntuación determinante", value: formatContextValue(result.decision_score) },
+              { label: "Umbral calibrado", value: formatContextValue(result.decision_threshold) },
+              { label: "Calibración", value: result.decision_calibration?.status || "no disponible" },
+              { label: "Exclusiones", value: formatCount((result.decision_exclusions || []).length) },
+            ]} />
+            <KeyValueGrid rows={Object.entries(result.family_scores || {}).map(([family, score]) => ({
+              label: `${family}: puntuación / cobertura`,
+              value: `${formatContextValue(score?.score)} / ${formatContextPercent(score?.coverage)}`,
+            }))} />
+          </article>
+        )}
 
         <div className="modal-columns">
           <article className="modal-block">
@@ -1862,23 +1617,18 @@ function ContextResultModal({ result, fallbackMapStale, onClose }) {
               { label: "Estado", value: coverage.status || (outcome === "cobertura_insuficiente" ? "insuficiente" : "suficiente") },
               { label: "Sin evidencia", value: formatCount(unknowns.length) },
             ]} />
-            <p className="context-method-note">
-              Falta de cobertura no se interpreta como contradiccion. Una contradiccion exige evidencia observable
-              incompatible con el signo, estado, secuencia o magnitud historicamente esperada.
-              Sin evidencia, la coherencia no es evaluable: no representa un 50 % de respaldo.
-            </p>
           </article>
           <article className="modal-block">
             <h3>Causa comun</h3>
             <ContextStatusBadge value={commonCause.key} label={commonCause.label} />
             <KeyValueGrid rows={[
               { label: "Identificable", value: commonCause.identifiable ? "si" : "no" },
-              { label: "Coincidencia contextual", value: commonCause.coincidence ? "Detectada; no implica causa comun" : "No detectada" },
+              { label: "Coincidencia contextual", value: commonCause.coincidence ? "Detectada" : "No detectada" },
               { label: "Ventana pasada", value: formatSeconds(commonCause.windowSeconds) },
               { label: "Entidades relacionadas observadas", value: commonCause.entities.join(", ") || "-" },
               { label: "Evidencia independiente", value: commonCause.independentEvidence ? "disponible" : "no disponible" },
               { label: "Dominio identificado", value: commonCause.domain || "Ninguno" },
-              { label: "Detalle", value: commonCause.detail || "El historico correlacional no permite atribuir una causa comun por si solo." },
+              { label: "Detalle", value: commonCause.detail || "-" },
             ]} />
           </article>
         </div>
@@ -2654,7 +2404,6 @@ function CalculationModal({ result, onClose }) {
               </div>
             ))}
           </div>
-          <p className="calc-note">{calculationSummary(result)}</p>
         </article>
 
         <article className="modal-block">
@@ -3401,16 +3150,6 @@ function calculationRow(result, indicator, title, rawKey, scoreKey) {
     score: formatNumber(score),
     active,
   };
-}
-
-function calculationSummary(result) {
-  if (result?.sensor_kind === "binary") {
-    return `S_bin(W) usa doble horizonte: base larga y base reciente. El score mostrado es el menor entre ambas para evitar falsos positivos por cambios de rutina = ${formatNumber(result.evidence_score)}. Luego P_sos = S_bin / (S_bin + tau_i) = ${formatNumber(result.suspicion_score)}.`;
-  }
-  if (result?.sensor_kind === "multistate") {
-    return `Version ${result.score_version || "multistate-v1"}: evidencia = max(s_C, s_estado, s_trans, s_D, s_M) = ${formatNumber(result.evidence_score)}. Solo usa estados y transiciones observados; las series de alta cardinalidad se excluyen antes del puntaje.`;
-  }
-  return `Version ${result.score_version || "v2"}: phi(u)=ln(1+u)/(ln(1+u)+lambda), con phi(1)=0.60. Evidencia continua = max(s_H, s_R, s_C, s_D_const, s_M, s_DSPOT) = ${formatNumber(result.evidence_score)}. El score de sospecha conserva ese mismo valor; expresa fuerza de evidencia, no una probabilidad = ${formatNumber(result.suspicion_score)}.`;
 }
 
 function readingRows(result) {

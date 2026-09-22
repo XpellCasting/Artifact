@@ -53,6 +53,10 @@ class FiltroContinuoEstadistico:
 
     SCORE_VERSION = "statistical-continuous-score-v2.0.0"
     SCORE_KIND = "statistical_evidence_strength_not_probability"
+    DETECTION_POLICY_VERSION = "local_hampel_cusum_v2"
+    cusum_retention = 0.98
+    cusum_recovery_z = 0.5
+    cusum_recovery_readings = 5
     window_hampel = 12
     alpha_ewma = 0.2
     zona_muerta_z = 2.5
@@ -69,8 +73,50 @@ class FiltroContinuoEstadistico:
         self.conf_path = conf_path or Path(os.getenv("CONTINUOUS_CONF_PATH", Path(__file__).resolve().parents[1] / "conf.txt"))
         self.config = ConfigParser()
         self.config.optionxform = str
+        self._config_loaded_path = self.conf_path
         if self.conf_path.exists():
             self.config.read(self.conf_path, encoding="utf-8")
+
+    def _sincronizar_config(self) -> None:
+        if self._config_loaded_path == self.conf_path:
+            return
+        self.config = ConfigParser()
+        self.config.optionxform = str
+        if self.conf_path.exists():
+            self.config.read(self.conf_path, encoding="utf-8")
+        self._config_loaded_path = self.conf_path
+
+    def ajustes_manuales(self, entity_ids: set[str] | None = None) -> dict[str, dict[str, float]]:
+        self._sincronizar_config()
+        salida = {}
+        for seccion in self.config.sections():
+            if not seccion.startswith("continuous.") or self.config.get(seccion, "origen", fallback="") != "editado_por_usuario":
+                continue
+            entity_id = seccion.removeprefix("continuous.")
+            if entity_ids is not None and entity_id not in entity_ids:
+                continue
+            valores = {}
+            for clave in self._claves_configurables():
+                if not self.config.has_option(seccion, clave):
+                    continue
+                try:
+                    valor = self.config.getfloat(seccion, clave)
+                except (Error, TypeError, ValueError) as exc:
+                    raise ValueError(f"Ajuste manual inválido para {entity_id}.{clave}") from exc
+                if not math.isfinite(valor):
+                    raise ValueError(f"Ajuste manual no finito para {entity_id}.{clave}")
+                if clave in {"value_floor", "rate_floor_per_minute", "const_epsilon_floor", "min_constant_seconds", "min_gap_seconds"} and valor <= 0:
+                    raise ValueError(f"Ajuste manual debe ser positivo: {entity_id}.{clave}")
+                valores[clave] = valor
+            for bajo, alto in (("physical_low", "physical_high"), ("extreme_low", "extreme_high")):
+                if bajo in valores and alto in valores and valores[bajo] >= valores[alto]:
+                    raise ValueError(f"Límites incompatibles para {entity_id}: {bajo} debe ser menor que {alto}")
+            salida[entity_id] = valores
+        return salida
+
+    @staticmethod
+    def _claves_configurables() -> tuple[str, ...]:
+        return ("value_floor", "rate_floor_per_minute", "const_epsilon_floor", "min_constant_seconds", "min_gap_seconds", "physical_low", "physical_high", "extreme_low", "extreme_high")
 
     def especificacion_puntaje(self) -> dict[str, Any]:
         return {
@@ -91,6 +137,16 @@ class FiltroContinuoEstadistico:
             "suspicion_score": "identity(evidence_score)",
             "hour_context_score": "same_soft_z_curve",
             "cusum_state": "persistent_state_single_historical_pass",
+            "constant_persistence_rule": "episode_range_v1",
+            "continuous_detection_policy_version": self.DETECTION_POLICY_VERSION,
+            "hampel_scale_policy": "local_mad_with_value_floor",
+            "hampel_band_veto": False,
+            "cusum_band_veto": False,
+            "cusum_reference_policy": "fixed_ewma_v1",
+            "cusum_accumulation_policy": "leaky_two_sided_v1",
+            "cusum_retention": self.cusum_retention,
+            "cusum_recovery_z": self.cusum_recovery_z,
+            "cusum_recovery_readings": self.cusum_recovery_readings,
             "operational_limits": "empirical_unless_user_edited",
             "isolated_reading_gap_cap": 0.5,
             "uses_simulated_dataset": False,
@@ -127,7 +183,15 @@ class FiltroContinuoEstadistico:
         entidad: dict[str, Any],
         suspicion_threshold: float,
     ) -> list[dict[str, Any]]:
-        serie = grupo.sort_values("timestamp_dt").copy()
+        original = grupo.sort_values("timestamp_dt", kind="stable").copy()
+        numeric_original = pd.to_numeric(original["value"], errors="coerce")
+        invalid_mask = numeric_original.isna() | original["timestamp_dt"].isna()
+        if "is_valid_value" in original.columns:
+            invalid_mask |= ~original["is_valid_value"].astype(bool)
+        invalid_timestamps = pd.to_datetime(
+            original.loc[invalid_mask, "timestamp_dt"], errors="coerce", utc=True
+        ).dropna().sort_values().tolist()
+        serie = original.copy()
         serie["value"] = pd.to_numeric(serie["value"], errors="coerce")
         serie = serie[serie["value"].notna() & serie["timestamp_dt"].notna()].copy()
         if len(serie) < self.window_hampel:
@@ -143,8 +207,9 @@ class FiltroContinuoEstadistico:
         resultados: list[dict[str, Any]] = []
 
         estado_cusum = self._estado_cusum_vacio()
-        duracion_constante = 0.0
-        valor_previo = None
+        ultimo_timestamp_cusum = None
+        invalid_index = 0
+        estado_constancia = self._estado_constancia_vacio()
         brecha_reportada = False
 
         for fila in serie.to_dict("records"):
@@ -153,12 +218,11 @@ class FiltroContinuoEstadistico:
             delta_value = self._numero(fila.get("delta_value"), 0.0)
             rate_per_minute = self._numero(fila.get("rate_per_minute"), 0.0)
             base_fila = self._base_horaria(base, fila)
-
-            if (
-                estado_cusum["ewma"] is None
-                or gap_seconds > base_fila["cusum_reset_gap_seconds"]
-            ):
-                duracion_constante = 0.0
+            timestamp_fila = pd.to_datetime(fila.get("timestamp_dt"), errors="coerce", utc=True)
+            while invalid_index < len(invalid_timestamps) and invalid_timestamps[invalid_index] <= timestamp_fila:
+                if ultimo_timestamp_cusum is None or invalid_timestamps[invalid_index] > ultimo_timestamp_cusum:
+                    estado_cusum["recovery_count"] = 0
+                invalid_index += 1
 
             raw_fisico, s_fisico = self._score_fisico(valor, perfil)
             dentro_banda = base_fila["normal_lower"] <= valor <= base_fila["normal_upper"]
@@ -175,11 +239,16 @@ class FiltroContinuoEstadistico:
                 score_limite_operacional=s_fisico,
                 estado=estado_cusum,
             )
+            ultimo_timestamp_cusum = timestamp_fila
 
-            if valor_previo is not None and abs(valor - valor_previo) <= base_fila["epsilon_const"] and gap_seconds <= base_fila["gap_alert_seconds"]:
-                duracion_constante += max(gap_seconds, 0.0)
-            else:
-                duracion_constante = 0.0
+            estado_constancia, _ = self._actualizar_estado_constancia(
+                estado_constancia,
+                valor,
+                gap_seconds,
+                base_fila["epsilon_const"],
+                base_fila["gap_alert_seconds"],
+            )
+            duracion_constante = float(estado_constancia["duration_seconds"])
             raw_d_const, s_d_const = self._score_persistencia_constante(duracion_constante, base_fila)
 
             raw_m, s_m = self._score_brecha_temporal(gap_seconds, base_fila)
@@ -190,9 +259,8 @@ class FiltroContinuoEstadistico:
             else:
                 brecha_reportada = False
             raw_dspot, s_dspot = self._score_dspot_extremo(valor, base_fila)
-            raw_h, s_h = self._score_hampel(fila, base_fila)
-            if dentro_banda and s_fisico <= 0 and s_r <= 0.0 and s_dspot <= 0.0:
-                s_h = 0.0
+            raw_h, s_hampel = self._score_hampel(fila, base_fila)
+            s_h = s_hampel
             fuente_h = "hampel"
             if s_fisico > s_h:
                 s_h = s_fisico
@@ -228,6 +296,7 @@ class FiltroContinuoEstadistico:
                 resultados.append(
                     {
                         "entity_id": entity_id,
+                        "source_raw_index": fila.get("_raw_index"),
                         "timestamp": str(fila["timestamp"]),
                         "window_start": str(fila["timestamp"]),
                         "window_end": str(fila["timestamp"]),
@@ -254,6 +323,18 @@ class FiltroContinuoEstadistico:
                             "gap_seconds": round(gap_seconds, 3),
                             "constant_duration_seconds": round(duracion_constante, 3),
                             "residual": round(residual, 6),
+                            "hampel_score": round(s_hampel, 6),
+                            "hampel_reference_median": round(float(fila["local_median"]), 6),
+                            "hampel_reference_mad": round(max(float(fila["local_mad"]), base_fila["perfil"].value_floor), 6),
+                            "hampel_reference_source": str(fila["hampel_reference_source"]),
+                            "cusum_positive": round(float(estado_cusum["c_pos"] or 0.0), 6),
+                            "cusum_negative": round(float(estado_cusum["c_neg"] or 0.0), 6),
+                            "cusum_z_residual": round(float(estado_cusum["last_z"] or 0.0), 6),
+                            "cusum_recovery_count": int(estado_cusum["recovery_count"] or 0),
+                            "cusum_reset_reason": estado_cusum.get("last_reset_reason"),
+                            "cusum_reference_policy": "fixed_ewma_v1",
+                            "cusum_accumulation_policy": "leaky_two_sided_v1",
+                            "continuous_detection_policy_version": self.DETECTION_POLICY_VERSION,
                             "components": componentes,
                             "raw_components": raw_componentes,
                             "component_sources": {"s_H": fuente_h},
@@ -264,9 +345,6 @@ class FiltroContinuoEstadistico:
                         "severity": self._severidad(suspicion_score),
                     }
                 )
-
-            valor_previo = valor
-
         return resultados
 
     def _preparar_variables_temporales(self, serie: pd.DataFrame, base: dict[str, Any]) -> pd.DataFrame:
@@ -286,6 +364,10 @@ class FiltroContinuoEstadistico:
         rolling = historico_previo.rolling(self.window_hampel, min_periods=max(6, self.window_hampel // 2))
         trabajo["local_median"] = rolling.median()
         trabajo["local_mad"] = rolling.apply(lambda valores: self._mad(pd.Series(valores)), raw=False)
+        local_disponible = trabajo["local_median"].notna() & trabajo["local_mad"].notna()
+        trabajo["hampel_reference_source"] = local_disponible.map(
+            {True: "local", False: "historical_fallback"}
+        )
         trabajo["local_median"] = trabajo["local_median"].fillna(base["median"])
         trabajo["local_mad"] = trabajo["local_mad"].fillna(base["mad"])
         return trabajo
@@ -364,9 +446,15 @@ class FiltroContinuoEstadistico:
         rate_summary = self._resumen_robusto(rates, perfil.rate_floor_per_minute)
         gap_summary = self._resumen_robusto(gaps, self._piso_robusto(gaps))
 
-        ewma_previa = temporal["value"].ewm(alpha=self.alpha_ewma, adjust=False).mean().shift(1)
-        residuales = (temporal["value"] - ewma_previa).dropna()
-        residual_mad = max(self._mad(residuales), perfil.value_floor)
+        gap_alert = max(
+            perfil.min_gap_seconds,
+            gap_summary["median"] + 8.0 * gap_summary["scaled_mad"],
+            gap_summary["p99"] * 2.0,
+        )
+        residuales, cusum_initial_ewma = self._residuales_historicos_cusum(
+            temporal, gap_alert
+        )
+        residual_mad = max(self._mad(pd.Series(residuales, dtype="float64")), perfil.value_floor)
         hourly_baseline = self._baseline_por_hora(temporal, perfil)
 
         epsilon_const = max(perfil.const_epsilon_floor, min(mad * 0.03, perfil.value_floor))
@@ -374,11 +462,6 @@ class FiltroContinuoEstadistico:
         const_summary = self._resumen_robusto(
             pd.Series(duraciones_constantes, dtype="float64"),
             self._piso_robusto(pd.Series(duraciones_constantes, dtype="float64")),
-        )
-        gap_alert = max(
-            perfil.min_gap_seconds,
-            gap_summary["median"] + 8.0 * gap_summary["scaled_mad"],
-            gap_summary["p99"] * 2.0,
         )
         const_alert = max(
             perfil.min_constant_seconds,
@@ -404,6 +487,10 @@ class FiltroContinuoEstadistico:
             "residual_scale": max(1.4826 * residual_mad, perfil.value_floor),
             "cusum_k": 0.5,
             "cusum_theta": 8.0,
+            "cusum_retention": self.cusum_retention,
+            "cusum_recovery_z": self.cusum_recovery_z,
+            "cusum_recovery_readings": self.cusum_recovery_readings,
+            "cusum_initial_ewma": cusum_initial_ewma,
             "cusum_reset_gap_seconds": gap_alert,
             "epsilon_const": epsilon_const,
             "gap_alert_seconds": gap_alert,
@@ -464,7 +551,78 @@ class FiltroContinuoEstadistico:
             "last_raw": 0.0,
             "last_score": 0.0,
             "last_residual": 0.0,
+            "recovery_count": 0,
+            "last_z": 0.0,
+            "last_reset_reason": None,
         }
+
+    def _transicion_referencia_cusum(
+        self,
+        ewma_anterior: float | None,
+        valor: float,
+        gap_seconds: float,
+        reset_gap_seconds: float,
+    ) -> tuple[float, float, str | None]:
+        if ewma_anterior is None:
+            return float(valor), 0.0, "initialization"
+        if gap_seconds > reset_gap_seconds:
+            return float(valor), 0.0, "gap"
+        residual = float(valor) - float(ewma_anterior)
+        ewma_nueva = self.alpha_ewma * float(valor) + (1.0 - self.alpha_ewma) * float(ewma_anterior)
+        return ewma_nueva, residual, None
+
+    def _residuales_historicos_cusum(
+        self, temporal: pd.DataFrame, reset_gap_seconds: float
+    ) -> tuple[list[float], float | None]:
+        ewma = None
+        residuales: list[float] = []
+        for fila in temporal.sort_values("timestamp_dt", kind="stable").to_dict("records"):
+            valor = float(fila["value"])
+            gap = self._numero(fila.get("gap_seconds"), 0.0)
+            ewma, residual, reset_reason = self._transicion_referencia_cusum(
+                ewma, valor, gap, reset_gap_seconds
+            )
+            if reset_reason is None:
+                residuales.append(residual)
+        return residuales, ewma
+
+    def _estado_constancia_vacio(self) -> dict[str, float | None]:
+        return {
+            "min_value": None,
+            "max_value": None,
+            "duration_seconds": 0.0,
+        }
+
+    def _actualizar_estado_constancia(
+        self,
+        estado: dict[str, float | None],
+        valor: float,
+        gap_seconds: float,
+        epsilon: float,
+        gap_max: float,
+    ) -> tuple[dict[str, float | None], float | None]:
+        min_anterior = estado.get("min_value")
+        max_anterior = estado.get("max_value")
+        duracion_anterior = float(estado.get("duration_seconds") or 0.0)
+        estado_inicial = {
+            "min_value": float(valor),
+            "max_value": float(valor),
+            "duration_seconds": 0.0,
+        }
+        if min_anterior is None or max_anterior is None:
+            return estado_inicial, None
+        if not math.isfinite(gap_seconds) or gap_seconds < 0.0 or gap_seconds > gap_max:
+            return estado_inicial, duracion_anterior
+
+        nuevo_minimo = min(float(min_anterior), float(valor))
+        nuevo_maximo = max(float(max_anterior), float(valor))
+        if nuevo_maximo - nuevo_minimo <= epsilon:
+            return {
+                "min_value": nuevo_minimo,
+                "max_value": nuevo_maximo,
+                "duration_seconds": duracion_anterior + gap_seconds,
+            }, None
+        return estado_inicial, duracion_anterior
 
     def _actualizar_cusum(
         self,
@@ -476,40 +634,57 @@ class FiltroContinuoEstadistico:
         score_limite_operacional: float,
         estado: dict[str, float | None],
     ) -> tuple[dict[str, float | None], float, float, float]:
+        """Actualiza CUSUM; banda y límite se conservan solo por compatibilidad."""
         ewma_anterior = estado.get("ewma")
         c_pos = float(estado.get("c_pos") or 0.0)
         c_neg = float(estado.get("c_neg") or 0.0)
-        if (
-            ewma_anterior is None
-            or gap_seconds > base["cusum_reset_gap_seconds"]
-        ):
-            ewma_anterior = valor
-            c_pos = 0.0
-            c_neg = 0.0
+        recovery_count = int(estado.get("recovery_count") or 0)
+        ewma, residual, reset_reason = self._transicion_referencia_cusum(
+            None if ewma_anterior is None else float(ewma_anterior),
+            valor,
+            gap_seconds,
+            float(base["cusum_reset_gap_seconds"]),
+        )
+        if reset_reason is not None:
+            nuevo_estado: dict[str, float | None] = {
+                "ewma": ewma,
+                "c_pos": 0.0,
+                "c_neg": 0.0,
+                "last_raw": 0.0,
+                "last_score": 0.0,
+                "last_residual": 0.0,
+                "recovery_count": 0,
+                "last_z": 0.0,
+                "last_reset_reason": reset_reason,
+            }
+            return nuevo_estado, 0.0, 0.0, 0.0
 
-        residual = valor - float(ewma_anterior)
         z_residual = residual / (float(base["residual_scale"]) + 1e-9)
-        if dentro_banda and abs(z_residual) < 1.5:
+        retention = float(base.get("cusum_retention", self.cusum_retention))
+        c_pos = max(
+            0.0,
+            retention * c_pos + z_residual - float(base["cusum_k"]),
+        )
+        c_neg = max(
+            0.0,
+            retention * c_neg - z_residual - float(base["cusum_k"]),
+        )
+        recovery_z = float(base.get("cusum_recovery_z", self.cusum_recovery_z))
+        recovery_readings = int(base.get("cusum_recovery_readings", self.cusum_recovery_readings))
+        recovery_count_anterior = recovery_count
+        if abs(z_residual) <= recovery_z:
+            recovery_count = min(recovery_readings, recovery_count + 1)
+        else:
+            recovery_count = 0
+        if recovery_count >= recovery_readings:
             c_pos = 0.0
             c_neg = 0.0
-        else:
-            c_pos = max(
-                0.0,
-                c_pos + z_residual - float(base["cusum_k"]),
-            )
-            c_neg = max(
-                0.0,
-                c_neg - z_residual - float(base["cusum_k"]),
-            )
+            if recovery_count_anterior < recovery_readings:
+                reset_reason = "stable_residuals"
         raw_c = max(c_pos, c_neg)
         s_c = self._score_desde_ratio(
             raw_c / max(float(base["cusum_theta"]), 1e-9)
         )
-        if dentro_banda and score_limite_operacional <= 0.0:
-            s_c = 0.0
-
-        peso_pewma = self._peso_pewma(residual, base)
-        ewma = peso_pewma * valor + (1.0 - peso_pewma) * float(ewma_anterior)
         nuevo_estado: dict[str, float | None] = {
             "ewma": ewma,
             "c_pos": c_pos,
@@ -517,6 +692,9 @@ class FiltroContinuoEstadistico:
             "last_raw": raw_c,
             "last_score": s_c,
             "last_residual": residual,
+            "recovery_count": recovery_count,
+            "last_z": z_residual,
+            "last_reset_reason": reset_reason,
         }
         return nuevo_estado, raw_c, s_c, residual
 
@@ -525,6 +703,18 @@ class FiltroContinuoEstadistico:
         local_mad = max(self._numero(fila.get("local_mad"), base["mad"]), base["perfil"].value_floor)
         h = abs(float(fila["value"]) - local_median) / (1.4826 * local_mad + 1e-9)
         return h, self._score_desde_z(h)
+
+    def _referencia_hampel(
+        self, valores_previos: pd.Series, base: dict[str, Any]
+    ) -> tuple[float, float, str]:
+        minimo_local = max(6, self.window_hampel // 2)
+        if len(valores_previos) >= minimo_local:
+            return (
+                float(valores_previos.median()),
+                self._mad(valores_previos),
+                "local",
+            )
+        return float(base["median"]), float(base["mad"]), "historical_fallback"
 
     def _score_tasa_robusta(self, rate_per_minute: float, base: dict[str, Any]) -> tuple[float, float]:
         resumen = base["rate_summary"]
@@ -566,11 +756,6 @@ class FiltroContinuoEstadistico:
             z = (valor - upper) / escala
             return z, self._score_desde_z(z)
         return 0.0, 0.0
-
-    def _peso_pewma(self, residual: float, base: dict[str, Any]) -> float:
-        z = abs(residual) / (float(base["residual_scale"]) + 1e-9)
-        probabilidad = math.exp(-0.5 * min(z, 8.0) ** 2)
-        return self.alpha_ewma * max(0.02, min(1.0, probabilidad))
 
     def _score_desde_z(self, z_value: float) -> float:
         if not math.isfinite(z_value) or z_value <= self.zona_muerta_z:
@@ -719,6 +904,7 @@ class FiltroContinuoEstadistico:
         persistir_perfil_calculado: bool = True,
     ) -> PerfilContinuo:
         seccion = f"continuous.{entity_id}"
+        self._sincronizar_config()
         claves = [
             "value_floor",
             "rate_floor_per_minute",
@@ -726,21 +912,8 @@ class FiltroContinuoEstadistico:
             "min_constant_seconds",
             "min_gap_seconds",
         ]
-        if self.config.has_section(seccion) and self.config.get(seccion, "origen", fallback="") == "editado_por_usuario":
-            try:
-                valores = {clave: self.config.getfloat(seccion, clave) for clave in claves}
-                return replace(perfil, **valores)
-            except (Error, TypeError, ValueError):
-                pass
-        if not persistir_perfil_calculado:
-            return perfil
-        if not self.config.has_section(seccion):
-            self.config.add_section(seccion)
-            self.config.set(seccion, "origen", "calculado_desde_historial")
-        for clave in claves:
-            self.config.set(seccion, clave, f"{getattr(perfil, clave):.6f}")
-        self._guardar_config()
-        return perfil
+        manuales = self.ajustes_manuales({entity_id}).get(entity_id, {})
+        return replace(perfil, **{clave: manuales[clave] for clave in claves if clave in manuales})
 
     def _limites_fisicos(
         self,
@@ -750,19 +923,6 @@ class FiltroContinuoEstadistico:
         *,
         persistir_perfil_calculado: bool = True,
     ) -> dict[str, float]:
-        seccion = f"continuous.{entity_id}"
-        if self.config.has_section(seccion):
-            try:
-                return {
-                    "physical_low": self.config.getfloat(seccion, "physical_low"),
-                    "physical_high": self.config.getfloat(seccion, "physical_high"),
-                    "extreme_low": self.config.getfloat(seccion, "extreme_low"),
-                    "extreme_high": self.config.getfloat(seccion, "extreme_high"),
-                }
-            except (Error, TypeError, ValueError):
-                if persistir_perfil_calculado:
-                    self.config.remove_section(seccion)
-
         q01 = float(valores.quantile(0.01))
         q05 = float(valores.quantile(0.05))
         q95 = float(valores.quantile(0.95))
@@ -773,14 +933,10 @@ class FiltroContinuoEstadistico:
             "extreme_low": q05 - 1.5 * iqr,
             "extreme_high": q95 + 1.5 * iqr,
         }
-        if not persistir_perfil_calculado:
-            return limites
-        if not self.config.has_section(seccion):
-            self.config.add_section(seccion)
-        self.config.set(seccion, "origen", "calculado_desde_historial")
-        for clave, valor in limites.items():
-            self.config.set(seccion, clave, f"{valor:.6f}")
-        self._guardar_config()
+        manuales = self.ajustes_manuales({entity_id}).get(entity_id, {})
+        for clave in limites:
+            if clave in manuales:
+                limites[clave] = manuales[clave]
         return limites
 
     def configuracion_continua(self, eventos: pd.DataFrame, entidades: pd.DataFrame) -> list[dict[str, Any]]:
@@ -795,42 +951,54 @@ class FiltroContinuoEstadistico:
             serie = serie[serie["value"].notna() & serie["timestamp_dt"].notna()].copy()
             if len(serie) < self.window_hampel:
                 continue
-            base = self._construir_base_normalidad(serie, str(entity_id))
+            base = self._construir_base_normalidad(serie, str(entity_id), persistir_perfil_calculado=False)
             entidad = lookup.get(str(entity_id), {})
+            manuales = self.ajustes_manuales({str(entity_id)}).get(str(entity_id), {})
             salida.append(
                 {
                     "entity_id": str(entity_id),
                     "device_class": str(entidad.get("device_class") or ""),
                     "unit_of_measurement": str(entidad.get("unit_of_measurement") or ""),
                     "values": self._resumen_base_para_salida(base),
+                    "provenance": {clave: ("manual" if clave in manuales else "automatic") for clave in self._claves_configurables()},
                 }
             )
         return salida
 
     def guardar_configuracion(self, configuraciones: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        claves = [
-            "value_floor",
-            "rate_floor_per_minute",
-            "const_epsilon_floor",
-            "min_constant_seconds",
-            "min_gap_seconds",
-            "physical_low",
-            "physical_high",
-            "extreme_low",
-            "extreme_high",
-        ]
+        self._sincronizar_config()
+        claves = self._claves_configurables()
+        existentes = self.ajustes_manuales()
+        preparados = []
         for item in configuraciones:
             entity_id = str(item.get("entity_id") or "").strip()
             if not entity_id:
-                continue
+                raise ValueError("Cada configuración requiere entity_id")
+            valores = item.get("values") or {}
+            normalizados = {}
+            for clave in claves:
+                if clave in valores:
+                    try:
+                        valor = float(valores[clave])
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"Ajuste manual inválido para {entity_id}.{clave}") from exc
+                    if not math.isfinite(valor):
+                        raise ValueError(f"Ajuste manual no finito para {entity_id}.{clave}")
+                    if clave in {"value_floor", "rate_floor_per_minute", "const_epsilon_floor", "min_constant_seconds", "min_gap_seconds"} and valor <= 0:
+                        raise ValueError(f"Ajuste manual debe ser positivo: {entity_id}.{clave}")
+                    normalizados[clave] = valor
+            efectivos = {**existentes.get(entity_id, {}), **normalizados}
+            for bajo, alto in (("physical_low", "physical_high"), ("extreme_low", "extreme_high")):
+                if bajo in efectivos and alto in efectivos and efectivos[bajo] >= efectivos[alto]:
+                    raise ValueError(f"Límites incompatibles para {entity_id}: {bajo} debe ser menor que {alto}")
+            preparados.append((entity_id, normalizados))
+        for entity_id, valores in preparados:
             seccion = f"continuous.{entity_id}"
             if not self.config.has_section(seccion):
                 self.config.add_section(seccion)
             self.config.set(seccion, "origen", "editado_por_usuario")
-            valores = item.get("values") or {}
-            for clave in claves:
-                if clave in valores:
-                    self.config.set(seccion, clave, f"{float(valores[clave]):.6f}")
+            for clave, valor in valores.items():
+                self.config.set(seccion, clave, format(valor, ".17g"))
         self._guardar_config()
         return configuraciones
 
@@ -930,20 +1098,21 @@ class FiltroContinuoEstadistico:
 
     def _duraciones_constantes(self, temporal: pd.DataFrame, epsilon: float, gap_max: float) -> list[float]:
         duraciones: list[float] = []
-        duracion_actual = 0.0
-        valor_anterior: float | None = None
+        estado = self._estado_constancia_vacio()
         for fila in temporal.to_dict("records"):
             valor = float(fila["value"])
-            gap = self._numero(fila.get("gap_seconds"), 0.0)
-            if valor_anterior is not None and abs(valor - valor_anterior) <= epsilon and gap <= gap_max:
-                duracion_actual += max(gap, 0.0)
-            else:
-                if duracion_actual > 0:
-                    duraciones.append(duracion_actual)
-                duracion_actual = 0.0
-            valor_anterior = valor
-        if duracion_actual > 0:
-            duraciones.append(duracion_actual)
+            try:
+                gap = float(fila.get("gap_seconds"))
+            except (TypeError, ValueError):
+                gap = math.nan
+            estado, duracion_cerrada = self._actualizar_estado_constancia(
+                estado, valor, gap, epsilon, gap_max
+            )
+            if duracion_cerrada is not None and duracion_cerrada > 0.0:
+                duraciones.append(duracion_cerrada)
+        duracion_final = float(estado["duration_seconds"] or 0.0)
+        if duracion_final > 0.0:
+            duraciones.append(duracion_final)
         return duraciones or [0.0]
 
     def _resumen_robusto(self, valores: pd.Series, piso_mad: float) -> dict[str, float]:
@@ -996,6 +1165,10 @@ class FiltroContinuoEstadistico:
             "min_gap_seconds": round(base["perfil"].min_gap_seconds, 3),
             "min_constant_seconds": round(base["perfil"].min_constant_seconds, 3),
             "cusum_theta": round(base["cusum_theta"], 6),
+            "cusum_retention": round(base["cusum_retention"], 6),
+            "cusum_recovery_z": round(base["cusum_recovery_z"], 6),
+            "cusum_recovery_readings": int(base["cusum_recovery_readings"]),
+            "cusum_initial_ewma": None if base.get("cusum_initial_ewma") is None else round(base["cusum_initial_ewma"], 6),
         }
 
     def _evidencia_continua(

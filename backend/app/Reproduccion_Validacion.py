@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+import math
 from time import perf_counter
 from typing import Any
+from copy import deepcopy
 
 import pandas as pd
 
 from .Filtro_Estadistico.Continuos import (
     DETALLE_INDICADOR as DETALLE_CONTINUO,
     INDICADORES_CONTINUOS,
+)
+from .Filtro_Estadistico.Continuos_Temporales import (
+    CONTINUOUS_METHOD, HISTORY_SIZE, TemporalSensorModel, causal_features,
+    serializable_manifest,
+)
+from .Filtro_Estadistico.Residuos_Secuenciales import (
+    RESIDUAL_METHODS, RESIDUAL_EWMA_METHOD, RESIDUAL_FOCUS_METHOD,
+    prepare_sensor, update_channels,
 )
 from .Filtro_Estadistico.Estados_Binarios import (
     DETALLE_INDICADOR as DETALLE_BINARIO,
@@ -38,15 +48,22 @@ class MotorReproduccionValidacion:
         eventos_desarrollo: pd.DataFrame,
         entidades_desarrollo: pd.DataFrame,
         entidades_objetivo: set[str] | None = None,
+        continuous_method: str = CONTINUOUS_METHOD,
     ) -> dict[str, Any]:
+        if continuous_method not in {CONTINUOUS_METHOD, *RESIDUAL_METHODS}:
+            raise ValueError(f"Método continuo desconocido: {continuous_method}")
         if eventos_desarrollo.empty or "sensor_kind" not in eventos_desarrollo.columns:
             raise ValueError("Desarrollo no contiene eventos normalizados para construir la base.")
         trabajo = eventos_desarrollo.copy()
+        trabajo["__baseline_order"] = range(len(trabajo))
         trabajo["timestamp_dt"] = pd.to_datetime(
             trabajo["timestamp_dt"], errors="coerce", utc=True
         )
         if entidades_objetivo:
             trabajo = trabajo[trabajo["entity_id"].isin(entidades_objetivo)].copy()
+        trabajo = trabajo.sort_values(
+            ["entity_id", "timestamp_dt", "__baseline_order"], kind="stable"
+        ).drop(columns=["__baseline_order"])
         lookup = (
             entidades_desarrollo.set_index("entity_id").to_dict("index")
             if not entidades_desarrollo.empty
@@ -54,6 +71,7 @@ class MotorReproduccionValidacion:
         )
         baseline: dict[str, Any] = {
             "version": self.VERSION,
+            "continuous_method": continuous_method,
             "continuous": {},
             "binary": {},
             "multistate": {},
@@ -79,7 +97,7 @@ class MotorReproduccionValidacion:
             ultima = serie.tail(1)
             ultimo_valor = None if ultima.empty else float(ultima.iloc[0]["value"])
             estado_cusum = self.filtro.continuos._estado_cusum_vacio()
-            estado_cusum["ewma"] = ultimo_valor
+            estado_cusum["ewma"] = base.get("cusum_initial_ewma", ultimo_valor)
             baseline["continuous"][str(entity_id)] = {
                 "base": base,
                 "runtime": {
@@ -90,10 +108,38 @@ class MotorReproduccionValidacion:
                     "last_timestamp": None if ultima.empty else ultima.iloc[0]["timestamp_dt"],
                     "last_value": ultimo_valor,
                     "cusum": estado_cusum,
+                    "constant_state": self.filtro.continuos._estado_constancia_vacio(),
                     "constant_duration_seconds": 0.0,
                     "gap_reported": False,
                 },
             }
+
+        temporal_models: dict[str, Any] = {}
+        temporal_entries: dict[str, Any] = {}
+        for entity_id, grupo in trabajo[trabajo["sensor_kind"].eq("continuous")].groupby("entity_id", sort=False):
+            if continuous_method in RESIDUAL_METHODS:
+                learned = prepare_sensor(self.filtro.continuos_temporales, grupo, str(entity_id), continuous_method)
+                learned["constant_base"] = (baseline["continuous"].get(str(entity_id)) or {}).get("base")
+                temporal_models[str(entity_id)] = {key: value for key, value in learned.items() if key not in {"predictor", "runtime"}}
+                if learned.get("eligible"):
+                    temporal_entries[str(entity_id)] = learned
+                continue
+            learned = self.filtro.continuos_temporales.train_sensor(grupo, str(entity_id))
+            temporal_models[str(entity_id)] = learned
+            if isinstance(learned, TemporalSensorModel):
+                constant_reference = baseline["continuous"].get(str(entity_id))
+                temporal_entries[str(entity_id)] = {
+                    "model": learned,
+                    "metadata": dict(learned.metadata),
+                    "runtime": {
+                        **self.filtro.continuos_temporales.runtime(grupo),
+                        "constant_state": self.filtro.continuos._estado_constancia_vacio(),
+                        "last_timestamp": None,
+                    },
+                    "constant_base": None if constant_reference is None else constant_reference.get("base"),
+                }
+        baseline["continuous"] = temporal_entries
+        baseline["continuous_model_manifest"] = serializable_manifest(temporal_models) if continuous_method == CONTINUOUS_METHOD else temporal_models
 
         for entity_id, grupo in trabajo[
             trabajo["sensor_kind"].eq("binary")
@@ -190,16 +236,18 @@ class MotorReproduccionValidacion:
         nuevos_eventos: pd.DataFrame,
         baseline: dict[str, Any],
         suspicion_threshold: float,
+        continuous_method: str | None = None,
     ) -> dict[str, Any]:
         inicio = perf_counter()
         if nuevos_eventos.empty:
-            return self._resultado([], inicio, {})
+            return self._resultado([], inicio, {}, detections=[])
         umbral_local = min(float(suspicion_threshold), self.filtro.umbral_activacion_lapsos)
 
         inicio_tipo = perf_counter()
-        continuos = self._analizar_continuos(
-            nuevos_eventos, baseline, umbral_local
-        )
+        method = continuous_method or baseline.get("continuous_method", CONTINUOUS_METHOD)
+        if method not in {CONTINUOUS_METHOD, *RESIDUAL_METHODS}:
+            raise ValueError(f"Método continuo desconocido: {method}")
+        continuos = self._analizar_continuos_temporales(nuevos_eventos, baseline) if method == CONTINUOUS_METHOD else self._analizar_continuos_residuos(nuevos_eventos, baseline, method)
         tiempo_continuos = (perf_counter() - inicio_tipo) * 1000.0
         inicio_tipo = perf_counter()
         binarios = self._analizar_binarios(nuevos_eventos, baseline, umbral_local)
@@ -210,12 +258,13 @@ class MotorReproduccionValidacion:
         )
         tiempo_multivalor = (perf_counter() - inicio_tipo) * 1000.0
 
-        resultados = self._aplicar_contexto(
+        resultados_umbral = self._aplicar_contexto(
             continuos + binarios + multivalor,
             baseline.get("context", {}),
             suspicion_threshold,
         )
-        resultados = self._suprimir_repetidos(resultados, baseline)
+        detections = deepcopy(resultados_umbral)
+        resultados = self._suprimir_repetidos(deepcopy(resultados_umbral), baseline)
         return self._resultado(
             resultados,
             inicio,
@@ -224,6 +273,7 @@ class MotorReproduccionValidacion:
                 "binary": tiempo_binarios,
                 "multistate": tiempo_multivalor,
             },
+            detections=detections,
         )
 
     def _analizar_continuos(
@@ -234,41 +284,44 @@ class MotorReproduccionValidacion:
     ) -> list[dict[str, Any]]:
         filtro = self.filtro.continuos
         trabajo = nuevos[nuevos["sensor_kind"].eq("continuous")].copy()
-        if "is_valid_value" in trabajo.columns:
-            trabajo = trabajo[trabajo["is_valid_value"].astype(bool)].copy()
+        if trabajo.empty or "entity_id" not in trabajo:
+            return []
         resultados: list[dict[str, Any]] = []
         evidence_threshold = filtro._umbral_evidencia(suspicion_threshold)
         for entity_id, filas in trabajo.groupby("entity_id", sort=False):
             cached = baseline.get("continuous", {}).get(str(entity_id))
             if not cached:
                 continue
-            base = cached["base"]
             runtime = cached["runtime"]
             for fila in filas.sort_values("timestamp_dt").to_dict("records"):
                 timestamp = pd.to_datetime(
                     fila.get("timestamp_dt"), errors="coerce", utc=True
                 )
-                valor = pd.to_numeric(pd.Series([fila.get("value")]), errors="coerce").iloc[0]
-                if pd.isna(timestamp) or pd.isna(valor):
+                explicit_valid = bool(fila.get("is_valid_value", True))
+                numeric_value = pd.to_numeric(
+                    pd.Series([fila.get("value")]), errors="coerce"
+                ).iloc[0]
+                if pd.isna(timestamp) or not explicit_valid or pd.isna(numeric_value) or not math.isfinite(float(numeric_value)):
+                    runtime["cusum"]["recovery_count"] = 0
                     continue
+                base = cached["base"]
+                valor = numeric_value
                 valor = float(valor)
                 previo_ts = runtime.get("last_timestamp")
                 previo_valor = runtime.get("last_value")
-                gap_seconds = (
+                gap_constancia = (
                     0.0
                     if previo_ts is None
-                    else max(0.0, (timestamp - previo_ts).total_seconds())
+                    else (timestamp - previo_ts).total_seconds()
                 )
+                gap_seconds = max(0.0, gap_constancia)
                 delta_value = 0.0 if previo_valor is None else valor - float(previo_valor)
                 rate_per_minute = abs(delta_value) / max(
                     gap_seconds / 60.0, 1.0 / 60.0
                 )
                 recientes = pd.Series(list(runtime["recent_values"]), dtype="float64")
-                local_median = float(recientes.median()) if not recientes.empty else float(base["median"])
-                local_mad = (
-                    max(filtro._mad(recientes), float(base["mad"]))
-                    if not recientes.empty
-                    else float(base["mad"])
+                local_median, local_mad, hampel_reference_source = (
+                    filtro._referencia_hampel(recientes, base)
                 )
                 fila_score = {
                     **fila,
@@ -279,16 +332,12 @@ class MotorReproduccionValidacion:
                     ),
                     "local_median": local_median,
                     "local_mad": local_mad,
+                    "hampel_reference_source": hampel_reference_source,
                 }
                 base_fila = filtro._base_horaria(base, fila_score)
-                if (
-                    runtime["cusum"].get("ewma") is None
-                    or gap_seconds > base_fila["cusum_reset_gap_seconds"]
-                ):
-                    runtime["constant_duration_seconds"] = 0.0
                 raw_fisico, s_fisico = filtro._score_fisico(valor, base_fila["perfil"])
                 dentro_banda = base_fila["normal_lower"] <= valor <= base_fila["normal_upper"]
-                raw_h, s_h = filtro._score_hampel(fila_score, base_fila)
+                raw_h, s_hampel = filtro._score_hampel(fila_score, base_fila)
                 raw_r, s_r = filtro._score_tasa_robusta(rate_per_minute, base_fila)
                 raw_m, s_m = filtro._score_brecha_temporal(gap_seconds, base_fila)
                 raw_dspot, s_dspot = filtro._score_dspot_extremo(valor, base_fila)
@@ -300,14 +349,20 @@ class MotorReproduccionValidacion:
                     score_limite_operacional=s_fisico,
                     estado=runtime["cusum"],
                 )
-                if (
-                    previo_valor is not None
-                    and abs(valor - float(previo_valor)) <= base_fila["epsilon_const"]
-                    and gap_seconds <= base_fila["gap_alert_seconds"]
-                ):
-                    runtime["constant_duration_seconds"] += gap_seconds
-                else:
-                    runtime["constant_duration_seconds"] = 0.0
+                estado_constancia = runtime.get("constant_state")
+                if not isinstance(estado_constancia, dict):
+                    estado_constancia = filtro._estado_constancia_vacio()
+                estado_constancia, _ = filtro._actualizar_estado_constancia(
+                    estado_constancia,
+                    valor,
+                    gap_constancia,
+                    base_fila["epsilon_const"],
+                    base_fila["gap_alert_seconds"],
+                )
+                runtime["constant_state"] = estado_constancia
+                runtime["constant_duration_seconds"] = float(
+                    estado_constancia["duration_seconds"]
+                )
                 raw_const, s_const = filtro._score_persistencia_constante(
                     runtime["constant_duration_seconds"], base_fila
                 )
@@ -319,8 +374,7 @@ class MotorReproduccionValidacion:
                     runtime["gap_reported"] = False
                 if dentro_banda and s_fisico <= 0 and abs(delta_value) < base_fila["normal_delta_for_rate"]:
                     s_r = 0.0
-                if dentro_banda and s_fisico <= 0 and s_r <= 0.0 and s_dspot <= 0.0:
-                    s_h = 0.0
+                s_h = s_hampel
                 fuente_h = "hampel"
                 if s_fisico > s_h:
                     s_h = s_fisico
@@ -353,6 +407,7 @@ class MotorReproduccionValidacion:
                     resultados.append(
                         {
                             "entity_id": str(entity_id),
+                            "source_raw_index": fila.get("_raw_index"),
                             "timestamp": fila_score["timestamp"],
                             "window_start": fila_score["timestamp"],
                             "window_end": fila_score["timestamp"],
@@ -379,6 +434,18 @@ class MotorReproduccionValidacion:
                                 "gap_seconds": round(gap_seconds, 3),
                                 "constant_duration_seconds": round(runtime["constant_duration_seconds"], 3),
                                 "residual": round(residual, 6),
+                                "hampel_score": round(s_hampel, 6),
+                                "hampel_reference_median": round(local_median, 6),
+                                "hampel_reference_mad": round(max(local_mad, base_fila["perfil"].value_floor), 6),
+                                "hampel_reference_source": hampel_reference_source,
+                                "cusum_positive": round(float(runtime["cusum"]["c_pos"] or 0.0), 6),
+                                "cusum_negative": round(float(runtime["cusum"]["c_neg"] or 0.0), 6),
+                                "cusum_z_residual": round(float(runtime["cusum"]["last_z"] or 0.0), 6),
+                                "cusum_recovery_count": int(runtime["cusum"]["recovery_count"] or 0),
+                                "cusum_reset_reason": runtime["cusum"].get("last_reset_reason"),
+                                "cusum_reference_policy": "fixed_ewma_v1",
+                                "cusum_accumulation_policy": "leaky_two_sided_v1",
+                                "continuous_detection_policy_version": filtro.DETECTION_POLICY_VERSION,
                                 "components": componentes,
                                 "raw_components": raw_componentes,
                                 "component_sources": {"s_H": fuente_h},
@@ -393,6 +460,172 @@ class MotorReproduccionValidacion:
                 runtime["last_timestamp"] = timestamp
                 runtime["last_value"] = valor
         return resultados
+
+    def _analizar_continuos_temporales(
+        self, nuevos: pd.DataFrame, baseline: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Predict a timestamp group before adding any of its rows to history."""
+        filtro = self.filtro.continuos
+        trabajo = nuevos[nuevos["sensor_kind"].eq("continuous")].copy()
+        trabajo["__order"] = range(len(trabajo))
+        observations = baseline.setdefault("last_observations", {})
+        observations.clear()
+        resultados: list[dict[str, Any]] = []
+        for entity_id, filas in trabajo.groupby("entity_id", sort=False):
+            cached = baseline.get("continuous", {}).get(str(entity_id))
+            if not cached:
+                continue
+            runtime, model = cached["runtime"], cached["model"]
+            ordered = filas.copy()
+            ordered["timestamp_dt"] = pd.to_datetime(ordered["timestamp_dt"], errors="coerce", utc=True)
+            ordered = ordered.sort_values(["timestamp_dt", "__order"], kind="stable")
+            for timestamp, simultaneous in ordered.groupby("timestamp_dt", sort=True):
+                vector = causal_features(runtime["history"], timestamp)
+                pending: list[tuple[pd.Timestamp, float]] = []
+                constant_updates: list[tuple[float, dict[str, Any]]] = []
+                group_constant_state = deepcopy(runtime.get("constant_state") or filtro._estado_constancia_vacio())
+                group_previous_timestamp = runtime.get("last_timestamp")
+                for fila in simultaneous.to_dict("records"):
+                    raw_index = fila.get("_raw_index")
+                    key = str(raw_index) if raw_index is not None else f"{entity_id}:{timestamp.isoformat()}:{fila['__order']}"
+                    numeric = pd.to_numeric(pd.Series([fila.get("value")]), errors="coerce").iloc[0]
+                    valid = bool(fila.get("is_valid_value", True)) and pd.notna(numeric) and math.isfinite(float(numeric))
+                    if not valid:
+                        observations[key] = {"evaluable": False, "reason": "invalid_state", "continuous_method": CONTINUOUS_METHOD}
+                        continue
+                    value = float(numeric)
+                    if vector is None:
+                        observations[key] = {"evaluable": False, "reason": "insufficient_history", "continuous_method": CONTINUOUS_METHOD}
+                        pending.append((timestamp, value))
+                        continue
+                    prediction = model.predict(vector, value)
+                    interval_detected = bool(prediction["is_interval_detection"])
+                    constant_score = 0.0
+                    constant_detected = False
+                    constant_base = cached.get("constant_base")
+                    if constant_base:
+                        gap = 0.0 if group_previous_timestamp is None else max(0.0, (timestamp - group_previous_timestamp).total_seconds())
+                        base_row = filtro._base_horaria(constant_base, {**fila, "timestamp_dt": timestamp})
+                        state, _ = filtro._actualizar_estado_constancia(deepcopy(group_constant_state), value, gap, base_row["epsilon_const"], base_row["gap_alert_seconds"])
+                        _, constant_score = filtro._score_persistencia_constante(float(state["duration_seconds"]), base_row)
+                        constant_detected = constant_score >= 0.6
+                        constant_updates.append((value, base_row))
+                    sources = (["prediction_interval"] if interval_detected else []) + (["constant_persistence"] if constant_detected else [])
+                    score = max(float(prediction["suspicion_score"]), float(constant_score))
+                    detected = bool(sources)
+                    pattern = "stuck_value" if constant_score > float(prediction["suspicion_score"]) else "temporal_deviation"
+                    evidence = {
+                        "entity_id": str(entity_id), "source_raw_index": raw_index,
+                        "timestamp": str(fila.get("timestamp") or timestamp.isoformat()),
+                        "window_start": str(fila.get("timestamp") or timestamp.isoformat()),
+                        "window_end": str(fila.get("timestamp") or timestamp.isoformat()),
+                        "sensor_kind": "continuous", "tipo_interno": "continua",
+                        "observed_state": str(fila.get("state", value)), "value": round(value, 6),
+                        "observed_value": value, "continuous_method": CONTINUOUS_METHOD,
+                        "expected_value": prediction["expected_value"], "lower_bound": prediction["lower_bound"],
+                        "upper_bound": prediction["upper_bound"], "interval_margin": prediction["interval_margin"],
+                        "normalized_exceedance": prediction["normalized_exceedance"],
+                        "suspicion_score": score, "score_kind": "interval_exceedance_display_score",
+                        "is_suspicious": detected, "pattern": pattern, "suspected_pattern": pattern,
+                        "detection_sources": sources, "triggered_indicators": sources,
+                        "pattern_detail": "Intervalo predictivo calibrado" if interval_detected else "Persistencia constante",
+                        "filter": "statistical_temporal_quantile_validation_replay",
+                        "passed_to_contextual_filter": detected, "ground_truth_label": None,
+                        "severity": filtro._severidad(score),
+                        "reading": {**prediction, "continuous_method": CONTINUOUS_METHOD, "detection_sources": sources},
+                    }
+                    observations[key] = {"evaluable": True, "reason": None, "detected_before_suppression": detected,
+                                         "continuous_method": CONTINUOUS_METHOD, **prediction, "detection_sources": sources,
+                                         "score_kind": "interval_exceedance_display_score"}
+                    if detected:
+                        resultados.append(evidence)
+                    pending.append((timestamp, value))
+                for item in pending:
+                    runtime["history"].append(item)
+                state = group_constant_state
+                for index, (value, base_row) in enumerate(constant_updates):
+                    gap = (0.0 if group_previous_timestamp is None else max(0.0, (timestamp - group_previous_timestamp).total_seconds())) if index == 0 else 0.0
+                    state, _ = filtro._actualizar_estado_constancia(state, value, gap, base_row["epsilon_const"], base_row["gap_alert_seconds"])
+                runtime["constant_state"] = state
+                runtime["last_timestamp"] = timestamp
+        return resultados
+
+    def _analizar_continuos_residuos(self, nuevos: pd.DataFrame, baseline: dict[str, Any], method: str) -> list[dict[str, Any]]:
+        """Causal residual scoring; a timestamp group shares its sequential update."""
+        filtro = self.filtro.continuos
+        work = nuevos[nuevos["sensor_kind"].eq("continuous")].copy()
+        work["__order"] = range(len(work))
+        observations = baseline.setdefault("last_observations", {})
+        observations.clear(); results: list[dict[str, Any]] = []
+        for entity_id, rows in work.groupby("entity_id", sort=False):
+            cached = baseline.get("continuous", {}).get(str(entity_id))
+            if not cached:
+                continue
+            runtime, predictor = cached["runtime"], cached["predictor"]
+            ordered = rows.sort_values(["timestamp_dt", "__order"], kind="stable")
+            for timestamp, simultaneous in ordered.groupby("timestamp_dt", sort=True):
+                timestamp = pd.to_datetime(timestamp, errors="coerce", utc=True)
+                vector = causal_features(runtime.history, timestamp)
+                valid_rows, pending = [], []
+                for row in simultaneous.to_dict("records"):
+                    raw = row.get("_raw_index"); key = str(raw) if raw is not None else f"{entity_id}:{timestamp.isoformat()}:{row['__order']}"
+                    number = pd.to_numeric(pd.Series([row.get("value")]), errors="coerce").iloc[0]
+                    if pd.isna(timestamp) or not bool(row.get("is_valid_value", True)) or pd.isna(number) or not math.isfinite(float(number)):
+                        observations[key] = {"evaluable": False, "reason": "invalid_state", "continuous_method": method}; continue
+                    value = float(number); pending.append((timestamp, value))
+                    if vector is None:
+                        observations[key] = {"evaluable": False, "reason": "insufficient_history", "continuous_method": method}; continue
+                    expected = predictor.predict_raw(vector)[1]
+                    valid_rows.append((row, key, value, expected, (value - expected - cached["centre"]) / cached["scale"]))
+                if valid_rows:
+                    # One sequential update per simultaneous group, while P stays per reading.
+                    mean_z = sum(row[4] for row in valid_rows) / len(valid_rows)
+                    channels = update_channels(runtime, mean_z, timestamp, method, cached["half_life_seconds"])
+                    for row, key, value, expected, z in valid_rows:
+                        p = abs(z); d, n = channels["D"], channels["N"]
+                        qs = cached["channel_q99"]
+                        ratios = {"P": p / qs["P"], "D": d / qs["D"], "N": n / qs["N"]}
+                        score = max(ratios.values()); dominant = max(ratios, key=ratios.get)
+                        detected_numeric = score >= cached["threshold"]
+                        constant_score = 0.0
+                        # Preserve the established independent constancy check.
+                        constant_base = cached.get("constant_base")
+                        if constant_base:
+                            base_row = filtro._base_horaria(constant_base, {**row, "timestamp_dt": timestamp})
+                            previous = runtime.last_timestamp
+                            gap = 0.0 if previous is None else max(0.0, (timestamp - previous).total_seconds())
+                            state, _ = filtro._actualizar_estado_constancia(runtime.__dict__.setdefault("constant_state", filtro._estado_constancia_vacio()), value, gap, base_row["epsilon_const"], base_row["gap_alert_seconds"])
+                            runtime.constant_state = state
+                            _, constant_score = filtro._score_persistencia_constante(float(state["duration_seconds"]), base_row)
+                        constant_detected = constant_score >= .6
+                        sources = (["residual_sequential"] if detected_numeric else []) + (["constant_persistence"] if constant_detected else [])
+                        detected = bool(sources)
+                        change = channels.get("focus_changepoint_index")
+                        observation = {
+                            "evaluable": True, "reason": None, "detected_before_suppression": detected,
+                            "continuous_method": method, "expected_value": expected, "residual": value - expected, "z": z,
+                            "channels": {"P": p, "D": d, "N": n}, "dominant_channel": dominant,
+                            "joint_score": score, "threshold": cached["threshold"], "detection_sources": sources,
+                            "focus_statistic": d if method == RESIDUAL_FOCUS_METHOD else None,
+                            "focus_changepoint_index": change,
+                        }
+                        observations[key] = observation
+                        if detected:
+                            results.append({
+                                "entity_id": str(entity_id), "source_raw_index": row.get("_raw_index"), "timestamp": str(row.get("timestamp") or timestamp.isoformat()),
+                                "window_start": str(row.get("timestamp") or timestamp.isoformat()), "window_end": str(row.get("timestamp") or timestamp.isoformat()),
+                                "sensor_kind": "continuous", "tipo_interno": "continua", "observed_state": str(row.get("state", value)), "value": value,
+                                "continuous_method": method, "expected_value": expected, "residual": value - expected, "z": z,
+                                "channels": observation["channels"], "dominant_channel": dominant, "joint_score": score, "threshold": cached["threshold"],
+                                "suspicion_score": score, "is_suspicious": True, "pattern": "stuck_value" if constant_detected and not detected_numeric else "residual_sequential_deviation",
+                                "suspected_pattern": "stuck_value" if constant_detected and not detected_numeric else "residual_sequential_deviation", "detection_sources": sources,
+                                "triggered_indicators": sources, "filter": method, "passed_to_contextual_filter": True,
+                                "reading": observation, "focus_changepoint_index": change,
+                            })
+                            runtime.reset_sequential(method)
+                for item in pending:
+                    runtime.history.append(item)
+        return results
 
     def _analizar_binarios(
         self,
@@ -442,6 +675,7 @@ class MotorReproduccionValidacion:
                 resultados.append(
                     {
                         "entity_id": str(entity_id),
+                        "source_raw_index": fila.get("_raw_index"),
                         "timestamp": str(fila["timestamp"]),
                         "window_start": str(fila["window_start"]),
                         "window_end": str(fila["timestamp"]),
@@ -559,6 +793,7 @@ class MotorReproduccionValidacion:
                     resultados.append(
                         {
                             "entity_id": str(entity_id),
+                            "source_raw_index": fila.get("_raw_index"),
                             "timestamp": str(fila.get("timestamp")),
                             "window_start": (
                                 timestamp - pd.Timedelta(seconds=filtro.window_seconds)
@@ -668,7 +903,10 @@ class MotorReproduccionValidacion:
         resultados: list[dict[str, Any]],
         inicio: float,
         tiempos: dict[str, float],
+        *,
+        detections: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        detecciones = list(detections or [])
         elapsed_ms = (perf_counter() - inicio) * 1000.0
         resumen = {
             "results": len(resultados),
@@ -687,8 +925,13 @@ class MotorReproduccionValidacion:
             "evaluated_partition": "validation",
             "uses_future_validation_rows": False,
             "engine_version": self.VERSION,
+            "detection_count": len(detecciones),
+            "emitted_alert_count": len(resultados),
+            "suppressed_detection_count": max(0, len(detecciones) - len(resultados)),
+            "statistical_evaluation_version": "pre_suppression_v1",
         }
         return {
+            "detections": detecciones,
             "results": resultados,
             "all_results": resultados,
             "summary": resumen,

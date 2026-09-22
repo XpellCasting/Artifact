@@ -30,8 +30,17 @@ from .Filtro_Estadistico.Episodios import (
     enviar_a_contextual, resumen_episodios,
 )
 from .Reproduccion_Validacion import MotorReproduccionValidacion
+from . import Evaluacion_Etiquetada as labelled_evaluation
 from .Revision_Fragmentos import crear_router_revision
 from .Diagnostico_Trabajo import DiagnosticWorkbench, crear_router_diagnostico
+from .Flujos import FlowRunner, FlowStore, default_flow, validate_flow
+from .Evaluacion_Flujos import CausalFlowRunner, FlowEvaluationJobs
+from .Procedencia_Normalidad import (
+    SCHEMA_VERSION as NORMALITY_PROVENANCE_VERSION,
+    build_identity as build_baseline_identity,
+    effective_parameters as baseline_effective_parameters,
+    write_manifest as write_baseline_manifest,
+)
 DEFAULT_HISTORY_LOAD_SECONDS_PER_MIB = float(
     os.getenv("HISTORY_LOAD_SECONDS_PER_MIB", "0.22")
 )
@@ -67,6 +76,10 @@ class ValidationReplayAdvanceRequest(BaseModel):
         ge=MIN_SUSPICION_THRESHOLD,
         le=MAX_SUSPICION_THRESHOLD,
     )
+
+
+class FlowRunRequest(BaseModel):
+    candidate_limit: int = Field(default=1000, ge=1, le=20000)
 
 
 @dataclass
@@ -418,12 +431,40 @@ class EstadoAplicacion:
             self.future_context_events_template = None
             self.future_evaluation_prepared_at = None
             return
+        eventos_capturados = self.historial.eventos.copy(deep=True)
+        entidades_capturadas = self.historial.entidades.copy(deep=True)
+        entity_ids = set(eventos_capturados["entity_id"].astype(str))
+        ajustes = self.filtro_estadistico.continuos.ajustes_manuales(entity_ids)
+        identidad = build_baseline_identity(eventos_capturados, entidades_capturadas, ajustes)
+        self.future_baseline_template = None
+        self.future_context_map_template = None
+        self.future_context_events_template = None
+        self.future_evaluation_prepared_at = None
         baseline = MotorReproduccionValidacion(
             self.filtro_estadistico
         ).construir_baseline(
-            eventos_desarrollo=self.historial.eventos,
-            entidades_desarrollo=self.historial.entidades,
+            eventos_desarrollo=eventos_capturados,
+            entidades_desarrollo=entidades_capturadas,
         )
+        parametros = baseline_effective_parameters(baseline)
+        source = {
+            "name": Path(str(self.historial.metadatos.get("source_path") or "")).name,
+            "path": self.historial.metadatos.get("source_path"),
+            "rows": len(eventos_capturados),
+            "entities": len(entity_ids),
+            "start": self.historial.metadatos.get("start"),
+            "end": self.historial.metadatos.get("end"),
+        }
+        manifest_path, manifest = write_baseline_manifest(
+            self.analysis_cache_path.parent, identidad, source, ajustes, parametros
+        )
+        baseline["provenance"] = {
+            "baseline_id": identidad["baseline_id"],
+            "schema_version": NORMALITY_PROVENANCE_VERSION,
+            "identity": identidad,
+            "effective_parameters_sha256": manifest["effective_parameters_sha256"],
+            "manifest_path": str(manifest_path),
+        }
         mapa = self._asegurar_mapa_contextual()
         fin_historico = pd.to_datetime(
             self.historial.metadatos.get("end"), errors="coerce", utc=True
@@ -448,6 +489,7 @@ class EstadoAplicacion:
         self,
         contenido: bytes,
         filename: str = "historico_validacion.csv",
+        labelled: bool = False,
     ) -> dict[str, Any]:
         if not contenido:
             raise ValueError("El archivo de Evaluacion esta vacio.")
@@ -465,6 +507,10 @@ class EstadoAplicacion:
                 "El historico no tiene preparado su estado para Evaluacion; "
                 "vuelve a cargar el historico real."
             )
+
+        truth = []
+        if labelled:
+            contenido, truth = labelled_evaluation.separate_csv(contenido)
 
         # Una carga nueva invalida cualquier ejecucion anterior. La señal se
         # establece antes de esperar el lock para que el worker no tome otro lote.
@@ -528,7 +574,9 @@ class EstadoAplicacion:
             self.validation_replay_generation += 1
             self.validation_replay_pause = Event()
             self.validation_replay_worker = None
+            labelled_evaluation.install(self._ruta_almacen_resultados_validacion(), truth, eventos)
             self.validation_replay_state = {
+                "labelled": labelled, "unmatched_label_detections": 0,
                 "status": "ready",
                 "filename": Path(filename).name or ruta.name,
                 "evaluation_upload_mode": "load_only",
@@ -544,6 +592,7 @@ class EstadoAplicacion:
                 "development_end": None if pd.isna(fin_desarrollo) else fin_desarrollo.isoformat(),
                 "entity_count": int(eventos["entity_id"].nunique()),
                 "baseline_summary": baseline_historico.get("summary", {}),
+                "baseline_id": baseline_historico.get("provenance", {}).get("baseline_id"),
                 "context_map_version": mapa_contextual_historico.get("map_version"),
                 "context_map_stale": bool(
                     mapa_contextual_historico.get("refresh", {}).get("stale")
@@ -807,6 +856,13 @@ class EstadoAplicacion:
                 return self._publicar_snapshot_reproduccion()
 
             cursor = int(self.validation_replay_state.get("cursor", 0))
+            active_baseline_id = self.validation_replay_state.get("baseline_id")
+            prepared_baseline_id = (self.future_baseline_template or {}).get("provenance", {}).get("baseline_id")
+            if cursor > 0 and active_baseline_id != prepared_baseline_id:
+                raise ValueError("La base de normalidad cambió durante una reproducción parcial; reiníciala antes de continuar.")
+            if cursor > 0 and self.validation_replay_state.get("statistical_evaluation_version") != "pre_suppression_v1":
+                raise ValueError("Esta reproducción parcial usa la semántica anterior; reiníciala antes de continuar.")
+            self.validation_replay_state["statistical_evaluation_version"] = "pre_suppression_v1"
             umbral_anterior = self.validation_replay_state.get("suspicion_threshold")
             umbral_activo = (
                 float(umbral_anterior)
@@ -966,6 +1022,7 @@ class EstadoAplicacion:
                 baseline=self.validation_baseline,
                 suspicion_threshold=suspicion_threshold,
             )
+            nuevas_detecciones = resultado.get("detections", resultado.get("results", []))
             reloj = lote["timestamp_dt"].max()
             nuevos_resultados = []
             for item in resultado.get("results", []):
@@ -1067,6 +1124,9 @@ class EstadoAplicacion:
                 nuevos_contextuales,
                 rutas_lote,
             )
+            if self.validation_replay_state.get("labelled"):
+                unmatched = labelled_evaluation.record(self._ruta_almacen_resultados_validacion(), nuevas_detecciones, lote, self.validation_baseline)
+                self.validation_replay_state["unmatched_label_detections"] += unmatched
             self.validation_context_events = siguientes_eventos_contextuales
             self.validation_diagnostic_events = self._recortar_eventos_diagnosticos(
                 eventos_diagnosticos, reloj, self.validation_replay_state["diagnostic_window_seconds"],
@@ -1082,8 +1142,15 @@ class EstadoAplicacion:
                 -VALIDATION_REPLAY_STATUS_RESULTS:
             ]
             delays_lote = [
-                float(item.get("replay", {}).get("detection_delay_seconds", 0.0))
-                for item in nuevos_resultados
+                max(
+                    0.0,
+                    (
+                        reloj
+                        - pd.to_datetime(item.get("timestamp"), errors="coerce", utc=True)
+                    ).total_seconds(),
+                )
+                for item in nuevas_detecciones
+                if pd.notna(pd.to_datetime(item.get("timestamp"), errors="coerce", utc=True))
             ]
             outcomes = dict(
                 self.validation_replay_state.get("contextual_outcomes", {})
@@ -1129,6 +1196,8 @@ class EstadoAplicacion:
                     "detection_count": int(
                         self.validation_replay_state.get("detection_count", 0)
                     )
+                    + len(nuevas_detecciones),
+                    "emitted_alert_count": int(self.validation_replay_state.get("emitted_alert_count", 0))
                     + len(nuevos_resultados),
                     "forwarded_count": int(self.validation_replay_state.get(
                         "forwarded_count", self.validation_replay_state.get("contextual_count", 0)))
@@ -1180,7 +1249,8 @@ class EstadoAplicacion:
                         "simulated_span_seconds": round(simulated_span, 3),
                         "events_per_second": round(len(lote) / max(elapsed, 1e-9), 3),
                         "keeps_up_with_event_time": elapsed <= max(simulated_span, 0.001),
-                        "new_detections": len(nuevos_resultados),
+                        "new_detections": len(nuevas_detecciones),
+                        "new_emitted_alerts": len(nuevos_resultados),
                         "forwarded": agrupacion_lote["forwarded"],
                         "suppressed": agrupacion_lote["suppressed"],
                         "contextual_evaluated": len(nuevos_contextuales),
@@ -1226,6 +1296,8 @@ class EstadoAplicacion:
             self.validation_last_results = []
             self.validation_last_contextual_results = []
             self._reiniciar_almacen_resultados_validacion()
+            labelled_evaluation.reset(self._ruta_almacen_resultados_validacion())
+            self.validation_replay_state["unmatched_label_detections"] = 0
             self.validation_replay_generation += 1
             self.validation_replay_worker = None
             self.validation_replay_pause = Event()
@@ -1705,7 +1777,7 @@ class EstadoAplicacion:
             eventos=self.historial.eventos,
             entidades=self.historial.entidades,
         )
-        return {"config_path": str(self.filtro_estadistico.continuos.conf_path), "configs": configs}
+        return {"config_path": str(self.filtro_estadistico.continuos.conf_path), "baseline_id": (self.future_baseline_template or {}).get("provenance", {}).get("baseline_id"), "configs": configs}
 
     def guardar_configuracion_continua(self, configs: list[dict[str, Any]]) -> dict[str, Any]:
         guardadas = self.filtro_estadistico.continuos.guardar_configuracion(configs)
@@ -1714,7 +1786,7 @@ class EstadoAplicacion:
         # La configuracion cambia la base estadistica. Se vuelve a congelar el
         # estado desde el historico aqui, nunca durante la carga de Evaluacion.
         self._preparar_continuidad_historica()
-        return {"config_path": str(self.filtro_estadistico.continuos.conf_path), "configs": guardadas}
+        return {"config_path": str(self.filtro_estadistico.continuos.conf_path), "baseline_id": (self.future_baseline_template or {}).get("provenance", {}).get("baseline_id"), "configs": guardadas}
 
     def mapa_contextual(self, force: bool = False) -> dict[str, Any]:
         if self.historial is None:
@@ -1980,6 +2052,7 @@ class EstadoAplicacion:
                 if self.future_baseline_template is None
                 else self.future_baseline_template.get("summary", {})
             ),
+            "baseline_id": (self.future_baseline_template or {}).get("provenance", {}).get("baseline_id"),
         }
 
     def _reset_analysis(self) -> None:
@@ -1995,8 +2068,7 @@ class EstadoAplicacion:
     ) -> dict[str, Any] | None:
         if not self._es_historial_real_activo() or not self.real_history_path.exists():
             return None
-        stat = self.real_history_path.stat()
-        conf_path = self.filtro_estadistico.continuos.conf_path
+        provenance = (self.future_baseline_template or {}).get("provenance", {})
         contextual_map_path = self._ruta_cache_contextual()
         contextual_map_expired: bool | None = None
         if (
@@ -2024,12 +2096,9 @@ class EstadoAplicacion:
             except (OSError, json.JSONDecodeError):
                 contextual_map_expired = True
         return {
-            "cache_version": 20,
-            "source_path": str(self.real_history_path),
-            "source_size": int(stat.st_size),
-            "source_mtime_ns": int(stat.st_mtime_ns),
-            "source_sha256": self._sha256_archivo(self.real_history_path),
-            "continuous_conf_sha256": self._sha256_archivo(conf_path) if conf_path.is_file() else "",
+            "cache_version": 23,
+            "baseline_id": provenance.get("baseline_id"),
+            "effective_parameters_sha256": provenance.get("effective_parameters_sha256"),
             "suspicion_threshold": round(float(suspicion_threshold), 6),
             "episode_policy_version": EPISODE_POLICY_VERSION,
             "suspicion_quiet_seconds": suspicion_quiet_seconds,
@@ -2061,17 +2130,17 @@ class EstadoAplicacion:
     def _identidad_normalidad_real(self) -> dict[str, Any] | None:
         if not self._es_historial_real_activo() or not self.real_history_path.exists():
             return None
-        stat = self.real_history_path.stat()
+        provenance = (self.future_baseline_template or {}).get("provenance", {})
+        if not provenance.get("baseline_id"):
+            return None
         return {
-            "cache_version": 2,
-            "source_path": str(self.real_history_path),
-            "source_size": int(stat.st_size),
-            "source_mtime_ns": int(stat.st_mtime_ns),
-            "source_sha256": self._sha256_archivo(self.real_history_path),
+            "cache_version": 5,
+            "baseline_id": provenance["baseline_id"],
+            "effective_parameters_sha256": provenance.get("effective_parameters_sha256"),
         }
 
     def _normality_cache_path(self, identidad: dict[str, Any]) -> Path:
-        nombre = f"normality_{identidad['source_sha256'][:16]}.json"
+        nombre = f"normality_{identidad['baseline_id'][:16]}.json"
         return self.analysis_cache_path.parent / nombre
 
     def _sha256_archivo(self, ruta: Path) -> str:
@@ -2319,6 +2388,8 @@ state = EstadoAplicacion(
     diagnostic_workbench=DiagnosticWorkbench(REVIEW_DATA_DIRECTORY),
 )
 app.include_router(crear_router_diagnostico(state.diagnostic_workbench))
+flow_store = FlowStore(Path(os.getenv("FLOW_LAB_DB_PATH", str(ARTIFACT_ROOT / "data/cache/flow_lab.sqlite3"))))
+flow_evaluation_jobs = FlowEvaluationJobs(flow_store)
 
 
 @app.get("/health", tags=["health"])
@@ -2417,6 +2488,28 @@ async def validation_replay_upload(request: Request) -> dict[str, Any]:
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/validation/labelled/upload", tags=["validation-replay"])
+async def labelled_upload(request: Request):
+    from starlette.concurrency import run_in_threadpool
+    try:
+        return await run_in_threadpool(state.subir_validacion, await request.body(),
+            unquote(request.headers.get("X-Filename", "ground_truth.csv")), True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/validation/labelled/metrics", tags=["validation-replay"])
+def labelled_metrics():
+    with state.validation_replay_lock:
+        replay = state.validation_replay_state
+        if not replay.get("labelled"):
+            return {"loaded": False, "entities": []}
+        return {"loaded": True, "filename": replay["filename"], "run_id": replay.get("diagnostic_run_id"), "status": replay["status"],
+            "statistical_evaluation_version": replay.get("statistical_evaluation_version"),
+            "unmatched_detections": replay.get("unmatched_label_detections", 0),
+            "entities": labelled_evaluation.summary(state._ruta_almacen_resultados_validacion(), int(replay.get("cursor", 0)))}
 
 
 @app.get("/validation/replay/status", tags=["validation-replay"])
@@ -2526,6 +2619,99 @@ def analyze_context() -> dict[str, Any]:
 @app.get("/context/results", tags=["contextual"])
 def contextual_results() -> dict[str, Any]:
     return state.contexto_actual()
+
+
+@app.get("/flows", tags=["flow-lab"])
+def flows() -> dict[str, Any]:
+    return {"items": flow_store.list(), "default": default_flow()}
+
+
+@app.post("/flows/validate", tags=["flow-lab"])
+async def validate_flow_payload(request: Request) -> dict[str, Any]:
+    try:
+        return validate_flow(await request.json())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/flows", tags=["flow-lab"])
+async def create_flow(request: Request) -> dict[str, Any]:
+    try:
+        return flow_store.create(await request.json())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/flows/{flow_id}", tags=["flow-lab"])
+def get_flow(flow_id: str) -> dict[str, Any]:
+    try:
+        return flow_store.get(flow_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
+
+
+@app.put("/flows/{flow_id}", tags=["flow-lab"])
+async def update_flow(flow_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return flow_store.update(flow_id, await request.json())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/flows/{flow_id}/runs", tags=["flow-lab"])
+def run_flow(flow_id: str, request: FlowRunRequest) -> dict[str, Any]:
+    try:
+        flow = flow_store.get(flow_id)
+        with state.validation_replay_lock:
+            if state.historial is None or state.future_baseline_template is None:
+                raise ValueError("Carga el histórico de Desarrollo y espera a que se prepare el detector.")
+            if state.eventos_validacion_ordenados is None:
+                raise ValueError("Carga los eventos futuros o un conjunto etiquetado en Evaluación de flujos.")
+            development = state.historial.eventos.copy(deep=True)
+            future = state.eventos_validacion_ordenados.copy(deep=True)
+            entities = state.historial.entidades.copy(deep=True)
+            baseline = deepcopy(state.future_baseline_template)
+            context_map = deepcopy(state.future_context_map_template or {})
+            truth = labelled_evaluation.read_truth(state._ruta_almacen_resultados_validacion()) if state.validation_replay_state.get("labelled") else []
+            filename = state.validation_replay_state.get("filename")
+            runner = CausalFlowRunner(deepcopy(state.filtro_estadistico), deepcopy(state.filtro_contextual), state.diagnostic_workbench)
+        def evaluate(progress):
+            summary, results, snapshot = runner.evaluate(flow, development, future, entities, context_map, baseline, truth, progress)
+            snapshot["source"]["filename"] = filename
+            return summary, results, snapshot
+        return flow_evaluation_jobs.start(flow_id, evaluate)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/flow-evaluations/{job_id}", tags=["flow-evaluation"])
+def flow_evaluation_status(job_id: str):
+    try:
+        return flow_evaluation_jobs.get(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="La evaluación no está disponible; el servicio pudo reiniciarse. Las ejecuciones terminadas siguen guardadas.") from exc
+
+
+@app.get("/flow-runs", tags=["flow-lab"])
+def flow_runs(flow_id: str | None = None) -> dict[str, Any]:
+    return {"items": flow_store.list_runs(flow_id)}
+
+
+@app.get("/flow-runs/{run_id}/results", tags=["flow-lab"])
+def flow_run_results(
+    run_id: str,
+    node_id: str = "output",
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    try:
+        return flow_store.results(run_id, node_id, offset, limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Ejecución no encontrada.") from exc
 
 
 

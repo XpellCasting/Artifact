@@ -186,6 +186,7 @@ class FiltroEstadoMultivalorEstadistico:
             resultados.append(
                 {
                     "entity_id": entity_id,
+                    "source_raw_index": fila.get("_raw_index"),
                     "timestamp": str(fila["timestamp"]),
                     "window_start": str(fila["window_start"]),
                     "window_end": str(fila["timestamp"]),

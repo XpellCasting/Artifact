@@ -51,9 +51,12 @@ falla**, conservando la evidencia del diagnóstico. También se pueden incorpora
 anotaciones de anomalía ambiental como clase distinta de falla. Los casos
 inciertos no se convierten en etiquetas conocidas.
 
-Las anotaciones verificadas exigen los criterios de evidencia de la revisión.
-Los borradores requieren habilitar expresamente **Incluir borradores y casos
-exploratorios** al construir el conjunto. El conjunto y sus modelos conservan
+Las anotaciones revisadas requieren responsable y observaciones del histórico.
+Su evaluación mide acuerdo con la interpretación manual. Las inyecciones
+controladas documentan intervenciones conocidas sobre una base cuya normalidad
+se asume tras la revisión. El origen se conserva en cada ejemplo exportado.
+Las anotaciones pendientes requieren habilitar expresamente **Incluir pendientes
+y casos exploratorios** al construir el conjunto. El conjunto y sus modelos conservan
 esa condición; no adquieren verificación por haber sido procesados.
 
 ### 2. Incorporar casos de falla

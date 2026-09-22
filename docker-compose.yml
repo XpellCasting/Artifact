@@ -11,6 +11,7 @@ services:
       CONTINUOUS_CONF_PATH: /app/data/cache/conf.txt
       CONTEXT_MAP_CACHE_PATH: /app/data/cache/contextual_map.json
       REVIEW_DATA_DIR: /app/data/review
+      FLOW_LAB_DB_PATH: /app/data/cache/flow_lab.sqlite3
       VALIDATION_REPLAY_MEMORY_RESULTS: "500"
       VALIDATION_REPLAY_STATUS_RESULTS: "25"
       CONTEXT_CONTINUOUS_MAX_AGE_SECONDS: "3600"

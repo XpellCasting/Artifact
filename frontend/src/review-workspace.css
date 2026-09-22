@@ -104,3 +104,15 @@
 @media (max-width: 1200px) { .review-fields { grid-template-columns: repeat(2,minmax(0,1fr)); } .review-context-list { grid-template-columns: repeat(2,minmax(0,1fr)); } }
 @media (max-width: 760px) { .review-header { flex-direction: column; gap: 12px; } .review-panel { padding: 16px; } .review-import-row { grid-template-columns: minmax(0,1fr); } .review-panel-title { align-items: flex-start; flex-wrap: wrap; } .review-annotation-item { align-items: flex-start; flex-direction: column; } .review-chart { padding: 11px 5px 4px; } .review-chart-heading { padding: 0 6px 4px; } .review-upload-progress { grid-template-columns: 1fr; } }
 @media (max-width: 520px) { .review-fields, .review-annotation-form, .review-context-list { grid-template-columns: minmax(0,1fr); } .review-header h2 { font-size: 24px; } .review-chart svg { min-height: 100px; } .review-actions > .review-button { flex: 1 1 auto; } }
+.review-point-editor { border: 1px solid #447e6c; background: #0f211b; border-radius: 8px; padding: 16px; margin: 10px 0 20px; }
+.review-point-editor strong { display: block; overflow-wrap: anywhere; }
+.review-chart circle[role="button"] { cursor: pointer; stroke: transparent; stroke-width: 5px; }
+.review-chart circle[role="button"]:hover, .review-chart circle[role="button"]:focus { stroke: white; stroke-width: 2px; }
+.review-chart .review-label-normal { fill: #54ce94; }
+.review-chart .review-label-environmental_anomaly { fill: #efbf57; }
+.review-chart .review-label-sensor_fault { fill: #f47373; }
+.review-chart .review-label-unlabelled { fill: #9aa8b8; }
+.review-point-picker { padding: 6px 8px 12px; }
+.review-point-faults { margin-top: 12px; }
+.review-point-faults summary { cursor: pointer; width: fit-content; padding: 9px 13px; border: 1px solid #52605b; border-radius: 7px; }
+.review-zoom-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 8px 0; color: #a1b5ac; font-size: 12px; }

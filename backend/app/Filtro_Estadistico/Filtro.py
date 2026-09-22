@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from .Continuos import FiltroContinuoEstadistico
+from .Continuos_Temporales import FiltroContinuoTemporal
 from .Estados_Binarios import FiltroEstadoBinarioEstadistico
 from .Estados_Multivalor import FiltroEstadoMultivalorEstadistico
 
@@ -19,6 +20,7 @@ class FiltroEstadistico:
 
     def __init__(self) -> None:
         self.continuos = FiltroContinuoEstadistico()
+        self.continuos_temporales = FiltroContinuoTemporal()
         self.binarios = FiltroEstadoBinarioEstadistico()
         self.multivalor = FiltroEstadoMultivalorEstadistico()
         self.umbral_activacion_lapsos = 0.35

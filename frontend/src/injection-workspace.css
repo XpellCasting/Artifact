@@ -59,3 +59,7 @@
 @media (max-width: 1100px) { .injection-fields { grid-template-columns: repeat(2,minmax(0,1fr)); } .injection-stats { grid-template-columns: repeat(3,minmax(0,1fr)); } }
 @media (max-width: 760px) { .injection-result { padding: 13px; } .injection-result-heading { align-items: flex-start; flex-direction: column; } .injection-run { align-items: flex-start; flex-direction: column; } .injection-comparison svg { min-height: 120px; } }
 @media (max-width: 520px) { .injection-fields { grid-template-columns: minmax(0,1fr); } .injection-stats { grid-template-columns: repeat(2,minmax(0,1fr)); } .injection-saved-heading { align-items: flex-start; flex-direction: column; } .injection-result-heading > button { width: 100%; } }
+.injection-fragment-picker { margin: 18px 0; padding: 16px; border: 1px solid #386357; border-radius: 8px; }
+.injection-fragment-picker circle[role="button"] { cursor: crosshair; stroke: transparent; stroke-width: 6px; }
+.injection-fragment-picker circle[role="button"]:hover, .injection-fragment-picker circle[role="button"]:focus { stroke: #e4f3eb; stroke-width: 2px; outline: none; }
+.injection-fragment-picker .review-button[aria-pressed="true"] { border-color: #66c6b2; background: #163d32; }

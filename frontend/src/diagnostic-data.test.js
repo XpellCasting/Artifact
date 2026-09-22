@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { annotationDiagnosticProblem, faultTypeForLabel } from "./diagnostic-data.js";
 
-const normal = { label: "normal", status: "verified", reviewer: "Revisor", evidence: "Registro independiente revisado." };
+const normal = { label: "normal", status: "reviewed", reviewer: "Revisor", evidence: "Histórico inspeccionado manualmente." };
 
 test("diagnostic sources distinguish reviewed normal data from unresolved and untyped faults", () => {
   assert.equal(annotationDiagnosticProblem(normal), "");
@@ -13,9 +13,9 @@ test("diagnostic sources distinguish reviewed normal data from unresolved and un
 });
 
 test("draft sources require explicit exploratory use and documented review", () => {
-  assert.match(annotationDiagnosticProblem({ ...normal, status: "draft" }), /borrador/);
+  assert.match(annotationDiagnosticProblem({ ...normal, status: "draft" }), /pendiente/);
   assert.equal(annotationDiagnosticProblem({ ...normal, status: "draft" }, true), "");
-  assert.match(annotationDiagnosticProblem({ ...normal, status: "draft", evidence: "" }, true), /evidencia/);
+  assert.match(annotationDiagnosticProblem({ ...normal, status: "draft", evidence: "" }, true), /observaciones/);
 });
 
 test("changing a review class clears a fault type that no longer applies", () => {

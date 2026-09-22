@@ -1,8 +1,11 @@
+import { reviewStatusLabel, reviewStatus } from "./review-annotations.js";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Download, FlaskConical, FolderOpen, Loader2, RefreshCw } from "lucide-react";
 import { reviewMicros, reviewUtcTimestamp, validReviewInterval } from "./review-time.js";
 import "./injection-workspace.css";
 import { annotationKey, injectionBaselineProblems } from "./review-annotations.js";
+import ScenarioWorkspace from "./ScenarioWorkspace.jsx";
+import InjectionFragmentPicker from "./InjectionFragmentPicker.jsx";
 
 const PARTITIONS = { development: "Desarrollo", validation: "Validación", test: "Prueba" };
 const KINDS = {
@@ -20,7 +23,7 @@ const INVALID_STATES = new Set(["", "unknown", "unavailable", "none", "null", "n
 const LABELS = { normal: "Normal", environmental_anomaly: "Anomalía ambiental", sensor_fault: "Falla del sensor", uncertain: "Incierto" };
 const timestampLabel = (value) => String(value || "—").replace("T", " ").replace(/\+00:00$/, "Z");
 const finiteState = (value) => !INVALID_STATES.has(String(value ?? "").trim().toLowerCase()) && Number.isFinite(Number(value));
-const validState = (value) => !INVALID_STATES.has(String(value ?? "").trim().toLowerCase());
+const validState = (value) => String(value).trim() === "NONE" || !INVALID_STATES.has(String(value ?? "").trim().toLowerCase());
 
 async function request(base, path, options = {}) {
   const response = await fetch(`${base.replace(/\/$/, "")}${path}`, options);
@@ -31,7 +34,7 @@ async function request(base, path, options = {}) {
   return response.json();
 }
 
-function Comparison({ run, continuous }) {
+export function Comparison({ run, continuous, onSelectTime, originalOnly = false, title = "Comparación del caso guardado" }) {
   const [changesOnly, setChangesOnly] = useState(false);
   const points = run.preview || [];
   const tablePoints = changesOnly ? points.filter((point) => point.changed) : points;
@@ -73,21 +76,21 @@ function Comparison({ run, continuous }) {
   const start = reviewMicros(run.start);
   const end = reviewMicros(run.end);
   return <div className="injection-comparison">
-    <div className="injection-comparison-heading"><h4>Comparación del caso guardado</h4><div className="injection-legend"><span><i className="injection-original-swatch" />Original</span><span><i className="injection-altered-swatch" />Con inyección</span><span><i className="injection-invalid-swatch" />Estado no válido</span></div></div>
-    {points.length ? <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Comparación de lecturas originales y alteradas de ${run.entity_id}. El intervalo de intervención aparece sombreado. Los valores exactos están en la tabla.`}>
+    <div className="injection-comparison-heading"><h4>{title}</h4><div className="injection-legend"><span><i className="injection-original-swatch" />Original</span>{!originalOnly && <span><i className="injection-altered-swatch" />Con inyección</span>}<span><i className="injection-invalid-swatch" />Estado no válido</span></div></div>
+    {points.length ? <svg viewBox={`0 0 ${width} ${height}`} role={onSelectTime ? "group" : "img"} aria-label={`Comparación de lecturas originales y alteradas de ${run.entity_id}. El intervalo de intervención aparece sombreado. Los valores exactos están en la tabla.`}>
       {start !== null && end !== null && <rect x={Math.max(left, Math.min(width - right, x(start)))} y={top - 8} width={Math.max(1, Math.min(width - right, x(end)) - Math.max(left, x(start)))} height={height - top - bottom + 16} className="injection-window" />}
       {ticks.map((tick) => <g key={tick.value}><line x1={left} x2={width - right} y1={y(tick.value)} y2={y(tick.value)} className="injection-grid-line" /><text x={left - 10} y={y(tick.value) + 4} textAnchor="end" className="injection-axis"><title>{tick.text}</title>{tick.text.length > 14 ? `${tick.text.slice(0, 13)}…` : tick.text}</text></g>)}
       <path d={path("original_state")} className="injection-original-line" />
-      <path d={path("injected_state")} className="injection-altered-line" />
-      {points.flatMap((point, index) => ["original_state", "injected_state"].map((field) => {
+      {!originalOnly && <path d={path("injected_state")} className="injection-altered-line" />}
+      {points.flatMap((point, index) => (originalOnly ? ["original_state"] : ["original_state", "injected_state"]).map((field) => {
         const value = valueOf(point[field]);
         if (times[index] === null) return null;
-        return <circle key={`${index}-${field}`} cx={x(times[index])} cy={Number.isFinite(value) ? y(value) : height - bottom + (field === "original_state" ? 14 : 24)} r={Number.isFinite(value) ? 2 : 3} className={Number.isFinite(value) ? field === "original_state" ? "injection-original-point" : "injection-altered-point" : "injection-invalid-point"} />;
+        return <circle key={`${index}-${field}`} cx={x(times[index])} cy={Number.isFinite(value) ? y(value) : height - bottom + (field === "original_state" ? 14 : 24)} r={onSelectTime ? 4 : Number.isFinite(value) ? 2 : 3} role={onSelectTime ? "button" : undefined} tabIndex={onSelectTime ? 0 : undefined} aria-label={onSelectTime ? `Seleccionar ${reviewUtcTimestamp(point.timestamp)}, valor ${point[field]}` : undefined} onClick={() => onSelectTime?.(point.timestamp)} onKeyDown={event => { if (onSelectTime && ["Enter", " "].includes(event.key)) { event.preventDefault(); onSelectTime(point.timestamp); } }} className={Number.isFinite(value) ? field === "original_state" ? "injection-original-point" : "injection-altered-point" : "injection-invalid-point"}><title>{`${reviewUtcTimestamp(point.timestamp)} · ${point[field]}`}</title></circle>;
       }))}
       <text x={left} y={height - 9} className="injection-axis">{timestampLabel(points[0].timestamp)}</text><text x={width - right} y={height - 9} textAnchor="end" className="injection-axis">{timestampLabel(points[points.length - 1].timestamp)}</text>
     </svg> : <p className="review-help">No hay vista previa para este caso. Descarga el ZIP para inspeccionar sus datos.</p>}
-    <p className="review-help">La comparación muestra la entidad intervenida y su contexto temporal. {run.preview_sampled ? "La vista está muestreada; el ZIP conserva la resolución completa." : "Consulta los valores exactos en la tabla."} Las demás entidades conservan sus lecturas originales.</p>
-    <details className="injection-preview-table"><summary>Lecturas originales y alteradas · {points.length} filas en la vista</summary><label className="injection-checkbox"><input type="checkbox" checked={changesOnly} onChange={(event) => setChangesOnly(event.target.checked)} />Mostrar solo filas modificadas en esta vista</label><div className="review-table-scroll"><table><thead><tr><th>Fila de origen</th><th>Fecha y hora (zona original)</th><th>Original</th><th>Con inyección</th><th>Modificada</th></tr></thead><tbody>{tablePoints.map((point, index) => <tr key={`${point.source_row}-${index}`} className={point.changed ? "injection-changed-row" : undefined}><td>{point.source_row}</td><td>{timestampLabel(point.timestamp)}</td><td>{String(point.original_state)}</td><td>{String(point.injected_state)}</td><td>{point.changed ? "Sí" : "No"}</td></tr>)}</tbody></table>{!tablePoints.length && <p className="review-empty">No hay filas que mostrar con este filtro.</p>}</div></details>
+    <p className="review-help">{originalOnly ? "Lecturas originales de la entidad; todavía no se han modificado. " : "La comparación muestra la entidad intervenida y su contexto temporal. "}{run.preview_sampled ? "La vista está muestreada; la inyección usa la resolución completa." : "Consulta las fechas y valores exactos."}</p>
+    {!originalOnly && <details className="injection-preview-table"><summary>Lecturas originales y alteradas · {points.length} filas en la vista</summary><label className="injection-checkbox"><input type="checkbox" checked={changesOnly} onChange={(event) => setChangesOnly(event.target.checked)} />Mostrar solo filas modificadas en esta vista</label><div className="review-table-scroll"><table><thead><tr><th>Fila de origen</th><th>Fecha y hora (zona original)</th><th>Original</th><th>Con inyección</th><th>Modificada</th></tr></thead><tbody>{tablePoints.map((point, index) => <tr key={`${point.source_row}-${index}`} className={point.changed ? "injection-changed-row" : undefined}><td>{point.source_row}</td><td>{timestampLabel(point.timestamp)}</td><td>{String(point.original_state)}</td><td>{String(point.injected_state)}</td><td>{point.changed ? "Sí" : "No"}</td></tr>)}</tbody></table>{!tablePoints.length && <p className="review-empty">No hay filas que mostrar con este filtro.</p>}</div></details>}
   </div>;
 }
 
@@ -102,6 +105,7 @@ export default function InjectionWorkspace({ apiBaseUrl = "http://localhost:8000
   const [replacementState, setReplacementState] = useState("");
   const [runs, setRuns] = useState([]);
   const [result, setResult] = useState(null);
+  const [lastCreated, setLastCreated] = useState(null);
   const [listBusy, setListBusy] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [openingId, setOpeningId] = useState("");
@@ -116,7 +120,8 @@ export default function InjectionWorkspace({ apiBaseUrl = "http://localhost:8000
   const openSequence = useRef(0);
   const currentBaseVersion = useRef("");
   const reviewedAnnotations = useMemo(() => annotations.filter((annotation) => annotation.dataset_id === datasetId), [annotations, datasetId]);
-  const base = reviewedAnnotations.find((annotation) => annotationKey(annotation) === baseId);
+  const intervalAnnotations = useMemo(() => reviewedAnnotations.filter(annotation => annotation.source_row == null), [reviewedAnnotations]);
+  const base = intervalAnnotations.find((annotation) => annotationKey(annotation) === baseId);
   const baselineProblems = injectionBaselineProblems(base);
   const entity = dataset?.entities?.find((item) => item.entity_id === base?.entity_id);
   const types = entity?.kind === "continuous" ? CONTINUOUS_KINDS : DISCRETE_KINDS;
@@ -132,12 +137,13 @@ export default function InjectionWorkspace({ apiBaseUrl = "http://localhost:8000
     controllers.current.forEach((controller) => controller.abort());
     controllers.current.clear();
     openSequence.current += 1;
+    setLastCreated(null);
     setBaseId(""); setRuns([]); setResult(null); setError(""); setNotice(""); setGenerating(false); setOpeningId(""); setExportingId("");
   }, [datasetId]);
 
   useEffect(() => {
-    setBaseId((current) => reviewedAnnotations.some((annotation) => annotationKey(annotation) === current) ? current : annotationKey(reviewedAnnotations[0]));
-  }, [reviewedAnnotations]);
+    setBaseId((current) => intervalAnnotations.some((annotation) => annotationKey(annotation) === current) ? current : annotationKey(intervalAnnotations[0]));
+  }, [intervalAnnotations]);
 
   useEffect(() => {
     if (lastSavedAnnotation?.dataset_id === datasetId) setBaseId(annotationKey(lastSavedAnnotation));
@@ -173,7 +179,7 @@ export default function InjectionWorkspace({ apiBaseUrl = "http://localhost:8000
   const needsAmount = Boolean(KINDS[kind]?.amount);
   const validAmount = !needsAmount || (amount.trim() !== "" && Number.isFinite(Number(amount)) && (kind === "noise" ? Number(amount) > 0 : Number(amount) !== 0));
   const validSeed = seed.trim() !== "" && Number.isInteger(Number(seed)) && Number(seed) >= 0 && Number(seed) <= 2147483647;
-  const validReplacement = kind !== "state_replace" || (replacementState.trim().length > 0 && !INVALID_STATES.has(replacementState.trim().toLowerCase()));
+  const validReplacement = kind !== "state_replace" || (replacementState.trim().length > 0 && validState(replacementState));
   const validDriftDuration = kind !== "drift" || (a !== null && b !== null && a < b);
   const canGenerate = Boolean(base && !baselineProblems.length && entity && types.includes(kind) && validInterval && validDriftDuration && validAmount && validSeed && validReplacement && !generating);
   const duration = validInterval ? Number(b - a) / 1000000 : null;
@@ -192,6 +198,7 @@ export default function InjectionWorkspace({ apiBaseUrl = "http://localhost:8000
       if (controller.signal.aborted || !mounted.current || activeDataset.current !== scope) return;
       openSequence.current += 1;
       setOpeningId(""); setResult(saved);
+      setLastCreated(saved);
       setRuns((current) => [saved, ...current.filter((run) => run.injection_id !== saved.injection_id)]);
       setNotice(`Caso guardado con ${saved.changed_rows} filas modificadas.${currentBaseVersion.current !== version ? " El resultado conserva la revisión y los parámetros utilizados al generar." : ""}`);
     } catch (failure) {
@@ -252,12 +259,13 @@ export default function InjectionWorkspace({ apiBaseUrl = "http://localhost:8000
     <p className="review-help injection-intro">Usa una revisión guardada como Normal, elige una intervención y conserva una copia del resultado. Cada caso registra su semilla, su revisión de origen y la partición del histórico.</p>
     {error && <div className="review-alert injection-feedback" role="alert">{error}</div>}
     {notice && <div className="review-notice injection-feedback" role="status">{notice}</div>}
-    {!reviewedAnnotations.length ? <div className="review-empty injection-empty"><FlaskConical size={26} /><p>Guarda una anotación del histórico para cargarla aquí.</p><span>Para generar inyecciones, necesita clase Normal, revisor y evidencia. Una revisión visual en borrador permite crear casos exploratorios.</span></div> : <form onSubmit={generate}>
+    {!intervalAnnotations.length ? <div className="review-empty injection-empty"><FlaskConical size={26} /><p>Guarda una anotación del histórico para cargarla aquí.</p><span>Para generar inyecciones, guarda una referencia Normal como Revisado, con responsable y observaciones del histórico. No se exige evidencia externa.</span></div> : <form onSubmit={generate}>
       <fieldset disabled={generating}>
         <label className="injection-base-label">Revisión base para la inyección<select value={baseId} onChange={(event) => { setBaseId(event.target.value); setError(""); }}>
-          {reviewedAnnotations.map((annotation) => <option key={annotationKey(annotation)} value={annotationKey(annotation)}>{annotation.entity_id} · {timestampLabel(annotation.start)} · {LABELS[annotation.label] || annotation.label} · revisión {annotation.revision} · {injectionBaselineProblems(annotation).length ? "requiere completar revisión" : annotation.status === "verified" ? "verificada" : "borrador"}</option>)}
+          {intervalAnnotations.map((annotation) => <option key={annotationKey(annotation)} value={annotationKey(annotation)}>{annotation.entity_id} · {timestampLabel(annotation.start)} · {LABELS[annotation.label] || annotation.label} · revisión {annotation.revision} · {injectionBaselineProblems(annotation).length ? "requiere completar revisión" : reviewStatusLabel(annotation)}</option>)}
         </select></label>
-        {base && (baselineProblems.length ? <div className="injection-baseline-note" role="status"><strong>Anotación cargada · pendiente para generar inyecciones</strong><span>Abre esta anotación en «Anotaciones del histórico», completa lo siguiente en el paso 4 y guarda los cambios:</span><ul>{baselineProblems.map((problem) => <li key={problem}>{problem}</li>)}</ul><small>Revisión {base.revision} · {timestampLabel(base.start)} → {timestampLabel(base.end)}</small></div> : <div className={`injection-baseline-note ${base.status === "verified" ? "injection-baseline-verified" : ""}`}><strong>{base.status === "verified" ? "Base normal verificada · caso evaluable" : "Base normal en borrador · caso exploratorio"}</strong><span>{base.status === "verified" ? "La evaluación se refiere a una intervención semisintética sobre esta revisión." : "La normalidad de la base sigue pendiente de verificación. Este caso se guarda como no evaluable."} Las etiquetas de la intervención no convierten el resto del histórico en datos normales.</span><small>{PARTITIONS[base.partition] || base.partition} · {base.reviewer} · intervalo revisado: {timestampLabel(base.start)} → {timestampLabel(base.end)}</small></div>)}
+        {base && (baselineProblems.length ? <div className="injection-baseline-note" role="status"><strong>Anotación cargada · pendiente para generar inyecciones</strong><span>Abre esta anotación en «Anotaciones del histórico», completa lo siguiente en el paso 4 y guarda los cambios:</span><ul>{baselineProblems.map((problem) => <li key={problem}>{problem}</li>)}</ul><small>Revisión {base.revision} · {timestampLabel(base.start)} → {timestampLabel(base.end)}</small></div> : <div className={`injection-baseline-note ${reviewStatus(base) === "reviewed" ? "injection-baseline-verified" : ""}`}><strong>{reviewStatus(base) === "reviewed" ? "Base normal revisada · inyección evaluable" : "Revisión pendiente · completa la anotación"}</strong><span>{reviewStatus(base) === "reviewed" ? "Origen: inyección controlada. La intervención será conocida; la normalidad del original se asume tras revisar el histórico." : "Guarda el fragmento como Revisado para usarlo como base."} Las etiquetas de la intervención no convierten el resto del histórico en datos normales.</span><small>{PARTITIONS[base.partition] || base.partition} · {base.reviewer} · intervalo revisado: {timestampLabel(base.start)} → {timestampLabel(base.end)}</small></div>)}
+        <InjectionFragmentPicker apiBaseUrl={apiBaseUrl} base={base} entity={entity} start={start} end={end} onStart={setStart} onEnd={setEnd} disabled={generating} Comparison={Comparison} />
         <div className="injection-fields">
           <label>Tipo de inyección<select value={kind} onChange={(event) => setKind(event.target.value)}>{types.map((type) => <option key={type} value={type}>{KINDS[type].label}</option>)}</select></label>
           <label>Semilla de reproducción<input type="number" inputMode="numeric" min="0" max="2147483647" step="1" value={seed} onChange={(event) => setSeed(event.target.value)} /></label>
@@ -278,11 +286,12 @@ export default function InjectionWorkspace({ apiBaseUrl = "http://localhost:8000
     {result && <article className="injection-result" aria-label="Resultado de la inyección guardada">
       <div className="injection-result-heading"><div><span className="review-eyebrow">Caso guardado</span><h4>{KINDS[result.kind]?.label || result.kind} · {result.entity_id}</h4><small>{result.injection_id}</small></div><button className="review-button" type="button" onClick={() => download(result.injection_id)} disabled={Boolean(exportingId)}>{exportingId === result.injection_id ? <Loader2 size={15} className="review-spin" /> : <Download size={15} />}Descargar ZIP del caso</button></div>
       <div className="injection-stats"><div><span>Filas modificadas</span><strong>{Number(result.changed_rows || 0).toLocaleString("es-CL")}</strong></div><div><span>Filas exportadas</span><strong>{Number(result.exported_rows || 0).toLocaleString("es-CL")}</strong></div><div><span>Semilla</span><strong>{result.seed}</strong></div><div><span>Partición heredada</span><strong>{PARTITIONS[result.partition] || result.partition}</strong></div><div><span>Revisión de origen</span><strong>{result.annotation_revision}</strong></div></div>
-      <p className="review-help"><span className={`review-status ${result.evaluable ? "review-verified" : ""}`}>{result.evaluable ? "Evaluable · semisintético" : "Exploratorio · no evaluable"}</span> {timestampLabel(result.start)} → {timestampLabel(result.end)}{KINDS[result.kind]?.amount ? ` · ${KINDS[result.kind].amount}: ${result.amount}` : ""}{result.kind === "state_replace" ? ` · estado: ${result.replacement_state}` : ""}</p>
+      <p className="review-help"><span className={`review-status ${result.evaluable ? "review-verified" : ""}`}>{result.evaluable ? "Inyección controlada · evaluable" : "Exploratorio · no evaluable"}</span> {timestampLabel(result.start)} → {timestampLabel(result.end)}{KINDS[result.kind]?.amount ? ` · ${KINDS[result.kind].amount}: ${result.amount}` : ""}{result.kind === "state_replace" ? ` · estado: ${result.replacement_state}` : ""}</p>
       {(result.warnings || []).length > 0 && <ul className="injection-warnings">{result.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
       <Comparison key={result.injection_id} run={result} continuous={dataset?.entities?.find((item) => item.entity_id === result.entity_id)?.kind === "continuous"} />
     </article>}
     <div className="injection-saved-heading"><h4>Casos guardados de este histórico</h4><button className="review-button injection-refresh" type="button" onClick={() => setRefresh((value) => value + 1)} disabled={listBusy || generating}><RefreshCw size={14} className={listBusy ? "review-spin" : ""} />Actualizar casos</button></div>
     {listBusy ? <p className="review-help" role="status">Cargando casos guardados…</p> : !runs.length ? <p className="review-help">Todavía no hay inyecciones guardadas para este histórico.</p> : <div className="injection-run-list">{runs.map((run) => <article key={run.injection_id} className={`injection-run ${result?.injection_id === run.injection_id ? "injection-run-active" : ""}`}><div><strong>{KINDS[run.kind]?.label || run.kind} · {run.entity_id}</strong><p>{timestampLabel(run.start)} → {timestampLabel(run.end)}</p><small>{run.changed_rows} filas modificadas · semilla {run.seed} · revisión {run.annotation_revision} · {run.evaluable ? "evaluable" : "exploratorio"}</small></div><div className="review-actions"><button className="review-button" type="button" onClick={() => openRun(run.injection_id)} disabled={generating || openingId === run.injection_id} aria-label={`Abrir caso ${run.injection_id}`}>{openingId === run.injection_id ? <Loader2 size={14} className="review-spin" /> : <FolderOpen size={14} />}Abrir</button><button className="review-button" type="button" onClick={() => download(run.injection_id)} disabled={Boolean(exportingId)} aria-label={`Descargar ZIP del caso ${run.injection_id}`}>{exportingId === run.injection_id ? <Loader2 size={14} className="review-spin" /> : <Download size={14} />}ZIP</button></div></article>)}</div>}
+    <ScenarioWorkspace key={datasetId} apiBaseUrl={apiBaseUrl} dataset={dataset} runs={runs} annotations={reviewedAnnotations} lastCreated={lastCreated} Comparison={Comparison} />
   </section>;
 }

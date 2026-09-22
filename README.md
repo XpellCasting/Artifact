@@ -35,18 +35,74 @@ El alcance actual cubre:
 
 ## Revisión y etiquetado de fragmentos reales
 
+### Exploración manual
+
+Después de seleccionar el histórico, **Explorar histórico** permite comparar
+todas sus entidades: filas válidas e inválidas, primera y última observación,
+estados distintos, cambios de estado y mayor intervalo entre reportes. La tabla
+admite búsqueda, filtro por tipo y ordenamiento. No aplica el recorte de 30 días.
+Un intervalo sin reportes no se interpreta automáticamente como desconexión.
+Los cambios se cuentan entre reportes válidos consecutivos, sin atravesar un
+reporte inválido; las continuas muestran un guion en esa columna.
+
+**Explorar** abre el primer día UTC con datos de la entidad. La actividad diaria
+cubre todo el archivo e incluye días con cero reportes. El intervalo elegido
+muestra frecuencias de categorías (porcentaje de registros válidos, no tiempo)
+o mínimo, mediana y máximo numéricos. Los resúmenes son exactos; el gráfico puede
+muestrearse y lo indica. **Revisar este intervalo** abre el visor existente con
+la misma entidad, partición y límites con precisión de microsegundos. No guarda
+anotaciones, no propone ventanas y no ejecuta filtros ni inyecciones.
+
+API: `GET /review/datasets/{dataset_id}/exploration` devuelve el resumen completo
+con versión, identidad de fuente y actividad diaria observada. `GET
+/review/datasets/{dataset_id}/exploration/entity?entity_id=...&start=...&end=...`
+devuelve el detalle exacto del intervalo, actividad diaria con ceros y gráfico
+limitado a 600 puntos. Se reutiliza el índice SQLite; el resumen se calcula bajo
+demanda y se conserva en `exploration_cache`.
+
+El literal categórico **`NONE`** es válido en carga, revisión, diagnóstico y
+reemplazo de estados. Los marcadores `unknown`, `unavailable`, cadenas vacías y
+`none` en minúsculas siguen siendo inválidos. Al consultar históricos antiguos
+se actualiza su índice de validez y se invalida el resumen sin cambiar fuentes,
+anotaciones ni revisiones guardadas. Las cachés de análisis y normalidad también
+se versionan para evitar reutilizar resultados previos a la corrección.
+
+La clasificación se calcula por entidad sobre sus estados válidos y se comparte
+entre la carga del histórico y Revisión. `sensor_kind` en el CSV permite declarar
+`continuous`, `binary` o `multistate`; declaraciones contradictorias para una misma
+entidad se rechazan. Las declaraciones tienen prioridad sobre la inferencia.
+
+Se reconocen dominios categóricos como `person`, `device_tracker`, `select`,
+`input_select`, `input_datetime` y `counter`. Identificadores con palabras como
+`count`, `cantidad`, `location`, `ubicacion`, `schedule` o `horario` orientan la
+clasificación a multiestado. No hay excepciones por identificador completo.
+Los estados textuales mezclados, como `home`, `matt` y `matt home`, mantienen un
+único tipo categórico. Los valores originales se conservan; los números usados
+como categorías no pasan al filtro de magnitudes continuas.
+
+Una unidad o clase de medición y nombres como temperatura, batería o iluminancia
+protegen las mediciones numéricas. Pocos valores enteros no bastan para deducir
+categorías: un código numérico sin semántica reconocible necesita `sensor_kind`.
+Horarios/categorías y fechas pueden clasificarse como multiestado, pero siguen
+sujetos a los requisitos de historial y cardinalidad del filtro; una fecha
+distinta en cada registro no constituye automáticamente un catálogo útil.
+
+Tras actualizar el backend, recargar Desarrollo aplica esta clasificación.
+Las cachés de análisis y normalidad anteriores se invalidan; los catálogos ya
+importados en Revisión se actualizan al consultarlos conservando las anotaciones.
+
 La nueva pestaña permite importar un CSV con su partición (Desarrollo,
 Validación o Prueba), elegir una entidad y otras de contexto, revisar un
 intervalo y guardar una anotación. Los tiempos se introducen en UTC; la vista
 incluye un margen antes y después del intervalo etiquetado. No ejecuta filtros
 ni modifica su normalidad, parámetros o datos de reproducción.
 
-Las etiquetas iniciales son `Incierto` y `Borrador`. Para declarar un caso
-verificado se necesita una clase conocida, el nombre del revisor y una
-descripción de evidencia independiente: mantenimiento, acción controlada,
-sensor de referencia o registro del sistema. La revisión visual por sí sola se
-conserva como borrador. La declaración del revisor no supone una comprobación
-automática de la causa por parte del software.
+Las etiquetas iniciales son `Incierto` y `Pendiente`. El estado `Revisado`
+requiere responsable y observaciones documentadas del histórico, sin exigir
+evidencia externa. Puede finalizarse una revisión como incierta; estos casos
+quedan fuera de las métricas. El origen `Revisión del histórico` identifica una
+interpretación manual, no una confirmación independiente. La normalidad se
+asume a partir de la inspección. Se conservan las anotaciones antiguas.
 
 Cada anotación se puede editar y exportar como ZIP con `events.csv` (filas
 originales del fragmento y su contexto, a resolución completa),
@@ -70,10 +126,19 @@ Procedimiento de revisión y criterios de etiquetado:
 En esa misma pestaña, **Generar inyecciones** permite elegir una revisión normal
 guardada, el intervalo de intervención, el tipo de falla, su intensidad y una
 semilla. Conserva cada caso generado y descarga un ZIP con original, datos
-alterados, etiquetas, cambios por fila y manifiesto. Los casos basados en una
-revisión visual en borrador se identifican como exploratorios. Las variantes
+alterados, etiquetas, cambios por fila y manifiesto. Los casos sobre una base normal revisada son evaluables como
+`Inyección controlada`: se conoce la intervención y se conserva el supuesto de
+normalidad del histórico. Los casos exploratorios antiguos mantienen su condición. Las variantes
 heredan la partición de su fuente y no se incorporan automáticamente al detector.
 Procedimiento y alcance: [Inyeccion_Fragmentos.MD](Inyeccion_Fragmentos.MD).
+
+El paso **Acumular fallas y descargar el histórico completo** reúne casos de
+distintas entidades en un escenario. Cada caso nuevo se selecciona automáticamente;
+la tabla permite incluir o retirar casos guardados y la previsualización muestra
+todos los fragmentos seleccionados con sus fallas. La descarga conserva todas las
+filas y entidades de la fuente, modifica solo los valores intervenidos y exporta
+las etiquetas y cambios por separado. Rechaza intervalos superpuestos sobre una
+misma entidad. Los escenarios quedan guardados para volver a descargarlos.
 
 ## Clasificador diagnóstico y preparación del investigador
 

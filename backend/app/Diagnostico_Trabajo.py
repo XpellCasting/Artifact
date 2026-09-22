@@ -4,8 +4,10 @@ Review labels and controlled interventions supply supervision. F1/F2 decisions
 are inputs to diagnosis and are never turned into training labels here.
 """
 from __future__ import annotations
+from .Referencia_Revision import reference_metadata
 
 import csv
+from bisect import bisect_left, bisect_right
 import hashlib
 import io
 import json
@@ -71,6 +73,59 @@ def _write(path: Path, value):
 def _read_json(path):
     with _FILE_LOCK:
         return json.loads(path.read_text(encoding="utf-8"))
+
+
+class DiagnosticRunSession:
+    """Immutable diagnostic snapshot plus causal, per-entity event indexes.
+
+    It removes repeated snapshot reads, reference parsing and SQLite commits from
+    the timestamp-group hot path.  The caller owns the session and must flush it.
+    """
+    def __init__(self, workbench, source, run_id):
+        self.workbench, self.source, self.run_id = workbench, source, run_id
+        self.snapshot = workbench._run_snapshot(source, run_id)
+        self.references = {}
+        for reference in self.snapshot["references"]:
+            end, _ = parse_time(reference["end"])
+            self.references.setdefault(str(reference["entity_id"]), []).append((end, reference))
+        for values in self.references.values(): values.sort(key=lambda item: item[0])
+        self.events, self.seen, self.pending = {}, set(), []
+        self.last_flush = time.monotonic(); self.stats = {"snapshot_loads": 1, "event_rows": 0, "decision_writes": 0, "flushes": 0, "write_ms": 0.0}
+
+    def add_events(self, frame):
+        if not isinstance(frame, pd.DataFrame) or frame.empty: return
+        time_column = "timestamp_dt" if "timestamp_dt" in frame else "timestamp" if "timestamp" in frame else "last_changed"
+        for ordinal, row in enumerate(frame.sort_values([time_column, "entity_id", "_raw_index"], kind="stable").to_dict("records")):
+            key = row.get("_raw_index", (str(row.get("entity_id")), row.get(time_column), ordinal))
+            if key in self.seen: continue
+            at = pd.to_datetime(row.get(time_column), utc=True, errors="coerce")
+            if pd.isna(at): continue
+            self.seen.add(key); entity = str(row.get("entity_id", ""))
+            self.events.setdefault(entity, []).append((at, {"timestamp": at.isoformat(), "state": str(row.get("state", "")), "source_row": int(key) if isinstance(key, int) else ordinal}))
+            self.stats["event_rows"] += 1
+
+    def reference_for(self, entity_id, at):
+        values = self.references.get(str(entity_id), [])
+        index = bisect_left(values, at, key=lambda item: item[0])
+        return values[index - 1][1] if index else None
+
+    def rows_for(self, entity_id, at, window_seconds):
+        values = self.events.get(str(entity_id), [])
+        start = at - pd.Timedelta(seconds=window_seconds)
+        left = bisect_left(values, start, key=lambda item: item[0]); right = bisect_right(values, at, key=lambda item: item[0])
+        return [row for _, row in values[left:right]]
+
+    def queue(self, decisions):
+        self.pending.extend(decisions)
+        if len(self.pending) >= 500 or time.monotonic() - self.last_flush >= 2: self.flush()
+
+    def flush(self):
+        if not self.pending: return
+        rows = [(result["diagnosis_id"], self.snapshot["run_id"], self.source, result["entity_id"], result["timestamp"], _canonical(result)) for result in self.pending]
+        started = time.perf_counter()
+        with self.workbench._connect() as connection:
+            connection.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)", rows)
+        self.stats["decision_writes"] += len(rows); self.stats["flushes"] += 1; self.stats["write_ms"] += round((time.perf_counter() - started) * 1000, 3); self.pending.clear(); self.last_flush = time.monotonic()
 
 
 class BuildInput(BaseModel):
@@ -205,7 +260,7 @@ class DiagnosticWorkbench:
         if len(annotation.get("reviewer", "").strip()) < 2 or len(annotation.get("evidence", "").strip()) < 12:
             raise ReviewError(f"Completa revisor y evidencia de la anotación {annotation['annotation_id']} antes de preparar ejemplos.")
         if not annotation.get("evaluable") and not include_drafts:
-            raise ReviewError("La selección incluye borradores. Verifica la evidencia o habilita explícitamente el uso exploratorio.")
+            raise ReviewError("La selección incluye referencias pendientes o inciertas. Completa la revisión del histórico o habilita explícitamente el uso exploratorio; no se exige evidencia externa.")
 
     def build_dataset(self, payload, progress=lambda *_: None):
         try:
@@ -261,6 +316,10 @@ class DiagnosticWorkbench:
                     allow_retrospective_reference=True)
                 identifier = hashlib.sha256(_canonical([annotation["annotation_id"], annotation["revision"], injection and injection["injection_id"], at, params.window_seconds, label]).encode()).hexdigest()[:32]
                 examples.append({"example_id": identifier, "group_id": annotation["annotation_id"],
+                    "reference_origin": "controlled_injection" if injection else "historical_review",
+                    "evaluation_scope": "controlled_injection" if injection else reference_metadata(annotation)["evaluation_scope"],
+                    "baseline_normality_basis": reference_metadata(annotation)["normality_basis"],
+                    "externally_verified": reference_metadata(annotation)["externally_verified"] if not injection else False,
                     "annotation_id": annotation["annotation_id"], "annotation_revision": annotation["revision"],
                     "injection_id": injection["injection_id"] if injection else None,
                     "entity_id": annotation["entity_id"], "sensor_kind": reference["sensor_kind"],
@@ -391,6 +450,7 @@ class DiagnosticWorkbench:
         injected_rows = {}
         matrix, correct, accepted = {}, 0, 0
         labelled_correct = labelled_total = 0
+        by_origin = {}
         outputs = []
         for example in examples:
             # Evaluation uses only the fixed TRAINING reference. Never normalize
@@ -413,7 +473,16 @@ class DiagnosticWorkbench:
             if example["evaluable"]:
                 labelled_total += 1
                 labelled_correct += predicted == expected
-            outputs.append({"example_id": example["example_id"], "expected": expected, "predicted": predicted})
+            origin = example.get("reference_origin", "legacy_unspecified")
+            group = by_origin.setdefault(origin, {"count": 0, "evaluable_count": 0, "evaluable_correct": 0})
+            group["count"] += 1
+            if example["evaluable"]:
+                group["evaluable_count"] += 1
+                group["evaluable_correct"] += predicted == expected
+            outputs.append({"example_id": example["example_id"], "expected": expected, "predicted": predicted,
+                            "reference_origin": origin})
+        for group in by_origin.values():
+            group["evaluable_accuracy"] = group.pop("evaluable_correct") / group["evaluable_count"] if group["evaluable_count"] else None
         labels = sorted(matrix)
         f1s = []
         for label in labels:
@@ -424,6 +493,7 @@ class DiagnosticWorkbench:
         evaluation = {"dataset_id": dataset_id, "partition": partition, "created_at": _now(),
             "count": len(examples), "accuracy": correct / len(examples), "macro_f1": sum(f1s) / len(f1s),
             "coverage": accepted / len(examples), "confusion_matrix": matrix,
+            "by_reference_origin": by_origin,
             "evaluable_count": labelled_total, "evaluable_accuracy": labelled_correct / labelled_total if labelled_total else None,
             "scope": "classifier_windows_only_not_end_to_end", "reference_policy": "fixed_training_references",
             "exploratory": labelled_total != len(examples),
@@ -516,19 +586,27 @@ class DiagnosticWorkbench:
         snapshot = self._run_snapshot(source, run_id)
         return snapshot["model"]["window_seconds"] if snapshot["model"] else 3600
 
-    def enrich_contextual(self, statistical_results, contextual_results, events=None, source="history", run_id="default"):
-        snapshot = self._run_snapshot(source, run_id)
+    def create_run_session(self, source, run_id):
+        return DiagnosticRunSession(self, source, run_id)
+
+    def enrich_contextual(self, statistical_results, contextual_results, events=None, source="history", run_id="default", session=None):
+        if session is not None and (session.source != source or session.run_id != run_id):
+            raise ValueError("La sesión diagnóstica no corresponde a esta ejecución.")
+        snapshot = session.snapshot if session is not None else self._run_snapshot(source, run_id)
         trained = snapshot["model"]
         model = trained["model"] if trained else None
         window_seconds = trained["window_seconds"] if trained else 3600
         indexed = {}
         for statistical in statistical_results:
             try:
-                indexed[(str(statistical.get("entity_id")), parse_time(statistical["timestamp"])[0])] = statistical
+                key = statistical.get("observation_id") or (str(statistical.get("entity_id")), parse_time(statistical["timestamp"])[0])
+                indexed[key] = statistical
             except (ReviewError, KeyError):
                 continue
         event_groups = {}
-        if isinstance(events, pd.DataFrame) and not events.empty and "entity_id" in events:
+        if session is not None:
+            session.add_events(events)
+        elif isinstance(events, pd.DataFrame) and not events.empty and "entity_id" in events:
             target_ids = {str(item.get("entity_id")) for item in contextual_results if not item.get("routing", {}).get("terminal")}
             selected = events[events["entity_id"].astype(str).isin(target_ids)].copy()
             time_column = "timestamp_dt" if "timestamp_dt" in selected else "timestamp" if "timestamp" in selected else "last_changed"
@@ -551,12 +629,16 @@ class DiagnosticWorkbench:
                 enriched.append(item)
                 continue
             entity_id = str(item.get("entity_id", ""))
-            statistical = indexed.get((entity_id, at), {"entity_id": entity_id, "timestamp": timestamp})
-            eligible_refs = [ref for ref in snapshot["references"] if ref["entity_id"] == entity_id and parse_time(ref["end"])[0] < at]
-            reference = max(eligible_refs, key=lambda ref: parse_time(ref["end"])[0]) if eligible_refs else None
+            statistical = indexed.get(item.get("observation_id") or (entity_id, at), {"entity_id": entity_id, "timestamp": timestamp})
+            eligible_refs = [ref for ref in snapshot["references"] if ref["entity_id"] == entity_id and parse_time(ref["end"])[0] < at] if session is None else None
+            reference = (max(eligible_refs, key=lambda ref: parse_time(ref["end"])[0]) if eligible_refs else None) if session is None else session.reference_for(entity_id, at)
             rows = []
             group = event_groups.get(entity_id)
-            if group is not None:
+            if session is not None:
+                # parse_time returns epoch microseconds for reference comparisons;
+                # the event index and its window arithmetic use UTC Timestamps.
+                rows = session.rows_for(entity_id, pd.to_datetime(timestamp, utc=True), window_seconds)
+            elif group is not None:
                 now = pd.to_datetime(timestamp, utc=True)
                 window = group.loc[now - pd.Timedelta(seconds=window_seconds):now]
                 rows = [{"timestamp": row["_diag_time"].isoformat(), "state": str(row.get("state", "")), "source_row": int(index)} for index, (_, row) in enumerate(window.iterrows())]
@@ -577,8 +659,11 @@ class DiagnosticWorkbench:
             item["diagnosis_mode"] = result["mode"]
             enriched.append(item)
             decisions.append(result)
-        with self._connect() as connection:
-            connection.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)", [(result["diagnosis_id"], snapshot["run_id"], source, result["entity_id"], result["timestamp"], _canonical(result)) for result in decisions])
+        if session is not None:
+            session.queue(decisions)
+        else:
+            with self._connect() as connection:
+                connection.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)", [(result["diagnosis_id"], snapshot["run_id"], source, result["entity_id"], result["timestamp"], _canonical(result)) for result in decisions])
         return enriched
 
     def results(self, source=None, offset=0, limit=50):

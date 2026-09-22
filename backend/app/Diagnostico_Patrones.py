@@ -14,6 +14,7 @@ import json
 import math
 from statistics import median
 from typing import Any
+from .Estados_Validos import valid_state
 
 ENGINE_VERSION = "diagnostic-patterns-1.0"
 FEATURE_VERSION = "causal-window-1.0"
@@ -81,7 +82,7 @@ def _rows(rows: list[dict], entity_id: str | None = None) -> list[dict]:
         state = str(row.get("state", row.get("value", "")))
         parsed.append({"time": _time(row.get("timestamp", row.get("last_changed"))),
                        "state": state, "value": _number(state),
-                       "valid": state.strip().lower() not in INVALID_STATES,
+                       "valid": valid_state(state),
                        "order": _number(row.get("source_row")) or index})
     return sorted(parsed, key=lambda item: (item["time"], item["order"]))
 

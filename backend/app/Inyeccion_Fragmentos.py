@@ -4,6 +4,8 @@ Original records are immutable. A generated case is semisynthetic evidence,
 never an observed real fault, and its partition comes from the source dataset.
 """
 from __future__ import annotations
+from .Estados_Validos import valid_state
+from .Referencia_Revision import reference_metadata
 
 import csv
 import hashlib
@@ -29,7 +31,7 @@ from .Revision_Fragmentos import (
     iso_time, numeric_state, parse_time,
 )
 
-GENERATOR_VERSION = "1.0.0"
+GENERATOR_VERSION = "1.1.0"
 MAX_EXPORT_ROWS = 250_000
 MAX_PREVIEW_POINTS = 400
 NUMERIC_KINDS = {"bias", "drift", "noise", "spike"}
@@ -167,7 +169,7 @@ class InjectionStore:
                 if entity_kind == "continuous":
                     raise ReviewError("El reemplazo de estado requiere una entidad discreta.")
                 replacement = params.replacement_state
-                if replacement.strip().lower() in INVALID_STATES or not replacement.strip():
+                if not valid_state(replacement):
                     raise ReviewError("Seleccione un estado válido observado; para indisponibilidad use unavailable.")
                 observed = connection.execute(
                     "SELECT 1 FROM events WHERE dataset_id=? AND entity_id=? AND state=? AND is_valid=1 AND ts BETWEEN ? AND ? LIMIT 1",
@@ -217,6 +219,8 @@ class InjectionStore:
             raise ReviewError("La anotación cambió de revisión. Ábrala de nuevo antes de generar la inyección.", 409)
         if annotation["label"] != "normal":
             raise ReviewError("La inyección requiere una anotación guardada como normal.")
+        if annotation["status"] == "pending":
+            raise ReviewError("Termine la revisión y guarde el fragmento como Revisado antes de generar una inyección.")
         if len(annotation["reviewer"].strip()) < 2 or len(annotation["evidence"].strip()) < 12:
             raise ReviewError("Documente el revisor y una evidencia de al menos doce caracteres para el fragmento normal.")
 
@@ -291,10 +295,12 @@ class InjectionStore:
         if not changed_rows:
             raise ReviewError("La intervención no modifica ninguna lectura válida. Revise el intervalo, la magnitud o el estado de reemplazo.")
         truth_start, truth_end = (spike_ts, spike_ts) if params.kind == "spike" else (start_us, end_us)
-        evaluable = bool(annotation["status"] == "verified" and annotation["evaluable"]
-                         and annotation["evidence_type"] in INDEPENDENT_EVIDENCE)
+        basis = reference_metadata(annotation)
+        evaluable = bool(annotation["status"] in {"reviewed", "verified"} and annotation["evaluable"])
         warnings = ["Caso semisintético: las alteraciones son controladas y no acreditan una falla real observada.",
                     "La etiqueta se limita al episodio intervenido de la entidad objetivo. El resto de filas y entidades no recibe una etiqueta normal."]
+        if not basis["externally_verified"]:
+            warnings.append("La normalidad del original se asume tras revisar el histórico; la intervención es conocida, pero no aporta verificación externa del original.")
         if not evaluable:
             warnings.append("Base normal en borrador: uso exploratorio; este caso queda fuera de las métricas principales (evaluable=false).")
         if skipped_invalid:
@@ -311,6 +317,9 @@ class InjectionStore:
             "requested_start": iso_time(start_us), "requested_end": iso_time(end_us),
             "amount": params.amount, "seed": params.seed, "replacement_state": params.replacement_state,
             "created_at": datetime.now(UTC).isoformat(), "evaluable": evaluable,
+            "reference_origin": "controlled_injection", "intervention_known": True,
+            "evaluation_scope": "controlled_injection", "baseline_normality_basis": basis["normality_basis"],
+            "baseline_externally_verified": basis["externally_verified"],
             "changed_rows": changed_rows, "exported_rows": exported_rows,
             "preview": preview.finish(), "preview_sampled": preview.sampled, "warnings": warnings,
             "provenance": "semisynthetic", "generator_version": GENERATOR_VERSION,
@@ -319,6 +328,8 @@ class InjectionStore:
             "spike_source_row": spike_row,
         }
         truth = {
+            "reference_origin": "controlled_injection", "intervention_known": "true",
+            "evaluation_scope": "controlled_injection", "baseline_normality_basis": basis["normality_basis"],
             "injection_id": identifier, "dataset_id": dataset["dataset_id"], "source_sha256": dataset["sha256"],
             "partition": dataset["partition"], "entity_id": annotation["entity_id"],
             "start": metadata["start"], "end": metadata["end"], "label": "sensor_fault",
@@ -339,7 +350,7 @@ class InjectionStore:
             "context_interval": {"start": iso_time(lower), "end": iso_time(upper), "inclusive": True},
             "row_order": "timestamp in UTC, then original CSV source_row",
             "raw_field_semantics": "Both CSVs preserve original decoded field strings and column names; only state in interventions.csv rows changes in injected.csv. Original timestamp strings and all context rows are preserved. CSV serialization uses UTF-8 and commas, and may differ from uploaded bytes.",
-            "ground_truth_semantics": "One semisynthetic sensor_fault episode, only for the target and intervention interval. For spike, source_row additionally restricts the label to that single source observation when timestamps repeat. Interventions.csv identifies exactly which source rows changed. Unchanged rows, padding and context are not labelled normal. Evaluable means eligible as controlled semisynthetic evidence given the frozen verified baseline, never a real observed fault.",
+            "ground_truth_semantics": "One controlled semisynthetic fault episode for the target interval only. For spike, source_row identifies the single observation. interventions.csv records the exact changes. Evaluable means usable for evaluating known injections; baseline_normality_basis distinguishes assumed normality from legacy independent evidence. Neither a reviewed baseline nor a known intervention confirms a real observed fault. Unchanged rows and context are not labelled normal.",
             "drift_semantics": "amount * (event_time - requested_start) / (requested_end - requested_start), in native units",
             "stuck_semantics": "Hold the first valid state observed within the requested intervention interval; preserve existing invalid states.",
             "noise_semantics": "Independent Gaussian noise with standard deviation amount in native units, drawn in chronological/source-row order for eligible target rows only.",
@@ -368,7 +379,9 @@ class InjectionStore:
 
 
 def crear_router_inyecciones(store: ReviewStore) -> APIRouter:
+    from .Escenarios_Historico import ScenarioStore
     injections = InjectionStore(store)
+    scenarios = ScenarioStore(injections)
     router = APIRouter(tags=["Inyección controlada de fragmentos"])
 
     def translate(call, *args):
@@ -393,5 +406,25 @@ def crear_router_inyecciones(store: ReviewStore) -> APIRouter:
     def export_injection(injection_id: str):
         path = translate(injections.export_injection, injection_id)
         return FileResponse(path, media_type="application/zip", filename=f"injection-{injection_id}.zip")
+
+    @router.get("/scenarios")
+    def list_scenarios(dataset_id: str):
+        return {"scenarios": translate(scenarios.list, dataset_id)}
+
+    @router.post("/scenarios")
+    def create_scenario(payload: dict[str, Any]):
+        return translate(scenarios.create, payload)
+
+    @router.get("/scenarios/{scenario_id}/export")
+    def export_scenario(scenario_id: str):
+        translate(scenarios.get, scenario_id)
+        return FileResponse(scenarios.path(scenario_id) / "scenario.zip", media_type="application/zip", filename=f"historico-escenario-{scenario_id}.zip")
+
+    @router.get("/scenarios/{scenario_id}/csv")
+    def export_labelled_csv(scenario_id: str):
+        snapshot = translate(scenarios.get, scenario_id)
+        if not snapshot.get("labelled_csv"):
+            raise HTTPException(409, "Este escenario es anterior al CSV etiquetado. Carga su selección y guarda una nueva versión.")
+        return FileResponse(scenarios.path(scenario_id) / "labelled.csv", media_type="text/csv", filename=f"historico-etiquetado-{scenario_id}.csv")
 
     return router

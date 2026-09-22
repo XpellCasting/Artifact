@@ -40,12 +40,18 @@ class ConfiguracionContextual:
     common_cause_window_seconds: int = 300
     cadence_ttl_multiplier: float = 2.0
     residual_quantile: float = 0.99
+    temporal_feature_min_observations: int = 2
+    temporal_model_min_observations: int = 30
+    temporal_decision_min_observations: int = 30
 
     def __post_init__(self) -> None:
         if (self.window_seconds <= 0 or self.max_lag_windows < 0
                 or self.common_cause_window_seconds <= 0
                 or self.cadence_ttl_multiplier < 1
                 or not 0.5 < self.residual_quantile < 1
+                or self.temporal_feature_min_observations < 2
+                or self.temporal_model_min_observations < 1
+                or self.temporal_decision_min_observations < 1
                 or any(not isinstance(v, int) or isinstance(v, bool) or v <= 0
                        for v in self.window_candidates_seconds)):
             raise ValueError("Configuracion temporal o de residuos invalida.")
@@ -104,7 +110,10 @@ class FiltroContextualEspacioTemporal:
     observaciones futuras para explicar una sospecha.
     """
 
-    MAP_VERSION = "contextual-spatiotemporal-v3"
+    # v4 replaces the contradictory sign heuristic for continuous pairs with
+    # conditional level residuals.  Maps from earlier implementations stay
+    # intact and are rebuilt through the existing version check.
+    MAP_VERSION = "contextual-spatiotemporal-v5"
 
     def __init__(self, config: ConfiguracionContextual | None = None) -> None:
         self.config = config or ConfiguracionContextual()
@@ -188,13 +197,15 @@ class FiltroContextualEspacioTemporal:
         inicio_calculo = perf_counter()
         trabajo = self._preparar_eventos(eventos)
         catalogo = self._catalogo(entidades, trabajo)
-        signals, availability, stats, full_index = self._construir_senales(trabajo, catalogo)
+        partitions = self._particiones_desarrollo(trabajo)
+        ajuste = self._filtrar_particion(trabajo, partitions, "fit")
+        signals, availability, stats, full_index = self._construir_senales(ajuste, catalogo)
         entity_ids = sorted(signals)
-        temporal = self._calibrar_tiempos(trabajo, catalogo)
+        temporal = self._calibrar_tiempos(ajuste, catalogo)
         resolutions = set(self.config.ventanas())
         grids = {self.config.window_seconds: (signals, availability, stats, full_index)}
         for seconds in sorted(resolutions - grids.keys()):
-            grids[seconds] = self._construir_senales(trabajo, catalogo, seconds)
+            grids[seconds] = self._construir_senales(ajuste, catalogo, seconds)
 
         edges: list[dict[str, Any]] = []
         for source in entity_ids:
@@ -209,6 +220,15 @@ class FiltroContextualEspacioTemporal:
                 edges.append(relation)
 
         self._aplicar_top_k(edges)
+        observaciones = self._indexar_observaciones(trabajo, catalogo)
+        for edge in edges:
+            if (edge.get("accepted") and edge.get("relation_family") == "continuous_continuous"):
+                edge["temporal_models"] = self._calibrar_modelos_temporales(
+                    edge, observaciones, partitions
+                )
+        decision_calibrations = self._calibrar_decisiones_temporales(
+            edges, observaciones, partitions
+        )
         # Solo las relaciones utilizables necesitan payload de inferencia y
         # auditoria de candidatos; no multiplicarlo por todos los pares rechazados.
         for edge in edges:
@@ -265,6 +285,8 @@ class FiltroContextualEspacioTemporal:
             "source_fingerprint": fingerprint,
             "config": self.config.como_dict(),
             "calibration_partition": "development",
+            "development_partitions": partitions,
+            "decision_calibrations": decision_calibrations,
             "refresh": {
                 "stale": False,
                 "stale_reasons": [],
@@ -324,6 +346,7 @@ class FiltroContextualEspacioTemporal:
         entidades: pd.DataFrame,
         mapa: dict[str, Any],
         concurrence_state: dict[tuple[str, str], pd.Timestamp] | None = None,
+        accept_all: bool = False,
     ) -> dict[str, Any]:
         """Evalua cada sospecha usando solo observaciones con fecha no futura."""
         inicio = perf_counter()
@@ -340,8 +363,8 @@ class FiltroContextualEspacioTemporal:
             (
                 dict(item)
                 for item in sospechas
-                if (item.get("is_suspicious") or item.get("passed_to_contextual_filter"))
-                and not item.get("suppressed_by_episode")
+                if (accept_all or item.get("is_suspicious") or item.get("passed_to_contextual_filter"))
+                and (accept_all or not item.get("suppressed_by_episode"))
             ),
             key=lambda item: pd.to_datetime(
                 item.get("timestamp"), errors="coerce", utc=True
@@ -368,6 +391,7 @@ class FiltroContextualEspacioTemporal:
                 },
                 concurrent_entities=concurrentes,
                 continuous_observations=observaciones,
+                decision_calibrations=mapa.get("decision_calibrations", {}),
             )
             resultado["causal_runtime"] = {
                 "causal": True,
@@ -442,7 +466,9 @@ class FiltroContextualEspacioTemporal:
         if "is_valid_value" not in trabajo.columns:
             trabajo["is_valid_value"] = True
         trabajo["is_valid_value"] = trabajo["is_valid_value"].astype(bool)
-        return trabajo.sort_values(["entity_id", "timestamp_dt"]).reset_index(drop=True)
+        # ``mergesort`` preserves the producer order of simultaneous readings;
+        # causal feature extraction never uses a later row at that timestamp.
+        return trabajo.sort_values(["entity_id", "timestamp_dt"], kind="stable").reset_index(drop=True)
 
     def _catalogo(
         self, entidades: pd.DataFrame, eventos: pd.DataFrame
@@ -612,6 +638,227 @@ class FiltroContextualEspacioTemporal:
                                "development_cadence_capped" if calibrated else "configured_fallback"),
             }
         return profiles
+
+    def _particiones_desarrollo(self, eventos: pd.DataFrame) -> dict[str, Any]:
+        """Fronteras temporales comunes; nunca se infieren de etiquetas."""
+        if eventos.empty:
+            return {"fit": {"start": None, "end": None}, "tolerance": {"start": None, "end": None},
+                    "decision": {"start": None, "end": None}}
+        start, end = eventos["timestamp_dt"].min(), eventos["timestamp_dt"].max()
+        span = end - start
+        fit_end, tolerance_end = start + span * .5, start + span * .75
+        iso = lambda value: None if pd.isna(value) else value.isoformat()
+        return {
+            "fit": {"start": iso(start), "end": iso(fit_end)},
+            "tolerance": {"start": iso(fit_end), "end": iso(tolerance_end)},
+            "decision": {"start": iso(tolerance_end), "end": iso(end)},
+        }
+
+    def _filtrar_particion(self, eventos: pd.DataFrame, partitions: dict[str, Any], name: str) -> pd.DataFrame:
+        bounds = partitions.get(name, {})
+        start, end = (pd.to_datetime(bounds.get(key), errors="coerce", utc=True) for key in ("start", "end"))
+        if eventos.empty or pd.isna(start) or pd.isna(end):
+            return eventos.iloc[:0].copy()
+        if name == "fit":
+            return eventos[eventos["timestamp_dt"].between(start, end, inclusive="both")].copy()
+        return eventos[(eventos["timestamp_dt"] > start) & (eventos["timestamp_dt"] <= end)].copy()
+
+    def _caracteristicas_continuas(
+        self,
+        events: pd.DataFrame,
+        reference: pd.Timestamp,
+        entity_id: str,
+        *,
+        window_seconds: int,
+        max_age_seconds: float | None = None,
+        current_value: float | None = None,
+        partition_start: pd.Timestamp | None = None,
+    ) -> dict[str, Any]:
+        """Nivel, innovacion y tendencia causal sobre lecturas originales.
+
+        La lectura actual se excluye de la referencia de innovacion. Las
+        medianas no se rellenan: una interrupcion invalida toda caracteristica
+        que atraviese el reporte invalido.
+        """
+        reference = pd.to_datetime(reference, errors="coerce", utc=True)
+        result: dict[str, Any] = {
+            "reference_timestamp": None if pd.isna(reference) else reference.isoformat(),
+            "window_seconds": window_seconds, "original_value": None,
+            "level": None, "innovation": None, "trend": None,
+            "feature_windows": {}, "feature_counts": {}, "absence_reasons": {},
+            "observed_timestamp": None, "observation_age_seconds": None,
+            "max_age_seconds": max_age_seconds, "carried_forward": False,
+        }
+        if events.empty or pd.isna(reference):
+            result["absence_reasons"] = {key: "no_previous_observation" for key in ("level", "innovation", "trend")}
+            return result
+        limit = self.config.antiguedad_maxima(entity_id) if max_age_seconds is None else float(max_age_seconds)
+        end = int(events.index.searchsorted(reference, side="right"))
+        latest = events.iloc[end - 1] if end else None
+        observed_at = events.index[end - 1] if end else None
+        actual = self._numeric_or_none(current_value)
+        if actual is None:
+            if latest is None or not bool(latest.get("is_valid_value")):
+                reason = "no_previous_observation" if latest is None else "invalid_latest_observation"
+                result["absence_reasons"] = {key: reason for key in ("level", "innovation", "trend")}
+                return result
+            actual = self._numeric_or_none(latest.get("value", latest.get("state")))
+        if actual is None:
+            result["absence_reasons"] = {key: "invalid_latest_observation" for key in ("level", "innovation", "trend")}
+            return result
+        if observed_at is not None:
+            age = (reference - observed_at).total_seconds()
+            result.update(observed_timestamp=observed_at.isoformat(), observation_age_seconds=round(age, 6),
+                          carried_forward=observed_at < reference)
+            if current_value is None and age > limit:
+                result["absence_reasons"] = {key: "expired_observation" for key in ("level", "innovation", "trend")}
+                return result
+        result["original_value"] = actual
+        result["level"] = actual
+        result["absence_reasons"]["level"] = None
+
+        def median_window(start: pd.Timestamp, finish: pd.Timestamp, *, left_open: bool, right_closed: bool, key: str):
+            if partition_start is not None and start < partition_start:
+                result["absence_reasons"][key] = "partition_history_unavailable"
+                result["feature_counts"][key] = 0
+                return None
+            left = int(events.index.searchsorted(start, side="right" if left_open else "left"))
+            right = int(events.index.searchsorted(finish, side="right" if right_closed else "left"))
+            window = events.iloc[left:right]
+            result["feature_windows"][key] = {"start": start.isoformat(), "end": finish.isoformat(),
+                                               "left_open": left_open, "right_closed": right_closed}
+            if window.empty:
+                result["absence_reasons"][key] = "empty_window"
+                result["feature_counts"][key] = 0
+                return None
+            if not window["is_valid_value"].all():
+                result["absence_reasons"][key] = "invalid_intermediate_observation"
+                result["feature_counts"][key] = int(window["is_valid_value"].sum())
+                return None
+            values = pd.to_numeric(window.get("value", window["state"]), errors="coerce").replace([math.inf, -math.inf], float("nan"))
+            values = values.dropna()
+            # En ejecucion la sospecha puede llegar antes de quedar anexada al
+            # buffer. Para (t-W, t] esa lectura x(t) debe participar en la
+            # mediana reciente; nunca se agrega a [t-W, t).
+            if (right_closed and current_value is not None and finish == reference
+                    and (latest is None or observed_at != reference)):
+                values = pd.concat([values, pd.Series([actual])], ignore_index=True)
+            result["feature_counts"][key] = int(len(values))
+            if len(values) < self.config.temporal_feature_min_observations:
+                result["absence_reasons"][key] = "insufficient_window_observations"
+                return None
+            return float(values.median())
+
+        previous = median_window(reference - pd.Timedelta(seconds=window_seconds), reference,
+                                 left_open=False, right_closed=False, key="innovation")
+        if previous is not None:
+            result["innovation"] = actual - previous
+            result["absence_reasons"]["innovation"] = None
+        recent = median_window(reference - pd.Timedelta(seconds=window_seconds), reference,
+                               left_open=True, right_closed=True, key="trend_recent")
+        earlier = median_window(reference - pd.Timedelta(seconds=2 * window_seconds), reference - pd.Timedelta(seconds=window_seconds),
+                                left_open=True, right_closed=True, key="trend_previous")
+        result["feature_counts"]["trend"] = min(result["feature_counts"].get("trend_recent", 0), result["feature_counts"].get("trend_previous", 0))
+        if recent is not None and earlier is not None:
+            result["trend"] = recent - earlier
+            result["absence_reasons"]["trend"] = None
+        else:
+            result["absence_reasons"]["trend"] = (
+                result["absence_reasons"].get("trend_recent") or result["absence_reasons"].get("trend_previous")
+            )
+        return result
+
+    def _muestras_modelo_temporal(self, edge, observations, bounds: dict[str, Any]) -> dict[str, pd.DataFrame]:
+        source, target = str(edge["source"]), str(edge["target"])
+        source_events, target_events = observations.get(source), observations.get(target)
+        rows = {name: [] for name in ("level", "innovation", "trend")}
+        if source_events is None or target_events is None or source_events.empty or target_events.empty:
+            return {name: pd.DataFrame(columns=["target", "context", "timestamp"]) for name in rows}
+        start, end = (pd.to_datetime(bounds.get(key), errors="coerce", utc=True) for key in ("start", "end"))
+        if pd.isna(start) or pd.isna(end):
+            return {name: pd.DataFrame(columns=["target", "context", "timestamp"]) for name in rows}
+        candidates = source_events[(source_events.index > start) & (source_events.index <= end)]
+        # Solo la ultima lectura estable de un timestamp puede ser x(t).
+        candidates = candidates[~candidates.index.duplicated(keep="last")]
+        for timestamp, row in candidates.iterrows():
+            if not bool(row.get("is_valid_value")):
+                continue
+            actual = self._numeric_or_none(row.get("value", row.get("state")))
+            if actual is None:
+                continue
+            source_features = self._caracteristicas_continuas(
+                source_events, timestamp, source, window_seconds=int(edge["window_seconds"]),
+                max_age_seconds=edge.get("max_age_seconds"), current_value=actual, partition_start=start,
+            )
+            target_features = self._caracteristicas_continuas(
+                target_events, timestamp - pd.Timedelta(seconds=int(edge.get("lag_seconds", 0))), target,
+                window_seconds=int(edge["window_seconds"]), max_age_seconds=edge.get("max_age_seconds"), partition_start=start,
+            )
+            for name in rows:
+                response, predictor = source_features.get(name), target_features.get(name)
+                if response is not None and predictor is not None:
+                    rows[name].append({"timestamp": timestamp, "target": response, "context": predictor})
+        return {name: pd.DataFrame(values, columns=["timestamp", "target", "context"]) for name, values in rows.items()}
+
+    def _ajustar_modelo_temporal(self, feature: str, fit: pd.DataFrame, tolerance: pd.DataFrame) -> dict[str, Any]:
+        metadata = {"feature": feature, "fit_observations": int(len(fit)), "tolerance_observations": int(len(tolerance))}
+        if len(fit) < self.config.temporal_model_min_observations or len(tolerance) < self.config.temporal_model_min_observations:
+            return {**metadata, "status": "rejected", "reason": "insufficient_model_samples"}
+        variance = float(fit["context"].var(ddof=0))
+        if not math.isfinite(variance) or variance <= 0:
+            return {**metadata, "status": "rejected", "reason": "constant_predictor"}
+        slope = float(fit["target"].cov(fit["context"]) / fit["context"].var())
+        intercept = float(fit["target"].mean() - slope * fit["context"].mean())
+        if not (math.isfinite(slope) and math.isfinite(intercept)):
+            return {**metadata, "status": "rejected", "reason": "non_finite_parameters"}
+        residuals = (tolerance["target"] - (intercept + slope * tolerance["context"])).abs()
+        floor = max(float(fit["target"].std(ddof=0)) * .05, 1e-6)
+        threshold = max(float(residuals.quantile(self.config.residual_quantile)), floor)
+        return {**metadata, "status": "available", "method": "linear_conditional_residual",
+                "slope": slope, "intercept": intercept, "tolerance": threshold,
+                "residual_quantile": self.config.residual_quantile,
+                "context_min": float(fit["context"].min()), "context_max": float(fit["context"].max())}
+
+    def _calibrar_modelos_temporales(self, edge, observations, partitions) -> dict[str, Any]:
+        fit = self._muestras_modelo_temporal(edge, observations, partitions["fit"])
+        tolerance = self._muestras_modelo_temporal(edge, observations, partitions["tolerance"])
+        models = {name: self._ajustar_modelo_temporal(name, fit[name], tolerance[name])
+                  for name in ("level", "innovation", "trend")}
+        return {"partitioning": partitions, "models": models,
+                "sample_counts": {name: {"fit": len(fit[name]), "tolerance": len(tolerance[name])} for name in models}}
+
+    def _calibrar_decisiones_temporales(self, edges, observations, partitions) -> dict[str, Any]:
+        by_source: dict[str, list[dict[str, Any]]] = {}
+        for edge in edges:
+            if edge.get("accepted") and edge.get("relation_family") == "continuous_continuous":
+                by_source.setdefault(str(edge["source"]), []).append(edge)
+        results: dict[str, Any] = {}
+        for source, source_edges in by_source.items():
+            events = observations.get(source)
+            bounds = partitions["decision"]
+            start, end = (pd.to_datetime(bounds.get(key), errors="coerce", utc=True) for key in ("start", "end"))
+            groups: dict[str, list[dict[str, Any]]] = {}
+            if events is not None and not pd.isna(start) and not pd.isna(end):
+                candidates = events[(events.index > start) & (events.index <= end)]
+                for timestamp, row in candidates[~candidates.index.duplicated(keep="last")].iterrows():
+                    actual = self._numeric_or_none(row.get("value", row.get("state"))) if bool(row.get("is_valid_value")) else None
+                    scores = self._puntajes_familiares(source, timestamp, actual, source_edges, observations, partition_start=start)
+                    families = scores["available_families"]
+                    if families:
+                        key = "+".join(families)
+                        groups.setdefault(key, []).append({"score": scores["decision_score"], "neighbors": scores["evaluable_neighbors"]})
+            calibrated = {}
+            for key, values in groups.items():
+                if len(values) < self.config.temporal_decision_min_observations:
+                    calibrated[key] = {"status": "insufficient_calibration", "samples": len(values)}
+                    continue
+                series = pd.Series([item["score"] for item in values])
+                calibrated[key] = {"status": "available", "samples": len(values),
+                                   "threshold": float(series.quantile(self.config.residual_quantile, interpolation="higher")),
+                                   "neighbor_counts": sorted({int(item["neighbors"]) for item in values}),
+                                   "partition": "decision", "quantile": self.config.residual_quantile}
+            results[source] = {"partition": bounds, "combinations": calibrated}
+        return results
 
     def _calibrar_respuesta(self, pair: pd.DataFrame) -> dict[str, Any] | None:
         """Recta contextual, no clasificador de fallas; residuos fuera del ajuste.
@@ -957,7 +1204,162 @@ class FiltroContextualEspacioTemporal:
             "accepted": accepted_values,
         }
 
+    def _puntajes_familiares(self, source, timestamp, current_value, edges, observations, *, partition_start=None):
+        families = ("level", "innovation", "trend")
+        source_events = observations.get(source)
+        family_rows = {name: [] for name in families}
+        details: dict[str, dict[str, Any]] = {}
+        total_weights = {name: 0.0 for name in families}
+        evaluated_weights = {name: 0.0 for name in families}
+        source_feature_cache: dict[int, dict[str, Any]] = {}
+        for edge in edges:
+            weight = abs(float(edge.get("association_signed", 0.0))) * float(edge.get("stability_score", 0.0))
+            model_bundle = edge.get("temporal_models", {}).get("models", {})
+            target = str(edge["target"])
+            target_events = observations.get(target)
+            if source_events is None or target_events is None:
+                continue
+            window = int(edge.get("window_seconds") or self.config.window_seconds)
+            if window not in source_feature_cache:
+                source_feature_cache[window] = self._caracteristicas_continuas(
+                    source_events, timestamp, source, window_seconds=window,
+                    max_age_seconds=edge.get("max_age_seconds"), current_value=current_value,
+                    partition_start=partition_start,
+                )
+            source_features = source_feature_cache[window]
+            target_features = self._caracteristicas_continuas(
+                target_events, timestamp - pd.Timedelta(seconds=int(edge.get("lag_seconds", 0))), target,
+                window_seconds=window, max_age_seconds=edge.get("max_age_seconds"), partition_start=partition_start,
+            )
+            neighbor = details.setdefault(target, {"neighbor_id": target, "weight": self._redondear(weight),
+                                                    "features": {"source": source_features, "context": target_features}})
+            for family in families:
+                model = model_bundle.get(family, {})
+                check: dict[str, Any] = {"status": "unavailable", "reason": None, "ratio": None,
+                                         "residual": None, "tolerance": None, "extrapolated": False}
+                if model.get("status") != "available":
+                    check["reason"] = model.get("reason", "model_unavailable")
+                elif source_features.get(family) is None or target_features.get(family) is None:
+                    check["reason"] = (source_features.get("absence_reasons", {}).get(family)
+                                       or target_features.get("absence_reasons", {}).get(family)
+                                       or "feature_unavailable")
+                else:
+                    total_weights[family] += weight
+                    predictor, response = target_features[family], source_features[family]
+                    expected = model["intercept"] + model["slope"] * predictor
+                    if predictor < model["context_min"] or predictor > model["context_max"]:
+                        check.update(status="excluded", reason="predictor_extrapolated", extrapolated=True,
+                                     expected_value=expected, predictor_value=predictor)
+                    else:
+                        residual = abs(response - expected)
+                        ratio = residual / max(model["tolerance"], 1e-6)
+                        check.update(status="evaluated", ratio=ratio, residual=residual,
+                                     tolerance=model["tolerance"], expected_value=expected,
+                                     predictor_value=predictor)
+                        evaluated_weights[family] += weight
+                        family_rows[family].append((ratio, weight))
+                neighbor[f"{family}_check"] = check
+        family_scores = {}
+        available = []
+        for family in families:
+            denominator = total_weights[family]
+            coverage = evaluated_weights[family] / denominator if denominator else 0.0
+            score = (sum(ratio * weight for ratio, weight in family_rows[family]) / evaluated_weights[family]
+                     if evaluated_weights[family] else None)
+            family_scores[family] = {"score": self._redondear_o_none(score), "coverage": self._redondear(coverage),
+                                      "eligible_weight": self._redondear(denominator),
+                                      "evaluated_weight": self._redondear(evaluated_weights[family]),
+                                      "evaluable_neighbors": len(family_rows[family]),
+                                      "status": "available" if score is not None and coverage >= self.config.runtime_coverage_threshold else "insufficient_coverage"}
+            if family_scores[family]["status"] == "available":
+                available.append(family)
+        return {"family_scores": family_scores, "available_families": available,
+                "decision_score": max((family_scores[name]["score"] for name in available), default=None),
+                "evaluable_neighbors": max((family_scores[name]["evaluable_neighbors"] for name in available), default=0),
+                "neighbors": details}
+
     def _evaluar_sospecha(
+        self, *, sospecha, signals, stats, edges, map_quality, concurrent_entities,
+        continuous_observations=None, decision_calibrations=None,
+    ) -> dict[str, Any]:
+        continuous_edges = [edge for edge in edges if edge.get("relation_family") == "continuous_continuous"]
+        if map_quality.get("version") == self.MAP_VERSION and continuous_edges and continuous_observations is not None:
+            return self._evaluar_sospecha_v5(
+                sospecha=sospecha, signals=signals, stats=stats, edges=edges, map_quality=map_quality,
+                concurrent_entities=concurrent_entities, continuous_observations=continuous_observations,
+                decision_calibrations=decision_calibrations or {},
+            )
+        return self._evaluar_sospecha_v4(
+            sospecha=sospecha, signals=signals, stats=stats, edges=edges, map_quality=map_quality,
+            concurrent_entities=concurrent_entities, continuous_observations=continuous_observations,
+        )
+
+    def _evaluar_sospecha_v5(
+        self, *, sospecha, signals, stats, edges, map_quality, concurrent_entities,
+        continuous_observations, decision_calibrations,
+    ) -> dict[str, Any]:
+        # Se reutiliza el envoltorio y las protecciones de enrutamiento v4;
+        # sus votos continuos se sustituyen completamente por la decision v5.
+        base = self._evaluar_sospecha_v4(
+            sospecha=sospecha, signals=signals, stats=stats, edges=edges, map_quality=map_quality,
+            concurrent_entities=concurrent_entities, continuous_observations=continuous_observations,
+        )
+        source = str(sospecha.get("entity_id", ""))
+        timestamp = pd.to_datetime(sospecha.get("timestamp"), errors="coerce", utc=True)
+        current = self._numeric_or_none(sospecha.get("value", (sospecha.get("reading") or {}).get("value")))
+        if current is None and source in continuous_observations and not pd.isna(timestamp):
+            current, _ = self._observacion_continua(continuous_observations[source], timestamp, source)
+        continuous_edges = [edge for edge in edges if edge.get("relation_family") == "continuous_continuous"]
+        scores = self._puntajes_familiares(source, timestamp, current, continuous_edges, continuous_observations)
+        families = scores["available_families"]
+        combination = "+".join(families)
+        calibration = (decision_calibrations.get(source, {}).get("combinations", {}).get(combination) if combination else None)
+        exclusions = []
+        for item in scores["neighbors"].values():
+            for family in ("level", "innovation", "trend"):
+                check = item.get(f"{family}_check", {})
+                if check.get("reason"):
+                    exclusions.append({"neighbor_id": item["neighbor_id"], "family": family, "reason": check["reason"]})
+        if not families:
+            outcome, threshold = "insufficient_coverage", None
+        elif not calibration or calibration.get("status") != "available":
+            outcome, threshold = "unexplained", None
+        else:
+            threshold = float(calibration["threshold"])
+            outcome = "contradicted" if scores["decision_score"] > threshold else "supported"
+        base["context_outcome"] = outcome
+        base["context_score"] = -1.0 if outcome == "contradicted" else 1.0 if outcome == "supported" else None
+        base["coherence_score"] = 0.0 if outcome == "contradicted" else 1.0 if outcome == "supported" else None
+        base["context_evaluable"] = bool(families and calibration and calibration.get("status") == "available")
+        base["support_score"] = 1.0 if outcome == "supported" else 0.0
+        base["contradiction_score"] = 1.0 if outcome == "contradicted" else 0.0
+        base["score_semantics"] = "v5_outcome_indicator_not_probability"
+        base["decision_method"] = "calibrated_max_weighted_family_ratio"
+        base["family_scores"] = scores["family_scores"]
+        base["available_families"] = families
+        base["decision_score"] = self._redondear_o_none(scores["decision_score"])
+        base["decision_threshold"] = self._redondear_o_none(threshold)
+        base["decision_exclusions"] = exclusions
+        base["decision_calibration"] = calibration
+        base["coverage"]["observed_neighbors"] = scores["evaluable_neighbors"]
+        base["coverage"]["ratio"] = max((item["coverage"] for item in scores["family_scores"].values()), default=0.0)
+        base["coverage"]["status"] = "sufficient" if families else "insufficient"
+        for evidence in base["evidence"]:
+            detail = scores["neighbors"].get(evidence.get("neighbor_id"))
+            if detail:
+                evidence.update({key: detail[key] for key in ("level_check", "innovation_check", "trend_check")})
+                evidence["evidence_method"] = "v5_temporal_feature_models"
+                evidence["observed_delta"] = None
+        base["supports"] = []
+        base["contradictions"] = []
+        base["unknowns"] = list(base["evidence"])
+        routing = self._decidir_ruta(outcome, map_quality)
+        base["routing"] = routing
+        base["contextual_class"] = "environmental_anomaly" if routing["terminal"] else None
+        base["suspicion_effect"] = "decrease" if outcome == "supported" else "increase" if outcome == "contradicted" else "maintain"
+        return base
+
+    def _evaluar_sospecha_v4(
         self,
         *,
         sospecha: dict[str, Any],
@@ -990,7 +1392,13 @@ class FiltroContextualEspacioTemporal:
         target_z = self._standardized_value(target_value, target_stats)
         pattern = sospecha.get("suspected_pattern") or sospecha.get("pattern")
         directional_applicable = target_value is not None and pattern != "missing_gap"
-        if abs(target_z) < 0.05:
+        # ``delta_value`` remains a presentation aid for the legacy
+        # directional evidence used by state and mixed relations.  It cannot
+        # enter the continuous conditional-level calculation.
+        has_directional_relation = any(
+            edge.get("relation_family") != "continuous_continuous" for edge in edges
+        )
+        if has_directional_relation and abs(target_z) < 0.05:
             delta = self._numeric_or_none((sospecha.get("reading") or {}).get("delta_value"))
             if delta is not None and delta != 0:
                 target_z = 1.0 if delta > 0 else -1.0
@@ -1021,6 +1429,7 @@ class FiltroContextualEspacioTemporal:
                     continuous_observations[context_id], reference, context_id, edge
                 )
             if context_value is None:
+                is_continuous_pair = edge.get("relation_family") == "continuous_continuous"
                 evidence.append(
                     {
                         "neighbor_id": context_id,
@@ -1031,12 +1440,135 @@ class FiltroContextualEspacioTemporal:
                         "lag_error_seconds": None,
                         "observed_value": None,
                         "observed_delta": None,
-                        "expected_direction_or_state": self._expected_text(edge, target_z),
+                        "evidence_method": (
+                            "conditional_level_residual" if is_continuous_pair else "directional_association"
+                        ),
+                        "residual": None,
+                        "tolerance": None,
+                        "ratio": None,
+                        "contribution": 0.0,
+                        "expected_direction_or_state": (
+                            self._expected_level_text(edge)
+                            if is_continuous_pair else self._expected_text(edge, target_z)
+                        ),
                         "c_j_raw": None,
                         "c_j_normalized": None,
                         "weighted_contribution": 0.0,
                         "observation_status": "missing",
                         "temporal_match": False,
+                        "n_observations": edge.get("n_observations"),
+                        "coverage_ratio": edge.get("coverage_ratio"),
+                        "stability_score": edge.get("stability_score"),
+                        **observation_details,
+                    }
+                )
+                continue
+
+            # A continuous-continuous relation is evidence about conditional
+            # level, not about which side of either sensor's historical centre
+            # the readings fall on.  In particular, do not use source_z,
+            # context_z, association sign, or delta_value as a proxy here.
+            if edge.get("relation_family") == "continuous_continuous":
+                model = edge.get("expected_response")
+                actual = self._numeric_or_none(target_value)
+                context_numeric = self._numeric_or_none(context_value)
+                unknown_reason = None
+                if not model:
+                    unknown_reason = "missing_conditional_level_model"
+                elif not directional_applicable or actual is None:
+                    unknown_reason = "missing_evaluable_target_level"
+                elif context_numeric is None:
+                    unknown_reason = "invalid_context_level"
+
+                if unknown_reason is not None:
+                    evidence.append(
+                        {
+                            "neighbor_id": context_id,
+                            "weight": self._redondear(weight),
+                            "association_signed": edge.get("association_signed"),
+                            "expected_sign": edge.get("expected_sign"),
+                            "lag_seconds": edge.get("lag_seconds", 0),
+                            "lag_error_seconds": 0,
+                            "observed_value": self._serializable_value(context_value),
+                            "observed_delta": None,
+                            "expected_direction_or_state": self._expected_level_text(edge),
+                            "evidence_method": "conditional_level_residual",
+                            "residual": None,
+                            "tolerance": None,
+                            "ratio": None,
+                            "contribution": 0.0,
+                            "unknown_reason": unknown_reason,
+                            "c_j_raw": None,
+                            "c_j_normalized": None,
+                            "weighted_contribution": 0.0,
+                            "magnitude_check": {"status": "not_calibrated" if not model else "not_evaluable"},
+                            "observation_status": "unknown",
+                            "temporal_match": True,
+                            "n_observations": edge.get("n_observations"),
+                            "coverage_ratio": edge.get("coverage_ratio"),
+                            "stability_score": edge.get("stability_score"),
+                            **observation_details,
+                        }
+                    )
+                    # Unknown conditional evidence must not pretend to cover
+                    # this neighbor, even when a contextual observation exists.
+                    continue
+
+                expected = model["intercept"] + model["slope"] * context_numeric
+                residual = abs(actual - expected)
+                tolerance = max(model["tolerance"], 1e-6)
+                ratio = residual / tolerance
+                c_raw = 1.0 - ratio
+                c_normalized = max(-1.0, min(1.0, c_raw))
+                contribution = weight * c_normalized
+                magnitude = {
+                    "status": "compatible" if residual <= tolerance else "incompatible",
+                    "expected_value": expected,
+                    "actual_value": actual,
+                    "lower": expected - tolerance,
+                    "upper": expected + tolerance,
+                    "absolute_residual": residual,
+                    "tolerance": tolerance,
+                    "ratio": ratio,
+                    "extrapolated": not model["context_min"] <= context_numeric <= model["context_max"],
+                    "partition": "development",
+                    "method": model["method"],
+                }
+                observed_weight += weight
+                # Los limites son inclusivos. Un epsilon evita que la
+                # representacion binaria de, por ejemplo, 1.20 convierta el
+                # umbral documentado en 1.2000000000000002.
+                threshold_epsilon = 1e-12
+                if c_normalized >= self.config.evidence_threshold - threshold_epsilon:
+                    status = "supports"
+                    support_mass += contribution
+                elif c_normalized <= -self.config.evidence_threshold + threshold_epsilon:
+                    status = "contradicts"
+                    contradiction_mass += abs(contribution)
+                else:
+                    status = "observed_neutral"
+                evidence.append(
+                    {
+                        "neighbor_id": context_id,
+                        "weight": self._redondear(weight),
+                        "association_signed": edge.get("association_signed"),
+                        "expected_sign": edge.get("expected_sign"),
+                        "lag_seconds": edge.get("lag_seconds", 0),
+                        "lag_error_seconds": 0,
+                        "observed_value": self._serializable_value(context_value),
+                        "observed_delta": None,
+                        "expected_direction_or_state": self._expected_level_text(edge),
+                        "evidence_method": "conditional_level_residual",
+                        "residual": self._redondear(residual),
+                        "tolerance": self._redondear(tolerance),
+                        "ratio": self._redondear(ratio),
+                        "contribution": self._redondear(contribution),
+                        "c_j_raw": self._redondear(c_raw),
+                        "c_j_normalized": self._redondear(c_normalized),
+                        "weighted_contribution": self._redondear(contribution),
+                        "magnitude_check": magnitude,
+                        "observation_status": status,
+                        "temporal_match": True,
                         "n_observations": edge.get("n_observations"),
                         "coverage_ratio": edge.get("coverage_ratio"),
                         "stability_score": edge.get("stability_score"),
@@ -1106,6 +1638,11 @@ class FiltroContextualEspacioTemporal:
                     "lag_error_seconds": 0,
                     "observed_value": self._serializable_value(context_value),
                     "observed_delta": self._redondear(context_z),
+                    "evidence_method": "directional_association",
+                    "residual": None,
+                    "tolerance": None,
+                    "ratio": None,
+                    "contribution": self._redondear(contribution),
                     "expected_direction_or_state": self._expected_text(edge, target_z),
                     "c_j_raw": self._redondear(c_raw),
                     "c_j_normalized": self._redondear(c_normalized),
@@ -1148,7 +1685,6 @@ class FiltroContextualEspacioTemporal:
         elif (
             support_score >= self.config.decision_threshold
             and support_score > contradiction_score
-            and not any(item.get("magnitude_check", {}).get("status") == "incompatible" for item in evidence)
         ):
             outcome = "supported"
             effect = "decrease"
@@ -1184,11 +1720,12 @@ class FiltroContextualEspacioTemporal:
             ),
         }
         covered_neighbors = sum(
-            item["observation_status"] != "missing" for item in evidence
+            item["observation_status"] not in {"missing", "unknown"} for item in evidence
         )
         routing = self._decidir_ruta(outcome, map_quality)
         environmental = routing["terminal"]
         result = {
+            "observation_id": sospecha.get("observation_id"),
             "event_id": f"{entity_id}@{sospecha.get('timestamp')}",
             "episode": sospecha.get("episode"),
             "entity_id": entity_id,
@@ -1239,7 +1776,7 @@ class FiltroContextualEspacioTemporal:
             "unknowns": [
                 item
                 for item in evidence
-                if item["observation_status"] in {"missing", "observed_neutral"}
+                if item["observation_status"] in {"missing", "unknown", "observed_neutral"}
             ],
             "common_cause": common_cause,
             "adjustment_blocked_by_common_cause": False,
@@ -1467,6 +2004,9 @@ class FiltroContextualEspacioTemporal:
         target_direction = "sube" if target_z >= 0 else "baja"
         relation = "mismo sentido" if edge.get("expected_sign") == "positive" else "sentido opuesto"
         return f"{relation} cuando la entidad evaluada {target_direction}"
+
+    def _expected_level_text(self, edge: dict[str, Any]) -> str:
+        return f"nivel condicional segun modelo calibrado con desfase {edge.get('lag_seconds', 0)} s"
 
     def _comparar_mapas(
         self,

@@ -1,5 +1,57 @@
 # Inyecciones sobre fragmentos reales revisados
 
+## Escenario con el histórico completo
+
+Después de generar un caso, el paso **6. Acumular fallas y descargar el histórico
+completo** lo añade a la selección actual. Revisa otra entidad, guarda su base
+normal y genera la siguiente falla. Puedes incluir o retirar casos guardados
+mediante la tabla, sin borrar sus archivos. La selección se conserva en este
+navegador para cada histórico.
+
+La previsualización agrupa todas las entidades seleccionadas y muestra cada
+intervalo con su nombre de falla, comparación original/alterado y filas cambiadas.
+Las vistas muestreadas lo indican. Dos intervenciones sobre la misma entidad no
+pueden compartir instantes; entidades diferentes sí pueden intervenirse a la vez.
+
+**Guardar escenario y descargar histórico completo** crea una instantánea
+persistente con todas las entidades y filas del archivo fuente. `original.csv`
+conserva los bytes originales y `injected.csv` conserva el orden, las columnas y
+los valores salvo los cambios registrados. También conserva las filas no
+indexables. `ground_truth.csv` registra el tipo de falla (`kind`) y el intervalo
+de cada caso; `interventions.csv` identifica cada fila alterada, su falla y sus
+valores antes y después. Las etiquetas quedan separadas de los datos de entrada.
+El manifiesto conserva parámetros, semillas, revisiones, partición y huellas.
+Los registros sin intervención no se convierten automáticamente en normales.
+
+Desde la versión 2 del escenario, todas las anotaciones manuales actuales de
+ese histórico se incorporan automáticamente, incluso sin inyecciones. El ZIP
+añade `annotations.csv` con las anotaciones originales y sus revisiones fijadas.
+`ground_truth.csv` contiene los intervalos efectivos para `injected.csv`, con
+origen `historical_review` o `controlled_injection`. Los intervalos normales se
+recortan donde se aplica una inyección; las anotaciones originales no cambian.
+Pendientes e inciertos se conservan con `evaluable=false`.
+
+Los solapamientos manuales se dividen en tramos sin duplicar su cobertura.
+`annotation_references` conserva los identificadores y revisiones que contribuyen
+a cada tramo. Las clases conocidas revisadas prevalecen sobre pendientes e
+inciertas; clases conocidas contradictorias producen un tramo incierto.
+Una revisión actual que contradiga la normalidad de la base inyectada conserva
+la intervención, pero la excluye de métricas e indica el motivo.
+Los picos usan `source_row` para distinguir una lectura; si hay otras lecturas
+con la misma fecha, el tramo manual usa `excluded_source_rows` para excluir solo
+esa fila. Las fechas son inclusivas y conservan microsegundos.
+
+Descargar un escenario antiguo conserva su instantánea. Para incorporar las
+anotaciones actuales, carga su selección y guarda un nuevo escenario.
+
+El formulario de inyección muestra su fragmento original junto a los parámetros.
+Pulsa **Fijar inicio** y una lectura, luego otra para fijar el fin. Los mismos
+instantes están disponibles en una lista y en los campos ISO con microsegundos.
+Si el gráfico está muestreado se indica: la generación usa todos los registros.
+
+Los escenarios guardados pueden descargarse de nuevo o cargarse como selección
+para preparar otra versión. Añadir o retirar casos no modifica descargas anteriores.
+
 El generador crea casos semisintéticos: toma observaciones conservadas de un
 CSV y modifica el estado de una entidad durante un intervalo controlado. La
 intervención queda documentada por construcción. La fiabilidad del supuesto de
@@ -8,9 +60,10 @@ normalidad previo sigue dependiendo de la revisión del fragmento.
 ## Procedimiento en la interfaz
 
 1. Importa cada partición en **Revisión y etiquetado**. Revisa el fragmento y
-   guarda una anotación **Normal**, con responsable y descripción de evidencia
+   guarda una anotación **Normal** y **Revisado**, con responsable y observaciones
    de al menos 12 caracteres. Usa una descripción concreta; cumplir la longitud
-   mínima no acredita su calidad. Una revisión visual puede quedar en borrador.
+   mínima no acredita su calidad. No se requiere evidencia externa. La normalidad
+   se asume a partir del histórico; el origen del caso será **Inyección controlada**.
 2. En **Generar inyecciones**, selecciona esa anotación guardada. El generador
    usa su entidad principal, sus entidades de contexto y la revisión indicada.
    Al guardar en el paso 4, la anotación queda seleccionada automáticamente.
@@ -76,12 +129,14 @@ fuente y no se convierten en observaciones válidas para generar casos.
 
 ## Interpretación para la evaluación
 
-- Un fragmento **Normal / Borrador** produce un caso exploratorio con
-  `evaluable=false`. Conocer la intervención no confirma la normalidad previa.
-- Un fragmento **Normal / Verificado** puede producir un caso con
-  `evaluable=true` para la evaluación semisintética, según el protocolo del
-  estudio. Esa marca conserva la declaración del revisor; no convierte la
-  falla inyectada en una falla observada en el mundo real.
+- Un fragmento **Normal / Pendiente** requiere completar la revisión antes de
+  generar desde la interfaz. Los casos antiguos exploratorios conservan
+  `evaluable=false`.
+- Un fragmento **Normal / Revisado** produce un caso con `evaluable=true`
+  para la evaluación semisintética. El origen es **Inyección controlada** y
+  `baseline_normality_basis=assumed_from_history` documenta la normalidad
+  asumida. Conocer la intervención no confirma la normalidad previa ni convierte
+  la falla inyectada en una falla observada en el mundo real.
 - La etiqueta de intervención no se extiende a las entidades de contexto ni
   convierte el resto del fragmento en ejemplos negativos. Conserva las
   anotaciones normales originales para construir los controles que admita el
@@ -96,3 +151,29 @@ fuente y no se convierten en observaciones válidas para generar casos.
 Los originales y casos generados se guardan bajo `REVIEW_DATA_DIR`
 (`data/review` por defecto). Respalda el directorio completo. El generador
 prepara archivos; no ejecuta automáticamente el detector ni calcula métricas.
+
+## Histórico completo con marcas manuales e inyecciones
+
+El paso 6 permite acumular casos de distintas entidades del mismo CSV y descargar
+un único **CSV etiquetado** con `entity_id,state,last_changed,es_sintetica,tipo,tipo_falla`.
+Se incluyen todas las filas y todas las marcas manuales actuales. `es_sintetica=true`
+identifica exclusivamente valores que cambiaron en una intervención seleccionada;
+las demás filas llevan `false`. `tipo` usa `normal`, `anomalia`, `Falla` o `NULL`.
+`tipo_falla` contiene el nombre de la falla, o `NULL` si no aplica o no se conoce.
+
+La marca de una fila prevalece sobre una anotación de intervalo. En los registros
+modificados por una inyección prevalece la falla sintética. Los datos restantes
+no se convierten automáticamente en normales. Los escenarios permiten exportar
+marcas manuales sin seleccionar inyecciones. Las pendientes e inciertas quedan
+sin etiqueta definitiva en el CSV y se conservan documentadas en el respaldo.
+
+El esquema 3.0 conserva un `labelled.csv` descargable mediante
+`GET /review/scenarios/{scenario_id}/csv`. El ZIP de respaldo conserva también
+`original.csv`, `injected.csv`, `ground_truth.csv`, `interventions.csv`,
+`annotations.csv` y `manifest.json`, junto con los hashes. `ground_truth.csv`
+describe episodios; `labelled.csv` es la referencia por registro y distingue los
+valores efectivamente modificados de los demás registros del episodio.
+
+Los escenarios anteriores conservan sus archivos. Para usar el CSV nuevo, carga
+la selección del escenario y guarda otra versión. La revisión, la generación y
+la descarga no ejecutan el clasificador ni los filtros estadísticos.

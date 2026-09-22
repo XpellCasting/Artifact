@@ -13,8 +13,8 @@ export const DIAGNOSTIC_PARTITIONS = { development: "Desarrollo", validation: "V
 export function annotationDiagnosticProblem(annotation, includeDrafts = false) {
   if (!["normal", "sensor_fault", "environmental_anomaly"].includes(annotation.label)) return "Se requiere normalidad, una falla identificada o una anomalía ambiental.";
   if (annotation.label === "sensor_fault" && !FAULT_TYPES[annotation.fault_type]) return "Falta asignar el tipo de falla en Revisión y etiquetado.";
-  if (annotation.status !== "verified" && !includeDrafts) return "Es un borrador; habilita el uso exploratorio para seleccionarlo.";
-  if ((annotation.reviewer || "").trim().length < 2 || (annotation.evidence || "").trim().length < 12) return "Completa el responsable y la evidencia en Revisión y etiquetado.";
+  if (!["reviewed", "verified"].includes(annotation.status) && !includeDrafts) return "La revisión está pendiente; habilita el uso exploratorio para seleccionarlo.";
+  if ((annotation.reviewer || "").trim().length < 2 || (annotation.evidence || "").trim().length < 12) return "Completa el responsable y las observaciones en Revisión y etiquetado.";
   return "";
 }
 
