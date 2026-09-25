@@ -287,6 +287,7 @@ function App() {
   const [selectedResult, setSelectedResult] = useState(null);
   const [normalizationPreview, setNormalizationPreview] = useState(null);
   const [activeModule, setActiveModule] = useState("estadistico");
+  const [classifierVisited, setClassifierVisited] = useState(false);
   const [resultEntityFilterIds, setResultEntityFilterIds] = useState(null);
   const [continuousConfig, setContinuousConfig] = useState([]);
   const [contextMap, setContextMap] = useState(null);
@@ -822,7 +823,7 @@ function App() {
           active={activeModule === "clasificador"}
           icon={<FlaskConical size={17} />}
           label="Clasificador diagnóstico"
-          onClick={() => setActiveModule("clasificador")}
+          onClick={() => { setClassifierVisited(true); setActiveModule("clasificador"); }}
         />
         <ModuleTab
           active={activeModule === "revision"}
@@ -982,8 +983,11 @@ function App() {
       ) : activeModule === "revision" ? (
         <ReviewWorkspace apiBaseUrl={API_BASE_URL} />
       ) : (
-        <DiagnosticWorkspace apiBaseUrl={API_BASE_URL} />
+        null
       )}
+      <div hidden={activeModule !== "clasificador"}>
+        {classifierVisited && <DiagnosticWorkspace apiBaseUrl={API_BASE_URL} />}
+      </div>
       {selectedResult && (
         <CalculationModal
           result={selectedResult}

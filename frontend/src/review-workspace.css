@@ -116,3 +116,18 @@
 .review-point-faults { margin-top: 12px; }
 .review-point-faults summary { cursor: pointer; width: fit-content; padding: 9px 13px; border: 1px solid #52605b; border-radius: 7px; }
 .review-zoom-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 8px 0; color: #a1b5ac; font-size: 12px; }
+.review-pan-surface { cursor: grab; touch-action: pan-y; user-select: none; }
+.review-pan-surface:active, .review-zoomable.is-dragging .review-pan-surface { cursor: grabbing; }
+.review-pan-surface circle[role="button"] { cursor: pointer; }
+.review-chart { position: relative; }
+.review-point-tooltip { position: absolute; z-index: 3; top: 48px; left: 14px; display: grid; gap: 3px; max-width: min(420px, calc(100% - 28px)); padding: 9px 11px; border: 1px solid #477366; border-radius: 6px; background: rgba(7, 16, 14, .96); color: #d4e5df; font-size: 11px; line-height: 1.45; pointer-events: none; box-shadow: 0 5px 18px rgba(0,0,0,.35); }
+.review-point-tooltip strong { color: #71d8c2; }
+.exploration-actions { white-space: nowrap; }
+.exploration-complete { display: inline-flex !important; width: 38px; height: 38px; margin-left: 6px; align-items: center !important; justify-content: center; vertical-align: middle; border: 1px solid #34433f; border-radius: 7px; background: #131d19; cursor: pointer; }
+.exploration-complete input { position: absolute; width: 1px !important; height: 1px; opacity: 0; }
+.exploration-complete span { color: #789087; font-size: 20px; line-height: 1; }
+.exploration-complete:has(input:checked) { border-color: #2dd4bf; background: #12352d; }
+.exploration-complete:has(input:checked) span { color: #54e2c5; }
+.exploration-complete:focus-within { outline: 2px solid var(--review-teal); outline-offset: 2px; }
+.review-point-value-label, .review-point-time-label { fill: #e0f0eb; font-size: 9px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; paint-order: stroke; stroke: #07100e; stroke-width: 3px; stroke-linejoin: round; pointer-events: none; }
+.review-point-time-label { fill: #a9c8bd; font-size: 8px; }

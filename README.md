@@ -148,11 +148,11 @@ ventana y el paso del barrido para construir referencias y ejemplos trazables.
 El ZIP exporta las características y etiquetas; las variantes conservan el
 grupo y la partición de su fragmento original.
 
-El entrenamiento utiliza únicamente Desarrollo. La evaluación requiere
-Validación o Prueba posteriores, sin grupos o períodos compartidos, y vuelve a
-extraer características con las referencias fijadas en entrenamiento. La
-interfaz muestra matriz de confusión, abstenciones y métricas de ventanas de
-F3; estas métricas no representan todavía el rendimiento de extremo a extremo.
+El entrenamiento utiliza únicamente `train_fit`; `dev_tune` ajusta selección y
+abstención. Validación y Prueba se reservan para evaluación independiente y
+vuelven a extraer características con las referencias fijadas en entrenamiento.
+La interfaz muestra matriz de confusión, abstenciones y métricas por ventanas;
+estas métricas no representan todavía el rendimiento de extremo a extremo.
 
 Sin modelo activo, F3 utiliza un catálogo explícito de patrones. Una versión
 entrenada utiliza prototipos supervisados con escalado robusto; su activación
@@ -528,3 +528,36 @@ el rendimiento diagnostico de la tesis. Cubren cierre ambiental, causa comun,
 mapa obsoleto, pendientes, replay causal, caché, diagnóstico por patrones,
 separación temporal del aprendizaje y conservación de versiones. Los endpoints
 antiguos `/classifier/*` permanecen retirados; la API vigente es `/diagnostics/*`.
+# GAT-LSTM por entidad
+
+El workbench de **Clasificador diagnóstico → Preparación del investigador** permite seleccionar el motor GAT-LSTM, guardar su configuración, elegir fuentes canónicas y anotaciones revisadas, construir un dataset persistido, preentrenar opcionalmente, entrenar/evaluar candidatos y activarlos de forma explícita. Los candidatos nunca se activan al terminar el entrenamiento. Las puntuaciones son softmax no calibradas; `indeterminate` es abstención. Docker habilita PyTorch CPU-only de forma predeterminada, monta `HistoricoPuro` como solo lectura y sirve esta configuración desde la aplicación.
+
+Los valores iniciales son CPU, 60 pasos de 60 s, ventana de características de 15 min, cuatro vecinos, entropía y DTW activadas, preentrenamiento desactivado, cuatro cabezas de ocho dimensiones y LSTM de 32. El contexto total es 4.440 s. Los cambios temporales, de grafo o de características requieren construir otra vez el dataset.
+
+Desde la raíz del proyecto, la auditoría de fuentes se ejecuta con:
+
+```powershell
+backend/.venv/Scripts/python.exe scripts/gat_lstm_audit.py --output data/review/diagnostics/experiments/gat_lstm_p0_audit.json
+```
+
+Las pruebas backend se ejecutan desde `backend` con:
+
+```powershell
+.venv/Scripts/python.exe -m unittest discover -s tests -v
+```
+
+La suite web se ejecuta desde `frontend`:
+
+```powershell
+$files = @(Get-ChildItem -LiteralPath './src' -Filter '*.test.js' | ForEach-Object { $_.FullName })
+node --test $files
+npm run build
+```
+
+PyTorch sigue siendo opcional para el motor convencional. Instálalo en el entorno backend con `python -m pip install -r requirements-gat.txt`. `docker-compose.yml` configura `INSTALL_GAT=1`; el Dockerfile usa la rueda oficial CPU-only desde `requirements-gat-docker.txt`, sin bibliotecas CUDA. Para crear una imagen API liviana, cambia ese argumento a `"0"`.
+
+Las operaciones también tienen CLI (`--help` disponible): `scripts/gat_lstm_pretrain.py DATASET_ID`, `scripts/gat_lstm_train.py DATASET_ID [--encoder-id ID]`, y `scripts/gat_lstm_evaluate.py MODEL_ID DATASET_ID --partition validation|test`. `scripts/gat_lstm_compare.py DATASET_JSON --partition validation --variant B0=predicciones.json --variant B3=gat.json` compara archivos de predicción guardados sobre los mismos objetivos; objetivos faltantes se conservan como abstenciones y el informe muestra métricas por origen y remuestreo por episodio.
+
+La auditoría disponible en [GAT_LSTM_PROGRESO.md](GAT_LSTM_PROGRESO.md) encontró cero ventanas etiquetadas elegibles para las tres clases en `train_fit` y `dev_tune`, y cero en Prueba. Validación cuenta 220 normales, 123 anomalías ambientales y 7 fallas de sensor. Por este motivo no se entrenó ni activó un modelo real, y no se fabricaron etiquetas. Se requieren etiquetas revisadas con soporte en Desarrollo y Prueba para completar la comparación empírica. La aptitud de preentrenamiento predictivo sigue pendiente de auditar la cobertura futura.
+
+El estado, el soporte real del histórico y los comandos comprobados están en [GAT_LSTM_PROGRESO.md](GAT_LSTM_PROGRESO.md). No hay soporte elegible suficiente en `train_fit`/`dev_tune` para entrenar un clasificador real; el código se valida con fixtures sintéticos identificados como tales.

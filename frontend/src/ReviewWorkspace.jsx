@@ -59,6 +59,7 @@ export function SeriesChart(props) {
 }
 
 export function SeriesPlot({ series, fragment, target, exploration = false, onPoint, annotations = [], viewport, clipId = "review-static-plot" }) {
+  const [hoveredPoint, setHoveredPoint] = useState(null);
   const width = 1000;
   const height = 184;
   const left = 100;
@@ -111,17 +112,37 @@ export function SeriesPlot({ series, fragment, target, exploration = false, onPo
       {points.filter(visible).map((point, index) => {
         const annotation = annotationForPoint(annotations, series.entity_id, point);
         const label = annotation?.evaluable ? annotation.label : "unlabelled";
-        return <circle key={point.source_row ?? index} cx={x(point.timestamp)} cy={valid(point) ? y(numberOf(point)) : height - bottom - 3} r={onPoint ? 4 : 3}
+        const px = x(point.timestamp);
+        const py = valid(point) ? y(numberOf(point)) : height - bottom - 3;
+        const showPointText = Boolean(viewport && (to - from) < total * 0.2 && points.length <= 250);
+        const pointTime = utcTimestamp(point.timestamp);
+        const timeText = pointTime.includes("T") ? pointTime.slice(11, 19) : pointTime;
+        const pointValue = String(point.state);
+        return <g key={point.source_row ?? index}>
+          <circle cx={px} cy={py} r={onPoint ? 4 : 3}
           role={onPoint ? "button" : undefined} tabIndex={onPoint ? 0 : undefined}
           aria-label={onPoint ? `Etiquetar ${point.timestamp}, valor ${point.state}, fila ${point.source_row}` : undefined}
           onClick={() => onPoint?.(series, point)} onKeyDown={event => { if (onPoint && ["Enter", " "].includes(event.key)) { event.preventDefault(); onPoint(series, point); } }}
-          className={`${valid(point) ? "review-chart-point" : "review-chart-invalid"} review-label-${label}`}>
-          <title>{`${utcTimestamp(point.timestamp)}\nValor: ${point.state}\nEtiqueta: ${annotation ? LABELS[annotation.label] : "Sin revisar"}${annotation?.fault_type ? ` · ${POINT_FAULTS[annotation.fault_type] || annotation.fault_type}` : ""}`}</title>
-        </circle>;
+          onPointerEnter={() => setHoveredPoint({ point, annotation })}
+          onPointerLeave={() => setHoveredPoint((current) => current?.point === point ? null : current)}
+          onFocus={() => setHoveredPoint({ point, annotation })}
+          onBlur={() => setHoveredPoint((current) => current?.point === point ? null : current)}
+          className={`${valid(point) ? "review-chart-point" : "review-chart-invalid"} review-label-${label}`} />
+          {showPointText && <g className="review-point-inline-labels" aria-hidden="true">
+            <text x={px} y={py - 8} textAnchor="middle" className="review-point-value-label">{pointValue.length > 12 ? `${pointValue.slice(0, 11)}…` : pointValue}</text>
+            <text x={px} y={py + 17} textAnchor="middle" className="review-point-time-label">{timeText}</text>
+          </g>}
+        </g>;
       })}
       </g>
       {[0, 0.5, 1].map((position) => <text key={position} x={left + plotWidth * position} y={height - 9} textAnchor={position === 0 ? "start" : position === 1 ? "end" : "middle"} className="review-chart-axis">{formatReviewMicros(origin + BigInt(Math.round(from + span * position))).replace("T", " ")}</text>)}
     </svg>}
+    {hoveredPoint && <div className="review-point-tooltip" role="status" aria-live="polite">
+      <strong>{utcTimestamp(hoveredPoint.point.timestamp)}</strong>
+      <span>Valor: {String(hoveredPoint.point.state)}</span>
+      <span>Etiqueta: {hoveredPoint.annotation ? LABELS[hoveredPoint.annotation.label] : "Sin revisar"}{hoveredPoint.annotation?.fault_type ? ` · ${POINT_FAULTS[hoveredPoint.annotation.fault_type] || hoveredPoint.annotation.fault_type}` : ""}</span>
+      {hoveredPoint.point.source_row != null && <span>Fila: {hoveredPoint.point.source_row}</span>}
+    </div>}
     {onPoint && points.length > 0 && <label className="review-point-picker">Elegir lectura si los puntos se superponen<select value="" onChange={event => { const point = points.find(item => String(item.source_row) === event.target.value); if (point) onPoint(series, point); }}><option value="">Selecciona una lectura de la gráfica</option>{points.filter(visible).map(point => <option key={point.source_row} value={point.source_row}>{utcTimestamp(point.timestamp)} · {point.state} · fila {point.source_row}</option>)}</select></label>}
   </article>;
 }
@@ -138,6 +159,8 @@ export default function ReviewWorkspace({ apiBaseUrl = "http://localhost:8000" }
   const [uploadProgress, setUploadProgress] = useState(null);
   const [uploadProcessing, setUploadProcessing] = useState(false);
   const [entityId, setEntityId] = useState("");
+  const [completedEntities, setCompletedEntities] = useState({});
+  const [completedEntitiesDataset, setCompletedEntitiesDataset] = useState("");
   const [entitySearch, setEntitySearch] = useState("");
   const [contextSearch, setContextSearch] = useState("");
   const [contextIds, setContextIds] = useState([]);
@@ -200,6 +223,11 @@ export default function ReviewWorkspace({ apiBaseUrl = "http://localhost:8000" }
 
   useEffect(() => {
     if (!selectedDataset) return;
+    try {
+      const saved = window.localStorage.getItem(`review-completed-entities:${datasetId}`);
+      setCompletedEntities(saved ? JSON.parse(saved) : {});
+    } catch { setCompletedEntities({}); }
+    setCompletedEntitiesDataset(datasetId);
     setEntityId(selectedDataset.entities?.[0]?.entity_id || "");
     setContextIds([]);
     setEntitySearch("");
@@ -211,6 +239,12 @@ export default function ReviewWorkspace({ apiBaseUrl = "http://localhost:8000" }
     setForm({ ...NEW_LABEL });
     setNotice("");
   }, [datasetId]); // Dataset selection deliberately resets the review workspace.
+
+  useEffect(() => {
+    if (!datasetId || completedEntitiesDataset !== datasetId) return;
+    try { window.localStorage.setItem(`review-completed-entities:${datasetId}`, JSON.stringify(completedEntities)); }
+    catch { /* Completion marks remain usable for this session if storage is unavailable. */ }
+  }, [datasetId, completedEntities, completedEntitiesDataset]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -407,7 +441,7 @@ export default function ReviewWorkspace({ apiBaseUrl = "http://localhost:8000" }
     </section>
 
     {selectedDataset && <>
-      <HistoryExplorer key={`exploration-${datasetId}`} apiBaseUrl={apiBaseUrl} dataset={selectedDataset} Chart={SeriesChart} DateInput={PreciseDateInput} disabled={saving || uploadBusy} onReview={(selection) => {
+      <HistoryExplorer key={`exploration-${datasetId}`} apiBaseUrl={apiBaseUrl} dataset={selectedDataset} Chart={SeriesChart} DateInput={PreciseDateInput} disabled={saving || uploadBusy} completedEntities={completedEntities} onToggleEntityComplete={(id, checked) => setCompletedEntities(previous => ({ ...previous, [id]: checked }))} onReview={(selection) => {
         if (selection.datasetId !== datasetIdRef.current) return;
         setEntityId(selection.entityId); setStart(selection.start); setEnd(selection.end);
         setContextIds(previous => previous.filter(id => id !== selection.entityId)); setAnnotationId(null);
@@ -416,7 +450,7 @@ export default function ReviewWorkspace({ apiBaseUrl = "http://localhost:8000" }
         setNotice(selection.day ? `Día ${selection.day} seleccionado. ${selection.partialDay ? "Cobertura parcial del archivo." : "Jornada completa en UTC."} Revisa los datos antes de guardar una etiqueta.` : "Intervalo seleccionado para revisión.");
       }} />
       <section className="review-panel" ref={intervalPanel}><div className="review-panel-title"><h3>2. Revisión seleccionada</h3><span className="review-badge">Todas las fechas en UTC</span></div><p className="review-help"><strong>{entityId}</strong><br />{timeLabel(start)} → {timeLabel(end)}</p><p className="review-help">Selecciona un día en Actividad diaria para abrirlo directamente. Los ajustes siguientes permiten acotar un evento o añadir entidades de contexto.</p><details><summary>Ajustar entidad, intervalo y contexto</summary>
-        <fieldset className="review-fields" disabled={saving}><div className="review-field"><label>Buscar entidad<div className="review-search"><Search size={16} /><input value={entitySearch} onChange={(event) => setEntitySearch(event.target.value)} placeholder="Nombre o identificador" /></div></label><label>Entidad que recibirá la etiqueta<select value={entityId} onChange={(event) => { setEntityId(event.target.value); setContextIds((previous) => previous.filter((id) => id !== event.target.value)); setAnnotationId(null); setForm((previous) => ({ ...NEW_LABEL, reviewer: previous.reviewer })); }}><option value="" disabled>Selecciona una entidad</option>{targets.map((entity) => <option key={entity.entity_id} value={entity.entity_id}>{entity.entity_id}{entity.unit ? ` (${entity.unit})` : ""}</option>)}</select></label></div><PreciseDateInput label="Inicio" value={start} onChange={setStart} disabled={saving} /><PreciseDateInput label="Fin" value={end} onChange={setEnd} disabled={saving} /><label>Contexto antes y después (min)<input type="number" min="0" max="10080" step="1" value={padding} onChange={(event) => setPadding(event.target.value)} /></label></fieldset>
+        <fieldset className="review-fields" disabled={saving}><div className="review-field"><label>Buscar entidad<div className="review-search"><Search size={16} /><input value={entitySearch} onChange={(event) => setEntitySearch(event.target.value)} placeholder="Nombre o identificador" /></div></label><label>Entidad que recibirá la etiqueta<select value={entityId} onChange={(event) => { setEntityId(event.target.value); setContextIds((previous) => previous.filter((id) => id !== event.target.value)); setAnnotationId(null); setForm((previous) => ({ ...NEW_LABEL, reviewer: previous.reviewer })); }}><option value="" disabled>Selecciona una entidad</option>{targets.map((entity) => <option key={entity.entity_id} value={entity.entity_id}>{completedEntities[entity.entity_id] ? "✓ Revisada · " : ""}{entity.entity_id}{entity.unit ? ` (${entity.unit})` : ""}</option>)}</select></label></div><PreciseDateInput label="Inicio" value={start} onChange={setStart} disabled={saving} /><PreciseDateInput label="Fin" value={end} onChange={setEnd} disabled={saving} /><label>Contexto antes y después (min)<input type="number" min="0" max="10080" step="1" value={padding} onChange={(event) => setPadding(event.target.value)} /></label></fieldset>
         {start && end && !validInterval && <p className="review-inline-error">Indica fechas válidas y un fin posterior al inicio.</p>}
         {!validPadding && <p className="review-inline-error">El contexto debe estar entre 0 y 10 080 minutos.</p>}
         <details className="review-context-picker"><summary>Entidades de contexto · {contextIds.length}/7 seleccionadas</summary><p className="review-help">Elige entidades que ayuden a contrastar lo ocurrido. Las anotaciones de intervalo afectan a la entidad principal. Una marca puntual afecta únicamente al registro que pulses.</p><label>Buscar entidad de contexto<input value={contextSearch} onChange={(event) => setContextSearch(event.target.value)} placeholder="Ej. temperatura, puerta o disponibilidad" /></label><div className="review-context-list">{contextOptions.map((entity) => <label key={entity.entity_id}><input type="checkbox" checked={contextIds.includes(entity.entity_id)} disabled={saving || (!contextIds.includes(entity.entity_id) && contextIds.length >= 7)} onChange={(event) => setContextIds((previous) => event.target.checked ? [...previous, entity.entity_id] : previous.filter((id) => id !== entity.entity_id))} /><span>{entity.entity_id}</span></label>)}{!contextOptions.length && <p className="review-help">No hay entidades que coincidan.</p>}</div></details>

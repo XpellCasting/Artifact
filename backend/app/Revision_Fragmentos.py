@@ -158,11 +158,13 @@ class ReviewStore:
         finally:
             connection.close()
 
-    def list_datasets(self) -> list[dict[str, Any]]:
+    def list_datasets(self, partition: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            return [self._refresh_kinds(json.loads(row[0])) for row in connection.execute(
-                "SELECT metadata FROM datasets ORDER BY rowid DESC"
-            )]
+            datasets = [json.loads(row[0]) for row in connection.execute(
+                "SELECT metadata FROM datasets ORDER BY rowid DESC")]
+        if partition is not None:
+            datasets = [item for item in datasets if item.get("partition") == partition]
+        return [self._refresh_kinds(item) for item in datasets]
 
     def dataset(self, dataset_id: str) -> dict[str, Any]:
         with self.connect() as connection:
@@ -172,6 +174,20 @@ class ReviewStore:
         if row is None:
             raise ReviewError("Histórico de revisión no encontrado.", 404)
         return self._refresh_kinds(json.loads(row[0]))
+
+    def source_path(self, dataset_id: str) -> Path:
+        """Resuelve la copia inmutable de una fuente ya importada."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT source_name FROM datasets WHERE dataset_id=?", (dataset_id,)
+            ).fetchone()
+        if row is None:
+            raise ReviewError("Histórico de revisión no encontrado.", 404)
+        root = self.sources.resolve()
+        path = (root / row["source_name"]).resolve()
+        if path.parent != root:
+            raise ReviewError("La ruta de la fuente importada no es válida.")
+        return path
 
     def _refresh_kinds(self, metadata: dict[str, Any]) -> dict[str, Any]:
         """Actualiza catálogos anteriores sin tocar originales ni anotaciones."""

@@ -104,6 +104,14 @@
 .diagnostic-catalog h4 { color: #d6e9d6; }
 .diagnostic-catalog p { color: #a1b8a2; line-height: 1.7; font-size: 12px; }
 .diagnostic-spin { animation: diagnostic-spin 1s linear infinite; }
+.diagnostic-dataset-progress { display: grid; gap: 10px; margin: 16px 0; padding: 16px; border: 1px solid #35534a; border-radius: 8px; background: #10231f; color: #d9eeea; }
+.diagnostic-dataset-progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.diagnostic-dataset-progress-heading strong { display: flex; align-items: center; gap: 8px; }
+.diagnostic-dataset-progress progress { width: 100%; height: 14px; accent-color: var(--diagnostic-accent); }
+.diagnostic-dataset-progress p { margin: 0; font-size: 13px; line-height: 1.6; }
+.diagnostic-dataset-progress small { color: #a7b9bd; }
+.diagnostic-dataset-progress.ready { border-color: var(--diagnostic-accent); }
+.diagnostic-dataset-progress.failed { border-color: #cc7575; background: #301c1c; }
 @keyframes diagnostic-spin { to { transform: rotate(360deg); } }
 @media (max-width: 1100px) { .diagnostic-build-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } .diagnostic-build-controls > button { grid-column: 1 / -1; } .diagnostic-catalog { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 760px) { .diagnostic-header { flex-direction: column; gap: 15px; } .diagnostic-panel { padding: 17px; } .diagnostic-source-columns, .diagnostic-source-tools, .diagnostic-evaluate-controls { grid-template-columns: 1fr; } .diagnostic-mode { flex-wrap: wrap; } .diagnostic-mode > div { flex: 1; min-width: 180px; } .diagnostic-source-list { max-height: 320px; } .diagnostic-panel-title { flex-wrap: wrap; } .diagnostic-tabs { gap: 5px; } .diagnostic-tabs button { flex: 1 1 43%; justify-content: center; } .diagnostic-pagination { justify-content: space-between; gap: 8px; } .diagnostic-result { padding: 14px; } .diagnostic-result-heading { gap: 9px; } .diagnostic-compatibility small { max-width: 90px; } }

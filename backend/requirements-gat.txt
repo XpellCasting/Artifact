@@ -1,0 +1,2 @@
+# Optional CPU neural engine for the local backend and Docker image.
+torch==2.14.0

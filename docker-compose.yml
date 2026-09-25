@@ -1,7 +1,11 @@
 services:
   api:
+    mem_limit: 4g
+    memswap_limit: 4g
     build:
       context: ./backend
+      args:
+        INSTALL_GAT: "1"
     environment:
       MULTISTATE_FIXTURE_DIR: /app/fixtures
       STATIC_HISTORY_DIR: /app/data/static_history
@@ -11,6 +15,7 @@ services:
       CONTINUOUS_CONF_PATH: /app/data/cache/conf.txt
       CONTEXT_MAP_CACHE_PATH: /app/data/cache/contextual_map.json
       REVIEW_DATA_DIR: /app/data/review
+      HISTORICAL_DATA_DIR: /app/HistoricoPuro
       FLOW_LAB_DB_PATH: /app/data/cache/flow_lab.sqlite3
       VALIDATION_REPLAY_MEMORY_RESULTS: "500"
       VALIDATION_REPLAY_STATUS_RESULTS: "25"
@@ -23,6 +28,7 @@ services:
       - ./data/datosreales:/app/data/datosreales
       - ./data/cache:/app/data/cache
       - ./data/review:/app/data/review
+      - ../HistoricoPuro:/app/HistoricoPuro:ro
     ports:
       - "8000:8000"
 

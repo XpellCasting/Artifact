@@ -11,6 +11,7 @@ from bisect import bisect_left, bisect_right
 import hashlib
 import io
 import json
+from itertools import chain
 import math
 import os
 import sqlite3
@@ -24,6 +25,7 @@ from pathlib import Path
 from threading import Lock, RLock, Thread
 from typing import Any, Literal
 from uuid import uuid4
+import importlib.util
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
@@ -34,6 +36,13 @@ from starlette.background import BackgroundTask
 from .Revision_Fragmentos import ReviewStore, ReviewError, parse_time, iso_time, UTC
 from .Inyeccion_Fragmentos import InjectionStore
 from .Diagnostico_Patrones import CATALOG, ENGINE_VERSION, build_reference, extract_features, diagnose, fit_model, predict_features
+from .GAT_LSTM.config import Config as GATConfig, historical_manifest_path
+from .GAT_LSTM import LABELS as GAT_LABELS
+from .GAT_LSTM.pipeline import (build_sequence_dataset, canonical_sources, development_annotations, development_sources,
+                                load_partition, load_pretraining_partition)
+from .GAT_LSTM.audit import sha256_file
+from .GAT_LSTM.storage import sample_summaries
+from .GAT_LSTM.evaluation import metrics as gat_metrics
 
 MAX_ROWS = 250_000
 MAX_EXAMPLES = 20_000
@@ -84,6 +93,20 @@ class DiagnosticRunSession:
     def __init__(self, workbench, source, run_id):
         self.workbench, self.source, self.run_id = workbench, source, run_id
         self.snapshot = workbench._run_snapshot(source, run_id)
+        self.gat_snapshot = None
+        if self.snapshot.get("model", {}).get("method") == "gat_lstm":
+            from .GAT_LSTM.runtime import load_snapshot
+            try:
+                self.gat_snapshot = load_snapshot(str(workbench.directory), self.snapshot["model"]["model_id"])
+            except ImportError:
+                self.gat_snapshot = None
+            if self.gat_snapshot is not None:
+                self.window_seconds = self.gat_snapshot[3]["config"]["lookback_seconds"] + self.gat_snapshot[3]["config"]["feature_window_seconds"]
+            else:
+                cfg = self.snapshot["model"]["config"]
+                self.window_seconds = (cfg["sequence_steps"] - 1) * cfg["grid_seconds"] + cfg["feature_window_seconds"]
+        else:
+            self.window_seconds = self.snapshot.get("model", {}).get("window_seconds", 3600)
         self.references = {}
         for reference in self.snapshot["references"]:
             end, _ = parse_time(reference["end"])
@@ -95,14 +118,31 @@ class DiagnosticRunSession:
     def add_events(self, frame):
         if not isinstance(frame, pd.DataFrame) or frame.empty: return
         time_column = "timestamp_dt" if "timestamp_dt" in frame else "timestamp" if "timestamp" in frame else "last_changed"
-        for ordinal, row in enumerate(frame.sort_values([time_column, "entity_id", "_raw_index"], kind="stable").to_dict("records")):
-            key = row.get("_raw_index", (str(row.get("entity_id")), row.get(time_column), ordinal))
-            if key in self.seen: continue
+        order = [time_column, "entity_id"] + (["_raw_index"] if "_raw_index" in frame else [])
+        for ordinal, row in enumerate(frame.sort_values(order, kind="stable").to_dict("records")):
             at = pd.to_datetime(row.get(time_column), utc=True, errors="coerce")
             if pd.isna(at): continue
-            self.seen.add(key); entity = str(row.get("entity_id", ""))
-            self.events.setdefault(entity, []).append((at, {"timestamp": at.isoformat(), "state": str(row.get("state", "")), "source_row": int(key) if isinstance(key, int) else ordinal}))
+            entity = str(row.get("entity_id", ""))
+            raw_index = row.get("_raw_index")
+            source_row = int(raw_index) if isinstance(raw_index, (int, float)) and not pd.isna(raw_index) else ordinal
+            key = (entity, at.value, source_row)
+            if key in self.seen: continue
+            self.seen.add(key)
+            self.events.setdefault(entity, []).append((at, {"timestamp": at.isoformat(), "state": str(row.get("state", "")), "source_row": source_row}))
             self.stats["event_rows"] += 1
+        if self.snapshot.get("model", {}).get("method") == "gat_lstm":
+            latest = max((items[-1][0] for items in self.events.values() if items), default=None)
+            if latest is not None:
+                cutoff = latest - pd.Timedelta(seconds=self.window_seconds)
+                for entity, items in list(self.events.items()):
+                    kept = [item for item in items if item[0] >= cutoff]
+                    if kept:
+                        self.events[entity] = kept
+                    else:
+                        self.events.pop(entity, None)
+                active_keys = {(entity, at.value, row.get("source_row"))
+                               for entity, rows in self.events.items() for at, row in rows}
+                self.seen.intersection_update(active_keys)
 
     def reference_for(self, entity_id, at):
         values = self.references.get(str(entity_id), [])
@@ -114,6 +154,15 @@ class DiagnosticRunSession:
         start = at - pd.Timedelta(seconds=window_seconds)
         left = bisect_left(values, start, key=lambda item: item[0]); right = bisect_right(values, at, key=lambda item: item[0])
         return [row for _, row in values[left:right]]
+
+    def events_between(self, start, end, entity_ids):
+        result = []
+        for entity in entity_ids:
+            values = self.events.get(str(entity), [])
+            left = bisect_left(values, start, key=lambda item: item[0])
+            right = bisect_right(values, end, key=lambda item: item[0])
+            result.extend(row for _, row in values[left:right])
+        return result
 
     def queue(self, decisions):
         self.pending.extend(decisions)
@@ -135,6 +184,9 @@ class BuildInput(BaseModel):
     window_seconds: int = Field(default=3600, ge=60, le=604800)
     stride_seconds: int = Field(default=1800, ge=60, le=604800)
     include_drafts: bool = False
+    method: Literal["robust_nearest_prototype", "gat_lstm"] | None = None
+    source_ids: list[str] = Field(default_factory=list, max_length=10)
+    gat_config: dict[str, Any] | None = None
 
 
 class DiagnosticWorkbench:
@@ -142,7 +194,8 @@ class DiagnosticWorkbench:
         self.review = ReviewStore(directory)
         self.injections = InjectionStore(self.review)
         self.directory = Path(directory) / "diagnostics"
-        for folder in ("references", "datasets", "models", "jobs"):
+        for folder in ("references", "datasets", "models", "jobs", "weights", "preprocessors",
+                       "graphs", "sequences", "experiments", "encoders", "configurations"):
             (self.directory / folder).mkdir(parents=True, exist_ok=True)
         self.database = self.directory / "diagnostics.sqlite3"
         self.lock = RLock()
@@ -192,14 +245,91 @@ class DiagnosticWorkbench:
     def status(self):
         active = self._active()
         references = [{key: ref.get(key) for key in ("reference_id", "entity_id", "sensor_kind", "start", "end", "rows", "annotation_ids", "partition", "exploratory")} for ref in self._list("references")]
+        gat_available = importlib.util.find_spec("torch") is not None
         return {"mode": "active_model" if active else "catalogue", "active_model_id": active,
                 "engine_version": ENGINE_VERSION, "catalog": CATALOG, "references": references,
+                "capabilities": {"robust_nearest_prototype": True,
+                                 "gat_lstm": gat_available,
+                                 "pytorch_available": gat_available},
+                "gat_configurations": self.configurations(),
+                "gat_encoders": self.encoders(),
                 "datasets": sorted([self._dataset_summary(item) for item in self._list("datasets")], key=lambda item: item["created_at"], reverse=True),
                 "models": sorted([dict(self._model_summary(item), active=item["model_id"] == active) for item in self._list("models")], key=lambda item: item["created_at"], reverse=True)}
 
-    def sources(self):
-        return {"annotations": self.review.list_annotations(), "datasets": self.review.list_datasets(),
-                "injections": [{key: value for key, value in item.items() if key not in {"preview", "baseline_snapshot"}} for item in self.injections.list_injections()]}
+    def sources(self, gat_only=False):
+        manifest_path = historical_manifest_path()
+        training = [{key: value for key, value in item.items() if key != "path"}
+                    for item in development_sources(manifest_path, self.review)]
+        if gat_only:
+            hashes = {item["sha256"] for item in training}
+            annotations = development_annotations(self.review, hashes)
+            datasets = self.review.list_datasets(partition="development")
+            injections = []
+        else:
+            annotations = self.review.list_annotations()
+            datasets = self.review.list_datasets()
+            injections = [{key: value for key, value in item.items()
+                           if key not in {"preview", "baseline_snapshot"}}
+                          for item in self.injections.list_injections()]
+        return {"annotations": annotations, "datasets": datasets,
+                "training_sources": training,
+                # Kept as a compatibility alias; it now contains only Development.
+                "canonical_sources": training,
+                "injections": injections}
+
+    def build_gat_dataset(self, source_ids, annotation_ids, gat_config=None,
+                          progress=lambda *_: None):
+        if importlib.util.find_spec("torch") is None:
+            raise ReviewError("GAT-LSTM requiere la dependencia opcional PyTorch; el backend convencional sigue disponible.", 503)
+        config = GATConfig(**(gat_config or {}))
+        manifest_path = historical_manifest_path()
+        allowed = {item["source_id"] for item in development_sources(manifest_path, self.review)}
+        if len(source_ids) != 1 or source_ids[0] not in allowed:
+            raise ReviewError("GAT-LSTM admite una sola fuente de Desarrollo. Validación y Prueba quedan reservadas para eventos futuros.")
+        dataset = build_sequence_dataset(self.review, source_ids, annotation_ids, config,
+                                         self.directory, manifest_path, progress)
+        dataset["audit_id"] = sha256_file(manifest_path)
+        dataset["evaluation_status"] = "insufficient_labels"
+        dataset["label_support"] = dataset["label_counts"]
+        evidence_origins = set()
+        for source in development_sources(manifest_path, self.review):
+            if source["source_id"] not in dataset["labelled_source_ids"]:
+                continue
+            if source.get("imported_labels", 0) > source.get("imported_synthetic", 0):
+                evidence_origins.add("historical_review")
+            if source.get("imported_synthetic", 0):
+                evidence_origins.add("controlled_injection")
+        evidence_origins.update(self.review.annotation(identifier).get("evidence_origin", "unspecified")
+                                for identifier in dataset["annotation_ids"])
+        dataset["evidence_origins"] = sorted(evidence_origins)
+        _write(self._path("datasets", dataset["dataset_id"]), dataset)
+        progress(100, "Dataset listo: secuencias y configuración guardadas")
+        return self._dataset_summary(dataset)
+
+    def configurations(self):
+        return sorted([_read_json(path) for path in (self.directory / "configurations").glob("*.json")],
+                      key=lambda item: item.get("created_at", ""), reverse=True)
+
+    def encoders(self):
+        rows = []
+        for path in (self.directory / "encoders").glob("*.json"):
+            item = _read_json(path)
+            rows.append({key: item.get(key) for key in
+                         ("encoder_id", "created_at", "schema_version", "metrics", "dataset_id",
+                          "support_train_fit", "support_dev_tune", "can_activate")})
+        return sorted(rows, key=lambda item: item.get("created_at", ""), reverse=True)
+
+    def save_gat_configuration(self, payload):
+        name = str(payload.get("name", "GAT-LSTM")).strip()[:100] or "GAT-LSTM"
+        config_data = payload.get("config")
+        if not isinstance(config_data, dict):
+            raise ReviewError("La configuración debe ser un objeto JSON.")
+        config = GATConfig(**config_data)
+        identifier = uuid4().hex
+        saved = {"configuration_id": identifier, "name": name, "config": config.as_dict(),
+                 "created_at": _now(), "method": "gat_lstm"}
+        _write(self._path("configurations", identifier), saved)
+        return saved
 
     def _active(self):
         path = self.directory / "active.json"
@@ -215,7 +345,8 @@ class DiagnosticWorkbench:
         if not self.job_lock.acquire(blocking=False):
             raise ReviewError("Hay una preparación o entrenamiento en curso. Espera a que termine.", 409)
         identifier = uuid4().hex
-        job = {"job_id": identifier, "status": "queued", "progress": 0, "message": "Operación preparada", "created_at": _now()}
+        job = {"job_id": identifier, "status": "queued", "progress": 0, "message": "Operación preparada",
+               "operation": action.__name__, "created_at": _now()}
         self.running_jobs.add(identifier)
         try:
             _write(self._path("jobs", identifier), job)
@@ -224,18 +355,25 @@ class DiagnosticWorkbench:
             self.job_lock.release()
             raise
 
-        def progress(value, message):
-            job.update(status="running", progress=value, message=message)
+        def progress(value, message, **details):
+            now = _now()
+            next_phase = details.get("phase", job.get("phase"))
+            if next_phase and next_phase != job.get("phase"):
+                job["phase_started_at"] = now
+            job.update(status="running", progress=value, message=message,
+                       updated_at=now, **details)
             _write(self._path("jobs", identifier), job)
 
         def run():
             try:
                 result = action(*args, progress=progress)
-                job.update(status="completed", progress=100, message="Operación completada", result=result)
+                message = {"build_gat_dataset": "Dataset listo: secuencias y configuración guardadas",
+                           "train_gat": "Entrenamiento completado: candidato listo"}.get(action.__name__, "Operación completada")
+                job.update(status="completed", progress=100, message=message, result=result)
             except Exception as exc:
                 job.update(status="failed", message="No se pudo completar la operación", error=str(exc))
             finally:
-                job["finished_at"] = _now()
+                job["finished_at"] = job["updated_at"] = _now()
                 try:
                     _write(self._path("jobs", identifier), job)
                 finally:
@@ -417,6 +555,209 @@ class DiagnosticWorkbench:
         progress(100, "Modelo candidato guardado; todavía no está activo")
         return self._model_summary(trained)
 
+    def train_gat(self, dataset_id, encoder_id=None, gat_config=None,
+                  progress=lambda *_: None):
+        if importlib.util.find_spec("torch") is None:
+            raise ReviewError("GAT-LSTM no está disponible: falta PyTorch.", 503)
+        dataset = self._read("datasets", dataset_id)
+        if dataset.get("method") != "gat_lstm":
+            raise ReviewError("El conjunto seleccionado no fue preparado para GAT-LSTM.")
+        config = GATConfig(**(gat_config or dataset["config"]))
+        built_config = dataset["config"]
+        for key in ("grid_seconds", "sequence_steps", "feature_window_seconds", "graph_top_k",
+                    "max_nodes", "use_entropy", "use_dtw"):
+            if getattr(config, key) != built_config[key]:
+                raise ReviewError(f"La configuración {key} cambió; prepara nuevamente el conjunto.")
+        progress(1, "Cargando el dataset para entrenar el candidato", phase="loading")
+        train_samples = load_partition(dataset, "train_fit")
+        dev_samples = load_partition(dataset, "dev_tune")
+        support = {part: dataset.get("label_counts", {}).get(part, {})
+                   for part in ("train_fit", "dev_tune")}
+        missing = {part: [label for label in GAT_LABELS if counts.get(label, 0) == 0]
+                   for part, counts in support.items()}
+        missing = {part: labels for part, labels in missing.items() if labels}
+        episode_support = {part: dataset.get("episode_counts", {}).get(part, {})
+                           for part in ("train_fit", "dev_tune")}
+        missing_episodes = {part: [label for label in GAT_LABELS if counts.get(label, 0) == 0]
+                            for part, counts in episode_support.items()}
+        missing_episodes = {part: labels for part, labels in missing_episodes.items() if labels}
+        if missing or missing_episodes:
+            raise ReviewError(json.dumps({"code": "insufficient_labels", "missing_classes": missing,
+                                          "support": support, "episode_support": episode_support,
+                                          "missing_episode_classes": missing_episodes}, ensure_ascii=False))
+        preprocessor = json.loads((Path(dataset["sequence_dir"]) / "preprocessor.json").read_text(encoding="utf-8"))
+        graph = json.loads((Path(dataset["sequence_dir"]) / "graph.json").read_text(encoding="utf-8"))
+        entity_ids = preprocessor["entity_ids"]
+        category_sizes = [max(preprocessor["entities"][e].get("vocab", {}).values(), default=2) + 1
+                          for e in entity_ids]
+        entity_kinds = [preprocessor["entities"][e]["kind"] for e in entity_ids]
+        encoder = None
+        if encoder_id:
+            encoder_path = self.directory / "encoders" / f"{encoder_id}.json"
+            encoder_weights = self.directory / "encoders" / f"{encoder_id}.pt"
+            if len(encoder_id) != 32 or any(ch not in "0123456789abcdef" for ch in encoder_id):
+                raise ReviewError("ID de encoder inválido.")
+            if not encoder_path.is_file() or not encoder_weights.is_file():
+                raise ReviewError("No se encontró el encoder indicado.")
+            encoder_meta = _read_json(encoder_path)
+            if encoder_meta.get("can_activate") is not False or hashlib.sha256(encoder_weights.read_bytes()).hexdigest() != encoder_meta.get("weights_sha256"):
+                raise ReviewError("El encoder no es compatible o su hash no coincide.")
+            if (encoder_meta.get("schema_version") != config.schema_version
+                    or encoder_meta.get("preprocessor", {}).get("entity_ids") != entity_ids
+                    or encoder_meta.get("preprocessor", {}).get("entity_kinds") != preprocessor.get("entity_kinds")
+                    or encoder_meta.get("graph", {}).get("graph_version") != graph.get("graph_version")):
+                raise ReviewError("El encoder fue preentrenado con entidades o tipos distintos.")
+            import torch
+            encoder = torch.load(encoder_weights, map_location="cpu", weights_only=True)
+        from .GAT_LSTM.training import train_classifier, save_candidate
+        progress(5, "Iniciando entrenamiento GAT-LSTM solo con Desarrollo",
+                 phase="training", epoch=0, max_epochs=config.max_epochs)
+        def training_progress(row):
+            percent = 5 + 80 * row["epoch"] / config.max_epochs
+            message = (f"Época {row['epoch']}: pérdida train {row['train_loss']:.4f}, "
+                       f"dev_tune {row['dev_loss']:.4f}")
+            progress(min(85, percent), message, phase="training",
+                     epoch=row["epoch"], max_epochs=config.max_epochs)
+        def training_batch_progress(row):
+            stage = "Ajustando pesos" if row["stage"] == "train" else "Evaluando en Desarrollo"
+            percent = 5 + 80 * row["completed_batches"] / row["total_batches"]
+            message = f"{stage} · época {row['epoch']} de {row['max_epochs']} · lote {row['batch']} de {row['batches']}"
+            progress(percent, message, phase="training", **row)
+        model, metrics = train_classifier(train_samples, dev_samples, config,
+                                          category_sizes, entity_kinds, training_progress, encoder,
+                                          batch_progress=training_batch_progress)
+        progress(90, "Guardando pesos, grafo, preprocesador y política de rechazo", phase="saving")
+        candidate = save_candidate(model, preprocessor, graph, config, self.directory, metrics)
+        all_train_meta = [sample["metadata"] for sample in
+                          chain(sample_summaries(train_samples), sample_summaries(dev_samples))]
+        candidate.update({"dataset_id": dataset_id, "encoder_id": encoder_id,
+            "entity_ids": entity_ids, "entity_kinds": entity_kinds, "classes": list(GAT_LABELS),
+            "graph_version": graph["graph_version"],
+            "training_count": sum(sum(sample["label_mask"]) for sample in sample_summaries(train_samples)),
+            "training_contexts": [{key: m.get(key) for key in
+                ("parent_episode_id", "context_start", "context_end", "context_entities")}
+                for m in all_train_meta],
+            "training_sample_ids": [m["sample_id"] for m in all_train_meta],
+            "training_groups": sorted({m.get("parent_episode_id", "") for m in all_train_meta}),
+            "training_end": max((m["context_end"] for m in all_train_meta), default=None),
+            "source_hashes": dataset["source_hashes"], "validated": False,
+            "evaluation_status": "candidate", "label_support": support,
+            "evidence_origins": dataset.get("evidence_origins", []), "evaluations": [],
+            "exploratory": dataset.get("exploratory", False)})
+        _write(self._path("models", candidate["model_id"]), candidate)
+        progress(100, "Entrenamiento completado: candidato listo", phase="completed")
+        return self._model_summary(candidate)
+
+    def pretrain_gat(self, dataset_id, gat_config=None, progress=lambda *_: None):
+        if importlib.util.find_spec("torch") is None:
+            raise ReviewError("GAT-LSTM no está disponible: falta PyTorch.", 503)
+        dataset = self._read("datasets", dataset_id)
+        if dataset.get("method") != "gat_lstm":
+            raise ReviewError("El conjunto seleccionado no fue preparado para GAT-LSTM.")
+        config = GATConfig(**(gat_config or dataset["config"]))
+        if not config.pretrain_enabled:
+            raise ReviewError("Activa preentrenamiento en la configuración y vuelve a preparar el conjunto.")
+        for key in ("grid_seconds", "sequence_steps", "feature_window_seconds", "graph_top_k",
+                    "max_nodes", "use_entropy", "use_dtw"):
+            if getattr(config, key) != dataset["config"][key]:
+                raise ReviewError(f"La configuración {key} cambió; prepara nuevamente el conjunto.")
+        from .GAT_LSTM.pretraining import pretrain_encoder, save_encoder
+        train_samples = load_pretraining_partition(dataset, "train_fit")
+        dev_samples = load_pretraining_partition(dataset, "dev_tune")
+        if not train_samples or not dev_samples:
+            raise ReviewError(json.dumps({"code": "insufficient_predictive_targets",
+                "train_fit": dataset.get("pretrain_support_by_entity", {}).get("train_fit", {}),
+                "dev_tune": dataset.get("pretrain_support_by_entity", {}).get("dev_tune", {})}, ensure_ascii=False))
+        preprocessor = json.loads((Path(dataset["sequence_dir"]) / "preprocessor.json").read_text(encoding="utf-8"))
+        graph = json.loads((Path(dataset["sequence_dir"]) / "graph.json").read_text(encoding="utf-8"))
+        categories = [max(preprocessor["entities"][e].get("vocab", {}).values(), default=2) + 1
+                      for e in preprocessor["entity_ids"]]
+        kinds = [preprocessor["entities"][e]["kind"] for e in preprocessor["entity_ids"]]
+        progress(5, "Preentrenando solo con observaciones futuras originales")
+        def pretraining_progress(row):
+            percent = 5 + 80 * row["epoch"] / config.max_epochs
+            message = (f"Época {row['epoch']}: pérdida predictiva train {row['train_loss']:.4f}, "
+                       f"dev_tune {row['dev_loss']:.4f}")
+            progress(min(85, percent), message)
+        weights, metrics = pretrain_encoder(train_samples, dev_samples, config, categories, kinds,
+                                            pretraining_progress)
+        manifest = save_encoder(weights, preprocessor, graph, config, self.directory, metrics)
+        manifest.update({"dataset_id": dataset_id, "source_hashes": dataset["source_hashes"],
+                         "support_train_fit": dataset.get("pretrain_support_by_entity", {}).get("train_fit", {}),
+                         "support_dev_tune": dataset.get("pretrain_support_by_entity", {}).get("dev_tune", {})})
+        _write(self.directory / "encoders" / f"{manifest['encoder_id']}.json", manifest)
+        progress(100, "Encoder predictivo guardado; requiere ajuste diagnóstico antes de activarse")
+        return {key: value for key, value in manifest.items() if key not in {"preprocessor", "graph"}}
+
+    def evaluate_gat(self, model_id, dataset_id, partition="validation",
+                     progress=lambda *_: None):
+        raise ReviewError("GAT-LSTM se prepara y ajusta solo con Desarrollo. Validación y Prueba quedan reservadas para generar eventos futuros.")
+        trained, dataset = self._read("models", model_id), self._read("datasets", dataset_id)
+        if trained.get("method") != "gat_lstm" or dataset.get("method") != "gat_lstm":
+            raise ReviewError("El candidato o conjunto no corresponden a GAT-LSTM.")
+        if trained.get("schema_version") != dataset.get("schema_version"):
+            raise ReviewError("El esquema del conjunto no coincide con el del candidato.")
+        if trained.get("entity_ids") != dataset.get("entity_ids"):
+            raise ReviewError("Las entidades del conjunto no coinciden con el candidato.")
+        if trained.get("graph_version") != dataset.get("graph_version"):
+            raise ReviewError("El grafo congelado del conjunto no coincide con el candidato.")
+        samples = load_partition(dataset, partition)
+        if not samples:
+            raise ReviewError(json.dumps({"code": "insufficient_evaluation_labels", "partition": partition,
+                                          "support": dataset.get("label_counts", {}).get(partition, {})},
+                                         ensure_ascii=False))
+        trained_ids = set(trained.get("training_sample_ids", []))
+        trained_groups = set(trained.get("training_groups", []))
+        records, predictions = [], []
+        snapshot_dir = self.directory
+        from .GAT_LSTM.training import load_candidate
+        import torch
+        model, _, graph, manifest = load_candidate(model_id, snapshot_dir)
+        threshold = manifest.get("rejection_policy", {}).get("threshold", .4)
+        margin = manifest.get("rejection_policy", {}).get("margin", 0.0)
+        progress(10, f"Evaluando objetivos de {partition}")
+        with torch.no_grad():
+            for index, sample in enumerate(samples):
+                meta = sample["metadata"]
+                if meta.get("sample_id") in trained_ids or meta.get("parent_episode_id") in trained_groups:
+                    raise ReviewError("La evaluación comparte objetivo o episodio con el ajuste.")
+                if trained.get("training_end") and meta.get("context_start", "") <= trained["training_end"]:
+                    raise ReviewError("El contexto de evaluación no es posterior al último dato de ajuste.")
+                x = torch.tensor([sample["X"]], dtype=torch.float32)
+                states = torch.tensor([sample["state_ids"]], dtype=torch.long)
+                present = torch.tensor([sample["node_present"]], dtype=torch.bool)
+                adjacency = torch.tensor(graph["adjacency"], dtype=torch.bool)
+                scores = torch.softmax(model(x, states, adjacency, present), dim=-1)[0].tolist()
+                for node, active in enumerate(sample["label_mask"]):
+                    if not active: continue
+                    record = {"true_label": sample["y"][node], "scores": scores[node],
+                              "episode_id": meta.get("parent_episode_id"), "sample_id": meta["sample_id"],
+                              "evidence_origin": meta.get("evidence_origin", "unspecified")}
+                    records.append(record)
+                    predictions.append({**record, "entity_id": meta["entity_ids"][node],
+                                        "timestamp": meta["target_time"]})
+                if index % 25 == 0:
+                    progress(10 + 75 * index / len(samples), "Calculando predicciones con política congelada")
+        result = gat_metrics(records, threshold, margin)
+        result.update({"evaluation_id": uuid4().hex, "dataset_id": dataset_id,
+            "model_id": model_id, "partition": partition, "created_at": _now(),
+            "scope": "classifier_windows_only_not_end_to_end", "threshold": threshold,
+            "margin": margin, "label_support": result["per_class"],
+            "evidence_origins": result["evidence_origins"], "predictions": predictions})
+        experiment_dir = self.directory / "experiments" / model_id
+        experiment_dir.mkdir(parents=True, exist_ok=True)
+        _write(experiment_dir / f"{result['evaluation_id']}.json", result)
+        trained.setdefault("evaluations", []).append(result)
+        if partition == "validation":
+            trained["validation"] = result
+            trained["validated"] = bool(result["complete"] and trained.get("rejection_policy", {}).get("validated"))
+            trained["evaluation_status"] = "validated" if trained["validated"] else "incomplete"
+        else:
+            trained["evaluation_status"] = "test_complete" if result["complete"] else "incomplete"
+        _write(self._path("models", model_id), trained)
+        progress(100, "Evaluación guardada")
+        return self._model_summary(trained)
+
     @staticmethod
     def _leaks(example, training):
         if example["group_id"] == training["group_id"]:
@@ -532,11 +873,21 @@ class DiagnosticWorkbench:
             and (example.get("cutoff_source_row") is None or parse_time(row["timestamp"])[0] != upper or row["source_row"] <= example["cutoff_source_row"])]
 
     def activate(self, model_id, allow_exploratory=False):
+        if (model_id and len(model_id) == 32 and
+                (self.directory / "encoders" / f"{model_id}.json").is_file()):
+            raise ReviewError("Un encoder predictivo requiere una cabeza diagnóstica ajustada antes de activarse.", 409)
         trained = self._read("models", model_id)
-        if not trained["validated"] and not allow_exploratory:
+        if trained.get("kind") == "encoder_only" or trained.get("can_activate") is False:
+            raise ReviewError("Un encoder predictivo requiere una cabeza diagnóstica ajustada antes de activarse.", 409)
+        if trained.get("method") == "gat_lstm":
+            if importlib.util.find_spec("torch") is None:
+                raise ReviewError("GAT-LSTM no está disponible: falta PyTorch.", 503)
+            from .GAT_LSTM.training import load_candidate
+            load_candidate(model_id, self.directory)  # hash, esquema y dimensiones antes de publicar
+        if not trained.get("validated", False) and not allow_exploratory:
             raise ReviewError("Esta versión no tiene validación completa. Evalúala primero o activa explícitamente el modo experimental.", 409)
         with self.lock:
-            _write(self.directory / "active.json", {"model_id": model_id, "activated_at": _now(), "experimental": not trained["validated"]})
+            _write(self.directory / "active.json", {"model_id": model_id, "activated_at": _now(), "experimental": not trained.get("validated", False)})
         return dict(self._model_summary(trained), active=True)
 
     def deactivate(self, model_id):
@@ -577,23 +928,121 @@ class DiagnosticWorkbench:
                 return json.loads(existing[0])
             active = self._active()
             trained = self._read("models", active) if active else None
-            references = [self._read("references", identifier) for identifier in trained["reference_ids"]] if trained else [ref for ref in self._list("references") if ref["partition"] == "development"]
+            references = ([self._read("references", identifier) for identifier in trained.get("reference_ids", [])]
+                          if trained and trained.get("method") != "gat_lstm"
+                          else [] if trained else [ref for ref in self._list("references") if ref["partition"] == "development"])
             snapshot = {"run_id": key, "model": trained, "references": references, "created_at": _now()}
             connection.execute("INSERT INTO runs VALUES (?,?)", (key, _canonical(snapshot)))
             return snapshot
 
     def window_seconds_for_run(self, source, run_id):
         snapshot = self._run_snapshot(source, run_id)
+        if snapshot.get("model", {}).get("method") == "gat_lstm":
+            config = snapshot["model"]["config"]
+            return (config["sequence_steps"] - 1) * config["grid_seconds"] + config["feature_window_seconds"]
         return snapshot["model"]["window_seconds"] if snapshot["model"] else 3600
 
     def create_run_session(self, source, run_id):
         return DiagnosticRunSession(self, source, run_id)
+
+    def _enrich_gat_contextual(self, statistical_results, contextual_results, events,
+                               source, run_id, session, snapshot):
+        trained = snapshot["model"]
+        from .GAT_LSTM.runtime import load_snapshot, predict_at
+        gat_snapshot = (session.gat_snapshot if session is not None and session.gat_snapshot else None)
+        if gat_snapshot is None and importlib.util.find_spec("torch") is not None:
+            gat_snapshot = load_snapshot(str(self.directory), trained["model_id"])
+        if gat_snapshot is None:
+            enriched = []
+            for context in contextual_results:
+                item = deepcopy(context)
+                if not item.get("routing", {}).get("terminal"):
+                    item["diagnosis"] = {"entity_id": str(item.get("entity_id", "")),
+                        "timestamp": str(item.get("timestamp", "")), "status": "indeterminate",
+                        "predicted_label": None, "fault_type": None, "method": "gat_lstm",
+                        "compatibility": None, "confidence": 0.0,
+                        "confidence_kind": "uncalibrated_softmax", "class_scores": {},
+                        "needs_review": True, "reasons": ["pytorch_dependency_missing"],
+                        "model_version": trained["model_id"]}
+                    item["diagnosis_mode"] = "active_model"
+                enriched.append(item)
+            return enriched
+        preprocessor = gat_snapshot[1]
+        entities = preprocessor["entity_ids"]
+        event_index = {}
+        if session is not None:
+            session.add_events(events)
+            provider = session.events_between
+        else:
+            rows_by_entity = {}
+            if isinstance(events, pd.DataFrame) and not events.empty:
+                time_column = "timestamp_dt" if "timestamp_dt" in events else "timestamp" if "timestamp" in events else "last_changed"
+                selected = events[events["entity_id"].astype(str).isin(entities)].copy()
+                selected["_diag_time"] = pd.to_datetime(selected[time_column], utc=True, errors="coerce")
+                for entity, group in selected.dropna(subset=["_diag_time"]).groupby("entity_id", sort=False):
+                    values = []
+                    for ordinal, row in enumerate(group.sort_values(["_diag_time"], kind="stable").to_dict("records")):
+                        values.append((row["_diag_time"], {"entity_id": str(entity),
+                            "timestamp": row["_diag_time"].isoformat(), "state": str(row.get("state", "")),
+                            "source_row": int(row.get("_raw_index", ordinal)) if isinstance(row.get("_raw_index", ordinal), int) else ordinal}))
+                    rows_by_entity[str(entity)] = values
+            def provider(start, end, requested):
+                found = []
+                for entity in requested:
+                    values = rows_by_entity.get(entity, [])
+                    left = bisect_left(values, start, key=lambda pair: pair[0])
+                    right = bisect_right(values, end, key=lambda pair: pair[0])
+                    found.extend(row for _, row in values[left:right])
+                return found
+        enriched, decisions = [], []
+        for context in contextual_results:
+            item = deepcopy(context)
+            if item.get("routing", {}).get("terminal"):
+                item.pop("diagnosis", None); item.pop("diagnosis_mode", None)
+                enriched.append(item)
+                continue
+            entity_id, timestamp = str(item.get("entity_id", "")), str(item.get("timestamp", ""))
+            try:
+                result = predict_at(gat_snapshot, provider, entity_id, timestamp)
+                target_us, _ = parse_time(timestamp)
+                if source != "history" and trained.get("training_end"):
+                    if target_us <= parse_time(trained["training_end"])[0]:
+                        result.update(status="indeterminate", predicted_label=None, confidence=0.0,
+                                      class_scores={}, needs_review=True,
+                                      reasons=["target_not_after_training_period"])
+            except (ValueError, KeyError, RuntimeError) as exc:
+                result = {"entity_id": entity_id, "timestamp": timestamp, "status": "indeterminate",
+                          "predicted_label": None, "fault_type": None, "method": "gat_lstm",
+                          "compatibility": None, "confidence": 0.0,
+                          "confidence_kind": "uncalibrated_softmax", "class_scores": {},
+                          "needs_review": True, "reasons": [str(exc)],
+                          "model_version": trained["model_id"]}
+            result.update(source=source, run_id=run_id, mode="active_model",
+                          causal=source != "history",
+                          evaluation_scope="retrospective" if source == "history" else "causal_replay")
+            result["diagnosis_id"] = hashlib.sha256(_canonical(
+                [snapshot["run_id"], entity_id, timestamp, item.get("event_id"), trained["model_id"]]
+                ).encode()).hexdigest()[:32]
+            item["diagnosis"] = result
+            item["diagnosis_mode"] = "active_model"
+            enriched.append(item); decisions.append(result)
+        if session is not None:
+            session.queue(decisions)
+        elif decisions:
+            with self._connect() as connection:
+                connection.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)",
+                    [(r["diagnosis_id"], snapshot["run_id"], source, r["entity_id"], r["timestamp"], _canonical(r))
+                     for r in decisions])
+        return enriched
 
     def enrich_contextual(self, statistical_results, contextual_results, events=None, source="history", run_id="default", session=None):
         if session is not None and (session.source != source or session.run_id != run_id):
             raise ValueError("La sesión diagnóstica no corresponde a esta ejecución.")
         snapshot = session.snapshot if session is not None else self._run_snapshot(source, run_id)
         trained = snapshot["model"]
+        if trained and trained.get("method") == "gat_lstm":
+            return self._enrich_gat_contextual(statistical_results, contextual_results, events,
+                                               source, run_id, session, snapshot)
         model = trained["model"] if trained else None
         window_seconds = trained["window_seconds"] if trained else 3600
         indexed = {}
@@ -691,11 +1140,28 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
         return translate(workbench.status)
 
     @router.get("/sources")
-    def sources():
-        return translate(workbench.sources)
+    def sources(method: Literal["robust_nearest_prototype", "gat_lstm"] | None = Query(None)):
+        return translate(workbench.sources, method == "gat_lstm")
+
+    @router.get("/configurations")
+    def configurations():
+        return translate(workbench.configurations)
+
+    @router.post("/configurations")
+    def save_configuration(payload: dict):
+        if set(payload) != {"name", "config"}:
+            raise HTTPException(400, "Indica name y config para guardar una configuración GAT-LSTM.")
+        return translate(workbench.save_gat_configuration, payload)
 
     @router.post("/build")
     def build(payload: BuildInput):
+        if payload.method == "gat_lstm":
+            if payload.injection_ids or payload.include_drafts:
+                raise HTTPException(400, "La preparación GAT-LSTM admite una fuente de Desarrollo y etiquetas importadas o anotaciones revisadas; no incluye borradores ni IDs de inyección.")
+            return translate(workbench.start_job, workbench.build_gat_dataset,
+                             payload.source_ids, payload.annotation_ids, payload.gat_config)
+        if payload.source_ids or payload.gat_config:
+            raise HTTPException(400, "source_ids y gat_config requieren method=gat_lstm.")
         return translate(workbench.start_job, workbench.build_dataset, payload.model_dump())
 
     @router.get("/jobs/{job_id}")
@@ -713,14 +1179,33 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
 
     @router.post("/train")
     def train(payload: dict):
+        allowed = {"dataset_id", "method", "encoder_id", "gat_config"}
+        if set(payload) - allowed or "dataset_id" not in payload:
+            raise HTTPException(400, "Indica dataset_id y, para GAT-LSTM, method, encoder_id y gat_config opcionales.")
+        dataset = translate(workbench._read, "datasets", payload["dataset_id"])
+        method = payload.get("method", dataset.get("method", "robust_nearest_prototype"))
+        if method == "gat_lstm":
+            return translate(workbench.start_job, workbench.train_gat, payload["dataset_id"],
+                             payload.get("encoder_id"), payload.get("gat_config"))
         if set(payload) != {"dataset_id"}:
-            raise HTTPException(400, "Indica únicamente dataset_id para entrenar.")
+            raise HTTPException(400, "El motor convencional acepta únicamente dataset_id.")
         return translate(workbench.start_job, workbench.train, payload["dataset_id"])
+
+    @router.post("/pretrain")
+    def pretrain(payload: dict):
+        if set(payload) - {"dataset_id", "gat_config"} or "dataset_id" not in payload:
+            raise HTTPException(400, "Indica dataset_id y gat_config opcional para preentrenar.")
+        return translate(workbench.start_job, workbench.pretrain_gat,
+                         payload["dataset_id"], payload.get("gat_config"))
 
     @router.post("/models/{model_id}/evaluate")
     def evaluate(model_id: str, payload: dict):
         if set(payload) != {"dataset_id", "partition"}:
             raise HTTPException(400, "Indica dataset_id y partition para evaluar.")
+        trained = translate(workbench._read, "models", model_id)
+        if trained.get("method") == "gat_lstm":
+            return translate(workbench.start_job, workbench.evaluate_gat, model_id,
+                             payload["dataset_id"], payload["partition"])
         return translate(workbench.start_job, workbench.evaluate, model_id, payload["dataset_id"], payload["partition"])
 
     @router.post("/models/{model_id}/activate")
