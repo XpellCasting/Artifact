@@ -1,8 +1,11 @@
 """Replay an arbitrary graph against future observations, with separate ground truth."""
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from copy import deepcopy
 import hashlib
 import json
+import os
+from pathlib import Path
+import tempfile
 from threading import Lock, Thread
 from time import perf_counter
 from uuid import uuid4
@@ -11,6 +14,47 @@ import pandas as pd
 
 from .Flujos import FlowRunner, _time, observation_valid, validate_flow
 from .Reproduccion_Validacion import MotorReproduccionValidacion
+
+
+class FlowResultSpool:
+    """Per-job JSONL spool so completed node outputs do not accumulate in RAM."""
+    def __init__(self, job_id):
+        fd, name = tempfile.mkstemp(prefix=f"flow-evaluation-{job_id}-", suffix=".jsonl")
+        self.path = Path(name)
+        self.file = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        self.sequences = Counter()
+        self.unflushed_inputs = 0
+        self.closed = False
+
+    def write_block(self, results):
+        for node_id, items in results.items():
+            for item in items:
+                record = {"node_id": node_id, "sequence": self.sequences[node_id],
+                          "observation_id": str(item["observation_id"]), "payload": item}
+                self.file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str))
+                self.file.write("\n")
+                self.sequences[node_id] += 1
+        self.unflushed_inputs += len(results.get("input", []))
+        if self.unflushed_inputs >= 500:
+            self.file.flush()
+            self.unflushed_inputs = 0
+
+    def finish(self):
+        if not self.closed:
+            self.file.flush()
+            self.file.close()
+            self.closed = True
+
+    def records(self):
+        self.finish()
+        with self.path.open("r", encoding="utf-8") as source:
+            for line in source:
+                if line.strip():
+                    yield json.loads(line)
+
+    def cleanup(self):
+        self.finish()
+        self.path.unlink(missing_ok=True)
 
 
 def labelled_report(results, truth):
@@ -72,8 +116,22 @@ def statistical_labelled_report(results, truth, node_id):
     return {"labelled": bool(truth), "scope": "received_by_node", "groups": list(groups.values()), "matched_rows": sum(g["total"] for g in groups.values())}
 
 
+def _merge_report_groups(target, report):
+    descriptors = {"entity_id", "expected", "synthetic", "fault_type"}
+    for item in report.get("groups", []):
+        key = (item["entity_id"], item["expected"], item["synthetic"], item.get("fault_type"))
+        current = target.get(key)
+        if current is None:
+            target[key] = dict(item)
+            continue
+        for field, value in item.items():
+            if field not in descriptors:
+                current[field] = current.get(field, 0) + value
+
+
 class CausalFlowRunner(FlowRunner):
-    def evaluate(self, flow, development, future, entities, context_map, baseline, truth=(), progress=None):
+    def evaluate(self, flow, development, future, entities, context_map, baseline, truth=(), progress=None,
+                 result_sink=None):
         total_started = perf_counter()
         compiled = self.compile(flow)
         if future is None or future.empty:
@@ -85,7 +143,7 @@ class CausalFlowRunner(FlowRunner):
         self.diagnostic_sessions = {}
         if progress:
             progress(0, len(future), "preparation", "Preparando modelos y estados causales")
-        performance = {"version": "flow-performance-v1", "phases_ms": {}, "counts": {"future_rows": len(future)}, "included_in": {}}
+        performance = {"version": "flow-performance-v2", "phases_ms": {}, "counts": {"future_rows": len(future)}, "included_in": {}}
         phase_started = perf_counter()
         diagnostic_snapshots = {}
         if hasattr(self.diagnostic, "_run_snapshot"):
@@ -123,70 +181,216 @@ class CausalFlowRunner(FlowRunner):
         ordered = future[columns].sort_values(["timestamp_dt", "entity_id", "_raw_index"], kind="stable").copy()
         identity_columns = [c for c in ("entity_id", "timestamp_dt", "state", "_raw_index") if c in ordered]
         source_id = hashlib.sha256(pd.util.hash_pandas_object(ordered[identity_columns], index=False).values.tobytes()).hexdigest()
-        available = development[[c for c in development.columns if c in columns]].copy()
-        available["_raw_index"] = -1 - pd.RangeIndex(len(available))
-        if hasattr(self.diagnostic, "create_run_session"):
-            for node in flow["nodes"]:
-                if node["type"] == "classifier" and node.get("config", {}).get("enabled") is not False:
-                    session = self.diagnostic.create_run_session("flow_evaluation", f"{self.execution_id}:{node['id']}")
-                    session.add_events(available)
-                    self.diagnostic_sessions[node["id"]] = session
+        contextual_nodes = [node for node in flow["nodes"]
+                            if node["type"] == "contextual" and node.get("config", {}).get("enabled") is not False]
+        active_classifier_ids = {node["id"] for node in flow["nodes"]
+                                 if node["type"] == "classifier" and node.get("config", {}).get("enabled") is not False}
         config = getattr(self.contextual, "config", None)
-        context_window = getattr(config, "window_seconds", 300) * (getattr(config, "max_lag_windows", 0) + 2)
-        diagnostic_window = max([3600, *[(s.get("model") or {}).get("window_seconds", 3600) for s in diagnostic_snapshots.values()]])
+        context_window = ((getattr(config, "window_seconds", 300) *
+                           (getattr(config, "max_lag_windows", 0) + 2))
+                          if contextual_nodes else 0)
+        diagnostic_windows = []
+        for snapshot in diagnostic_snapshots.values():
+            model = snapshot.get("model") or {}
+            model_config = model.get("config") or {}
+            lookback = model_config.get("lookback_seconds")
+            if lookback is None:
+                lookback = max(0, model_config.get("sequence_steps", 1) - 1) * model_config.get("grid_seconds", 0)
+            diagnostic_windows.append(model.get("window_seconds") or
+                                      lookback + model_config.get("feature_window_seconds", 0))
+        diagnostic_window = max([3600 if active_classifier_ids else 0, *diagnostic_windows])
         horizon = max(context_window, diagnostic_window)
+
         def retain(frame, at):
+            if not horizon:
+                return frame
             cutoff = at - pd.Timedelta(seconds=horizon)
             older = frame[frame["timestamp_dt"] < cutoff].sort_values("timestamp_dt", kind="stable").groupby("entity_id", sort=False).tail(1)
             return pd.concat([older, frame[frame["timestamp_dt"] >= cutoff]], ignore_index=True)
-        available = retain(available, ordered["timestamp_dt"].min())
-        outputs = defaultdict(list)
+
+        history_initialization_started = perf_counter()
+        needs_history = bool(contextual_nodes or active_classifier_ids)
+        if needs_history:
+            available = development[[c for c in development.columns if c in columns]].copy()
+            available["_raw_index"] = -1 - pd.RangeIndex(len(available))
+            available = retain(available, ordered["timestamp_dt"].min())
+        else:
+            available = None
+        if hasattr(self.diagnostic, "create_run_session"):
+            for node in flow["nodes"]:
+                if (available is not None and node["type"] == "classifier"
+                        and node.get("config", {}).get("enabled") is not False):
+                    session = self.diagnostic.create_run_session("flow_evaluation", f"{self.execution_id}:{node['id']}")
+                    session.add_events(available)
+                    self.diagnostic_sessions[node["id"]] = session
+        if contextual_nodes:
+            prepared_context = self.contextual.preparar_eventos_causales(entities, available)
+            self.context_sessions = {node["id"]: prepared_context for node in contextual_nodes}
+        else:
+            prepared_context = None
+            self.context_sessions = {}
+        history_initialization_ms = (perf_counter() - history_initialization_started) * 1000
+        needs_legacy_history_frame = bool(
+            active_classifier_ids - set(self.diagnostic_sessions)
+            or (contextual_nodes and prepared_context is None)
+        )
+        if not needs_legacy_history_frame:
+            available = None
+        outputs = defaultdict(list) if result_sink is None else None
+        streamed_node_counts = Counter()
+        streamed_decisions = Counter()
+        streamed_report_groups = {}
+        streamed_statistical_groups = {node_id: {} for node_id in self.baselines}
         timings = Counter()
         processed = 0
+        groups_completed = 0
+        classifier_inputs = Counter()
+        checkpoints = []
+        next_checkpoint = 5000
+        history_maintenance_ms = 0.0
+        contextual_index_update_ms = 0.0
+        statistical_preparation_ms = 0.0
+        graph_execution_ms = 0.0
         started = perf_counter()
         if progress:
             progress(0, len(ordered), "evaluation", "Reproduciendo grupos temporales")
         # Equal timestamps are simultaneous; no node can see a later timestamp.
         try:
             for _, batch in ordered.groupby("timestamp_dt", sort=True):
-                available = retain(pd.concat([available, batch], ignore_index=True), batch["timestamp_dt"].max())
+                batch_started = perf_counter()
+                if progress:
+                    progress(processed, len(ordered), "evaluation", "Procesando grupo temporal",
+                             current_timestamp=_time(batch["timestamp_dt"].iloc[0]),
+                             current_batch_rows=len(batch), groups_completed=groups_completed,
+                             group_started_at=pd.Timestamp.now(tz="UTC").isoformat())
+                if available is not None:
+                    available = retain(pd.concat([available, batch], ignore_index=True), batch["timestamp_dt"].max())
                 for session in self.diagnostic_sessions.values():
-                    session.add_events(batch)
+                    session.add_events(batch, events_sorted=True)
+                if prepared_context is not None:
+                    context_started = perf_counter()
+                    prepared_context.advance(
+                        batch,
+                        batch["timestamp_dt"].max() - pd.Timedelta(seconds=horizon),
+                    )
+                    contextual_index_update_ms += (perf_counter() - context_started) * 1000
+                history_maintenance_ms += (perf_counter() - batch_started) * 1000
+                statistical_started = perf_counter()
                 for node in flow["nodes"]:
                     if node["id"] in self.baselines:
                         method = "residual_focus_v1" if node["type"] == "statistical_focus" else node.get("config", {}).get("continuous_method", "temporal_quantile_v1")
                         self.statistical_results[node["id"]] = motor.analizar_lote(batch, self.baselines[node["id"]], node.get("config", {}).get("suspicion_threshold", .6), continuous_method=method)
-                summary, batch_outputs, _ = self.run(flow, available, entities, context_map, candidate_events=batch, source_id=source_id, compiled=compiled, events_sorted=True, include_snapshot=False)
-                for node_id, items in batch_outputs.items():
-                    outputs[node_id].extend(items)
+                statistical_preparation_ms += (perf_counter() - statistical_started) * 1000
+                graph_started = perf_counter()
+                run_events = available if available is not None else batch
+                summary, batch_outputs, _ = self.run(flow, run_events, entities, context_map, candidate_events=batch, source_id=source_id, compiled=compiled, events_sorted=True, include_snapshot=False)
+                graph_execution_ms += (perf_counter() - graph_started) * 1000
+                if result_sink is None:
+                    for node_id, items in batch_outputs.items():
+                        outputs[node_id].extend(items)
+                else:
+                    block_report = labelled_report(batch_outputs.get("output", []), truth)
+                    _merge_report_groups(streamed_report_groups, block_report)
+                    for node_id in streamed_statistical_groups:
+                        block_stats = statistical_labelled_report(batch_outputs.get(node_id, []), truth, node_id)
+                        _merge_report_groups(streamed_statistical_groups[node_id], block_stats)
+                    result_sink(batch_outputs)
+                    streamed_node_counts.update({key: len(value) for key, value in batch_outputs.items()})
+                    streamed_decisions.update(item.get("final_decision") for item in batch_outputs.get("output", []))
                 timings.update(summary["node_timings_ms"])
+                for node in flow["nodes"]:
+                    if node["type"] == "classifier":
+                        classifier_inputs[node["id"]] += summary["node_counts"].get(node["id"], 0)
                 processed += len(batch)
+                groups_completed += 1
+                completed_at = perf_counter()
+                while processed >= next_checkpoint:
+                    checkpoints.append({
+                        "processed": processed,
+                        "elapsed_ms": round((completed_at - started) * 1000, 3),
+                        "groups_completed": groups_completed,
+                        "classifier_inputs": dict(classifier_inputs),
+                        "history_rows": (len(available) if available is not None else
+                                         sum(len(frame) for frame in prepared_context.observations.values())
+                                         if prepared_context is not None else
+                                         max((session.stats.get("buffered_event_rows", 0)
+                                              for session in self.diagnostic_sessions.values()), default=0)),
+                        "diagnostic_buffers": {
+                            node_id: session.stats.get("buffered_event_rows", 0)
+                            for node_id, session in self.diagnostic_sessions.items()
+                        },
+                    })
+                    next_checkpoint += 5000
                 if progress:
-                    progress(processed, len(ordered), "evaluation", "Reproduciendo grupos temporales")
+                    progress(processed, len(ordered), "evaluation", "Reproduciendo grupos temporales",
+                             current_timestamp=_time(batch["timestamp_dt"].iloc[0]),
+                             current_batch_rows=len(batch), groups_completed=groups_completed,
+                             last_batch_ms=round((completed_at - batch_started) * 1000, 3),
+                             group_started_at=None)
         finally:
             for session in self.diagnostic_sessions.values():
                 session.flush()
-        report = labelled_report(outputs["output"], truth)
-        statistical_evaluation = {node_id: statistical_labelled_report(outputs.get(node_id, []), truth, node_id) for node_id in self.baselines}
+        report_started = perf_counter()
+        if result_sink is None:
+            report = labelled_report(outputs["output"], truth)
+            statistical_evaluation = {node_id: statistical_labelled_report(outputs.get(node_id, []), truth, node_id) for node_id in self.baselines}
+            result_count = len(outputs["output"])
+            node_counts = {key: len(value) for key, value in outputs.items()}
+            final_decisions = dict(Counter(item["final_decision"] for item in outputs["output"]))
+        else:
+            report = {"labelled": bool(truth), "groups": list(streamed_report_groups.values()),
+                      "matched_rows": sum(group["total"] for group in streamed_report_groups.values())}
+            statistical_evaluation = {
+                node_id: {"labelled": bool(truth), "scope": "received_by_node",
+                          "groups": list(groups.values()),
+                          "matched_rows": sum(group["total"] for group in groups.values())}
+                for node_id, groups in streamed_statistical_groups.items()
+            }
+            result_count = streamed_node_counts.get("output", 0)
+            node_counts = dict(streamed_node_counts)
+            final_decisions = dict(streamed_decisions)
+        report_finalization_ms = (perf_counter() - report_started) * 1000
         performance["phases_ms"]["causal_evaluation"] = round((perf_counter() - started) * 1000, 3)
         node_types = {node["id"]: node["type"] for node in flow["nodes"]}
         performance["phases_ms"].update({
             "statistical_execution": round(sum(value for node_id, value in timings.items() if node_types.get(node_id) in {"statistical", "statistical_focus"}), 3),
             "contextual_execution": round(sum(value for node_id, value in timings.items() if node_types.get(node_id) == "contextual"), 3),
             "classifier_execution": round(sum(value for node_id, value in timings.items() if node_types.get(node_id) == "classifier"), 3),
+            "history_maintenance": round(history_maintenance_ms, 3),
+            "contextual_index_update": round(contextual_index_update_ms, 3),
+            "history_initialization": round(history_initialization_ms, 3),
+            "report_finalization": round(report_finalization_ms, 3),
+            "statistical_preparation": round(statistical_preparation_ms, 3),
+            "graph_execution": round(graph_execution_ms, 3),
+            "classifier_sample_construction": round(sum(session.stats.get("gat_sample_ms", 0.0) for session in self.diagnostic_sessions.values()), 3),
+            "classifier_model_inference": round(sum(session.stats.get("gat_inference_ms", 0.0) for session in self.diagnostic_sessions.values()), 3),
+            "classifier_sample_cache_hits": sum(session.stats.get("gat_sample_cache_hits", 0) for session in self.diagnostic_sessions.values()),
+            "classifier_inference_cache_hits": sum(session.stats.get("gat_inference_cache_hits", 0) for session in self.diagnostic_sessions.values()),
             "diagnostic_writes": round(sum(session.stats["write_ms"] for session in self.diagnostic_sessions.values()), 3),
         })
         performance["phases_ms"]["total"] = round((perf_counter() - total_started) * 1000, 3)
-        performance["counts"].update(groups=int(ordered["timestamp_dt"].nunique()), statistical_nodes=len(statistical_nodes))
-        performance["included_in"] = {"baseline_preparation": "total", "causal_evaluation": "total", "node_timings_ms": "causal_evaluation"}
-        summary = {"candidate_count": len(ordered), "output_count": len(outputs["output"]), "node_counts": {key: len(value) for key, value in outputs.items()}, "node_timings_ms": dict(timings), "elapsed_ms": round((perf_counter() - started) * 1000, 2), "by_final_decision": dict(Counter(item["final_decision"] for item in outputs["output"])), "evaluation": report, "statistical_evaluation": statistical_evaluation, "statistical_evaluation_version": "pre_suppression_v1", "performance": performance}
+        performance["counts"].update(groups=groups_completed, statistical_nodes=len(statistical_nodes),
+                                      classifier_inputs=dict(classifier_inputs), checkpoints=checkpoints)
+        performance["included_in"] = {
+            "baseline_preparation": "total", "causal_evaluation": "total",
+            "history_initialization": "total",
+            "report_finalization": "causal_evaluation",
+            "node_timings_ms": "graph_execution", "history_maintenance": "causal_evaluation",
+            "contextual_index_update": "causal_evaluation",
+            "statistical_preparation": "causal_evaluation", "graph_execution": "causal_evaluation",
+            "classifier_sample_construction": "classifier_execution and causal_evaluation",
+            "classifier_model_inference": "classifier_execution and causal_evaluation",
+            "diagnostic_writes": "classifier_execution and causal_evaluation",
+            "classifier_execution": "graph_execution; includes diagnostic inference and writes",
+        }
+        summary = {"candidate_count": len(ordered), "output_count": result_count, "node_counts": node_counts, "node_timings_ms": dict(timings), "elapsed_ms": round((perf_counter() - started) * 1000, 2), "by_final_decision": final_decisions, "evaluation": report, "statistical_evaluation": statistical_evaluation, "statistical_evaluation_version": "pre_suppression_v1", "performance": performance}
         provenance = deepcopy(baseline.get("provenance"))
         continuous_models = {node_id: deepcopy(value.get("continuous_model_manifest")) for node_id, value in self.baselines.items()}
         identity_payload = {"base": (provenance or {}).get("baseline_id"), "continuous_methods": {node_id: value.get("continuous_method") for node_id, value in self.baselines.items()}, "continuous_models": continuous_models}
         run_baseline_id = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
         performance["counts"]["diagnostic_sessions"] = {node_id: session.stats for node_id, session in self.diagnostic_sessions.items()}
         snapshot = {"flow": deepcopy(flow), "execution_mode": "causal_future", "statistical_evaluation_version": "pre_suppression_v1", "source": {"rows": len(ordered), "fingerprint": source_id, "sample_start": _time(ordered["timestamp_dt"].min()), "sample_end": _time(ordered["timestamp_dt"].max())}, "development_end": _time(development["timestamp_dt"].max()), "context_map_version": context_map.get("map_version"), "baseline_version": baseline.get("version"), "baseline_id": run_baseline_id, "baseline_provenance": {**(provenance or {}), "continuous_models": continuous_models}, "diagnostic_snapshots": diagnostic_snapshots}
-        return summary, dict(outputs), snapshot
+        return summary, dict(outputs) if outputs is not None else None, snapshot
 
     def _statistical(self, node_id, incoming, events, entities, config):
         statistical = self.statistical_results[node_id]
@@ -247,19 +451,49 @@ class FlowEvaluationJobs:
                 raise ValueError("Ya hay una evaluación de flujos en curso. Espera a que termine.")
             job_id = uuid4().hex
             self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "status": "running", "processed": 0, "total": 0, "phase": "preparation"}
-        def progress(processed, total, phase="evaluation", detail=None):
+        recent_completions = deque()
+        last_completed = {"processed": 0, "at": None, "wall": None}
+        job_started = perf_counter()
+        def progress(processed, total, phase="evaluation", detail=None, **metadata):
+            now = perf_counter()
+            wall_now = pd.Timestamp.now(tz="UTC").isoformat()
+            if processed > last_completed["processed"]:
+                recent_completions.append((now, int(processed)))
+                last_completed.update(processed=int(processed), at=now, wall=wall_now)
+            cutoff = now - 30.0
+            while len(recent_completions) > 1 and recent_completions[1][0] <= cutoff:
+                recent_completions.popleft()
+            rate = None
+            if len(recent_completions) > 1:
+                elapsed = recent_completions[-1][0] - recent_completions[0][0]
+                if elapsed > 0:
+                    rate = round((recent_completions[-1][1] - recent_completions[0][1]) / elapsed, 2)
+            if last_completed["at"] is None or now - last_completed["at"] > 30.0:
+                rate = None
             with self.lock:
-                self.jobs[job_id].update(processed=processed, total=total, phase=phase, detail=detail)
+                self.jobs[job_id].update(processed=processed, total=total, phase=phase, detail=detail,
+                                         updated_at=wall_now,
+                                         elapsed_seconds=round(now - job_started, 1),
+                                         rate_window_seconds=30,
+                                         recent_events_per_second=rate,
+                                         last_completed_at=last_completed["wall"],
+                                         **metadata)
+        spool = FlowResultSpool(job_id)
         def work():
             try:
-                summary, results, snapshot = evaluate(progress)
-                progress(len(results.get("output", [])), len(results.get("output", [])), "saving", "Guardando resultados por nodo")
-                run_id = self.store.save_run(flow_id, snapshot, summary, results)
+                summary, _, snapshot = evaluate(progress, spool.write_block)
+                progress(summary.get("candidate_count", 0), summary.get("candidate_count", 0),
+                         "saving", "Guardando resultados por nodo")
+                spool.finish()
+                run_id, persistence_ms = self.store.save_run_stream(flow_id, snapshot, summary, spool.records())
                 with self.lock:
-                    self.jobs[job_id].update(status="completed", run={"run_id": run_id, "summary": summary, "snapshot": snapshot})
+                    self.jobs[job_id].update(status="completed", persistence_ms=persistence_ms,
+                                             run={"run_id": run_id, "summary": summary, "snapshot": snapshot})
             except Exception as exc:
                 with self.lock:
                     self.jobs[job_id].update(status="failed", error=str(exc))
+            finally:
+                spool.cleanup()
         Thread(target=work, daemon=True).start()
         return {"job_id": job_id, "status": "running"}
 

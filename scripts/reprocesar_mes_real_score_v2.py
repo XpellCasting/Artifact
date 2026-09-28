@@ -1,7 +1,7 @@
 """Reprocesa el mes real y resume el puntaje continuo v2.
 
 No carga ni crea el historial canonico/simulado. La ejecucion usa
-``data/datosreales/history.csv`` y actualiza la cache normal de la aplicacion.
+``HistoricosEnUso/cargados/history.csv`` y actualiza la cache normal de la aplicacion.
 """
 
 from __future__ import annotations

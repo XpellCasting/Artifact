@@ -1,5 +1,6 @@
 export const DEFAULT_GAT_CONFIG = Object.freeze({
   method: "gat_lstm", schema_version: "gat-lstm-entities-v1", task: "diagnostic_3class",
+  architecture_version: "gat_lstm_v1_entity",
   grid_seconds: 60, sequence_steps: 60, feature_window_seconds: 900,
   labelled_stride_seconds: 300, graph_top_k: 4, max_nodes: 32, entropy_bins: 16,
   dtw_reference_count: 3, dtw_band_fraction: .1, gat_heads: 4, gat_head_dim: 8,
@@ -31,9 +32,11 @@ export function gatSupportStatus(dataset) {
 export function gatDataConfigCompatible(config, dataset) {
   if (!dataset?.config) return false;
   const fields = ["grid_seconds", "sequence_steps", "feature_window_seconds", "graph_top_k",
-    "max_nodes", "use_entropy", "use_dtw"];
+    "max_nodes", "use_entropy", "use_dtw", "architecture_version"];
   if (config.pretrain_enabled) fields.push("pretrain_enabled", "pretrain_stride_seconds", "pretrain_max_samples");
-  return fields.every((key) => config[key] === dataset.config[key]);
+  return fields.every((key) => key === "architecture_version"
+    ? config[key] === (dataset.config[key] || "gat_lstm_v1_entity")
+    : config[key] === dataset.config[key]);
 }
 
 export function gatContextSeconds(config) {

@@ -15,26 +15,31 @@ export default function CandidateTrainingProgress({ job, onRetry, onShowCandidat
   const failed = job.status === "failed";
   const paused = job.tracking_paused;
   const saving = job.phase === "saving";
-  const percent = ready ? 100 : Math.max(0, Math.min(99, Number(job.progress) || 0));
-  const stagePercent = Math.max(0, Math.min(100, 100 * Number(job.batch || 0) / Number(job.batches || 1)));
+  const preparingCache = job.phase === "cache_preparation";
+  const percent = ready ? 100 : preparingCache && Number.isFinite(Number(job.cache_progress))
+    ? Math.max(0, Math.min(99, Number(job.cache_progress)))
+    : Math.max(0, Math.min(99, Number(job.progress) || 0));
   const remaining = estimateTrainingRemainingSeconds(job, now);
   const title = ready ? "Entrenamiento completado: candidato listo"
     : failed ? "El entrenamiento no se completó" : paused ? "Seguimiento interrumpido"
+    : preparingCache ? "Preparando almacenamiento para entrenar"
     : saving ? "Guardando candidato…" : "Entrenando candidato…";
-  return <section className={`diagnostic-dataset-progress ${ready ? "ready" : ""} ${failed ? "failed" : ""}`} aria-live="polite" aria-busy={active && !paused}>
-    <div className="diagnostic-dataset-progress-heading">
+  return <section className={`history-load-progress ${ready ? "ready" : ""} ${failed ? "failed" : ""}`} aria-live="polite" aria-busy={active && !paused}>
+    <div className="history-load-heading">
       <strong>{ready ? <Check size={18} /> : active && !paused ? <Loader2 size={18} className="diagnostic-spin" /> : null}{title}</strong>
       <span>{percent.toLocaleString("es-CL", { maximumFractionDigits: 1 })} %</span>
     </div>
-    <progress max="100" value={percent} aria-label="Avance total del entrenamiento del candidato" />
+    <div className="progress-track" role="progressbar" aria-label="Avance total del entrenamiento del candidato" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(percent)}><span style={{ width: `${percent}%` }} /></div>
     <p>{ready ? "El modelo quedó guardado y está disponible en Modelos y evaluación. Su activación es un paso posterior."
       : failed ? job.error || job.message
       : paused ? "No se pudo consultar el progreso. Reintenta el seguimiento sin iniciar otro entrenamiento."
       : job.message || "Iniciando el entrenamiento…"}</p>
-    {active && !paused && job.phase === "training" && Number(job.batches) > 0 && <>
-      <small>{job.stage === "dev" ? "Evaluación en Desarrollo" : "Ajuste de pesos"} · lote {Number(job.batch || 0).toLocaleString("es-CL")} de {Number(job.batches).toLocaleString("es-CL")}</small>
-      <progress max="100" value={stagePercent} aria-label="Avance de lotes de la etapa actual" />
-    </>}
+    <div className="history-load-meta">
+      {job.phase === "training" && Number(job.batches) > 0 && <span>{job.stage === "dev" ? "Evaluación en Desarrollo" : "Ajuste de pesos"} · lote {Number(job.batch || 0).toLocaleString("es-CL")} de {Number(job.batches).toLocaleString("es-CL")}</span>}
+      {job.source && <span>Lectura: {job.source === "cache" ? "caché Docker" : "dataset original"}</span>}
+      {Number.isFinite(Number(job.batches_per_second)) && Number(job.batches_per_second) > 0 && <span>{Number(job.batches_per_second).toFixed(2)} lotes/s</span>}
+      {Number.isFinite(Number(job.data_wait_seconds)) && <span>Espera acumulada de lectura: {formatRemainingTime(Number(job.data_wait_seconds))}</span>}
+    </div>
     {active && !paused && job.phase === "training" && <small>
       {Number(job.epoch) > 0 ? `Época ${job.epoch} de un máximo de ${job.max_epochs}. ` : ""}
       {remaining == null ? "Estimando el tiempo restante…" : `Tiempo estimado hasta el máximo de épocas: ${formatRemainingTime(remaining)}.`}

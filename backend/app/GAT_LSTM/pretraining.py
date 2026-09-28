@@ -8,6 +8,7 @@ import hashlib
 import json
 from itertools import chain
 import os
+import time
 from uuid import uuid4
 
 import numpy as np
@@ -17,7 +18,7 @@ from torch.nn import functional as F
 
 from .network import EntityGATLSTM
 from .config import parse_utc, required_context_seconds
-from .storage import sample_summaries
+from .storage import iter_partition_batches, sample_summaries
 
 
 class PredictiveEncoder(nn.Module):
@@ -55,6 +56,8 @@ def pretrain_encoder(train_samples, dev_samples, config, category_sizes, entity_
     """Cada muestra incluye next_target[N], next_observed[N] y next_time dentro del corte."""
     if not train_samples or not dev_samples:
         raise ValueError("Sin objetivos predictivos en train_fit o dev_tune")
+    if config.device != "cpu":
+        raise ValueError("La optimización GAT-LSTM disponible en esta versión requiere CPU")
     for sample in chain(sample_summaries(train_samples), sample_summaries(dev_samples)):
         metadata = sample["metadata"]
         target_time = parse_utc(metadata["target_time"])
@@ -65,22 +68,36 @@ def pretrain_encoder(train_samples, dev_samples, config, category_sizes, entity_
                 or next_time >= partition_end
                 or target_time.timestamp() - required_context_seconds(config) < partition_start.timestamp()):
             raise ValueError("Objetivo predictivo fuera del futuro permitido")
-    from .training import _tensor_batch
+    from .training import _batch_groups, _tensor_batch
     torch.manual_seed(config.seed)
     device = torch.device(config.device)
     feature_dim = len(train_samples[0]["X"][0][0])
     model = PredictiveEncoder(feature_dim, category_sizes, entity_kinds, config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     history, best, best_loss, stale = [], None, float("inf"), 0
+    runtime = {"epoch_durations_seconds": [], "batches_per_second": [], "data_wait_seconds": 0.0}
+    train_batch_count = (len(train_samples) + config.batch_size - 1) // config.batch_size
+    dev_batch_count = (len(dev_samples) + config.batch_size - 1) // config.batch_size
     for epoch in range(config.max_epochs):
+        epoch_started = time.monotonic()
+        epoch_waiting = 0.0
         model.train()
         total, count = 0.0, 0
         order = torch.randperm(len(train_samples)).tolist()
-        for start in range(0, len(order), config.batch_size):
-            batch = [train_samples[i] for i in order[start:start + config.batch_size]]
+        train_groups = _batch_groups(order, config.batch_size)
+        train_batches = (iter_partition_batches(train_samples, train_groups,
+            batch_bytes=train_samples.batch_nbytes() * config.batch_size)
+            if hasattr(train_samples, "read_batch")
+            else (([train_samples[i] for i in group], 0.0) for group in train_groups))
+        for batch_index, (batch, waited) in enumerate(train_batches):
+            epoch_waiting += waited
+            runtime["data_wait_seconds"] += waited
             x, ids, presence, _, _, adjacency = _tensor_batch(batch, device)
-            targets = torch.as_tensor(np.stack([s["next_target"] for s in batch]), device=device)
-            masks = torch.as_tensor(np.stack([s["next_observed"] for s in batch]), dtype=torch.bool, device=device)
+            targets = torch.as_tensor(batch["next_target"] if isinstance(batch, dict)
+                                      else np.stack([s["next_target"] for s in batch]), device=device)
+            masks = torch.as_tensor(batch["next_observed"] if isinstance(batch, dict)
+                                    else np.stack([s["next_observed"] for s in batch]),
+                                    dtype=torch.bool, device=device)
             if not masks.any():
                 continue
             optimizer.zero_grad()
@@ -96,19 +113,32 @@ def pretrain_encoder(train_samples, dev_samples, config, category_sizes, entity_
         model.eval()
         with torch.no_grad():
             dev_total, dev_count = 0.0, 0
-            for start in range(0, len(dev_samples), config.batch_size):
-                batch = dev_samples[start:start + config.batch_size]
+            dev_groups = _batch_groups(range(len(dev_samples)), config.batch_size)
+            dev_batches = (iter_partition_batches(dev_samples, dev_groups,
+                batch_bytes=dev_samples.batch_nbytes() * config.batch_size)
+                if hasattr(dev_samples, "read_batch")
+                else (([dev_samples[i] for i in group], 0.0) for group in dev_groups))
+            for batch_index, (batch, waited) in enumerate(dev_batches):
+                epoch_waiting += waited
+                runtime["data_wait_seconds"] += waited
                 x, ids, presence, _, _, adjacency = _tensor_batch(batch, device)
-                targets = torch.as_tensor(np.stack([s["next_target"] for s in batch]), device=device)
-                masks = torch.as_tensor(np.stack([s["next_observed"] for s in batch]), dtype=torch.bool, device=device)
+                targets = torch.as_tensor(batch["next_target"] if isinstance(batch, dict)
+                                          else np.stack([s["next_target"] for s in batch]), device=device)
+                masks = torch.as_tensor(batch["next_observed"] if isinstance(batch, dict)
+                                        else np.stack([s["next_observed"] for s in batch]),
+                                        dtype=torch.bool, device=device)
                 if masks.any():
                     value, category = model(x, ids, adjacency, presence)
                     dev_total += predictive_loss(value, category, targets, masks, entity_kinds).item()
                     dev_count += 1
         if not dev_count:
             raise ValueError("Sin observaciones predictivas en dev_tune")
-        row = {"epoch": epoch + 1, "train_loss": total / count, "dev_loss": dev_total / dev_count}
+        duration = time.monotonic() - epoch_started
+        row = {"epoch": epoch + 1, "train_loss": total / count, "dev_loss": dev_total / dev_count,
+               "duration_seconds": duration, "data_wait_seconds": epoch_waiting}
         history.append(row)
+        runtime["epoch_durations_seconds"].append(duration)
+        runtime["batches_per_second"].append((train_batch_count + dev_batch_count) / max(duration, 1e-9))
         if progress:
             progress(row)
         if row["dev_loss"] < best_loss:
@@ -118,7 +148,11 @@ def pretrain_encoder(train_samples, dev_samples, config, category_sizes, entity_
             if stale >= config.patience:
                 break
     return best, {"history": history, "best_dev_loss": best_loss,
-                  "kind": "encoder_only", "can_activate": False}
+                  "kind": "encoder_only", "can_activate": False, "runtime": runtime,
+                  "runtime_parameters": {"device": "cpu", "batch_size": config.batch_size,
+                      "omp_num_threads": os.environ.get("OMP_NUM_THREADS", "unset"),
+                      "mkl_num_threads": os.environ.get("MKL_NUM_THREADS", "unset"),
+                      "torch_num_threads": torch.get_num_threads()}}
 
 
 def save_encoder(weights, preprocessor, graph, config, directory: Path, metrics):

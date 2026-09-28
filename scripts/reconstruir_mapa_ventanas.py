@@ -12,7 +12,7 @@ from app.Filtro_Contextual import FiltroContextualEspacioTemporal
 def main():
     path = ROOT / 'Artifact/data/cache/contextual_map.json'
     previous = json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
-    history = CargadorHistorial().cargar_real(ROOT / 'HistoricoPuro/historico_desarrollo.csv')
+    history = CargadorHistorial().cargar_real(ROOT / 'Artifact/HistoricosEnUso/historico_desarrollo.csv')
     filtro = FiltroContextualEspacioTemporal()
     mapa = filtro.construir_mapa(history.eventos, history.entidades,
                                  trigger='window_selection_upgrade', mapa_anterior=previous)

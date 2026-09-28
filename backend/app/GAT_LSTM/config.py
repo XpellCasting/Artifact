@@ -17,6 +17,7 @@ class Config:
     method: str = "gat_lstm"
     schema_version: str = SCHEMA_VERSION
     task: str = "diagnostic_3class"
+    architecture_version: str = "gat_lstm_v1_entity"
     grid_seconds: int = 60
     sequence_steps: int = 60
     lookback_seconds: int | None = None
@@ -46,6 +47,10 @@ class Config:
     def __post_init__(self):
         if self.method != "gat_lstm" or self.schema_version != SCHEMA_VERSION or self.task != "diagnostic_3class":
             raise ValueError("Método, tarea o versión de esquema incompatibles")
+        if self.architecture_version not in {"gat_lstm_v1_entity", "gat_lstm_v2_shared_type"}:
+            raise ValueError("Versión de arquitectura GAT-LSTM incompatible")
+        if self.architecture_version == "gat_lstm_v2_shared_type" and self.pretrain_enabled:
+            raise ValueError("El preentrenamiento predictivo aún no está disponible en GAT-LSTM v2")
         expected_lookback = (self.sequence_steps - 1) * self.grid_seconds
         if self.lookback_seconds is None:
             object.__setattr__(self, "lookback_seconds", expected_lookback)
@@ -119,17 +124,17 @@ def historical_manifest_path() -> Path:
     if configured:
         return Path(configured) / "particiones_seleccionadas_resumen.json"
     for parent in Path(__file__).resolve().parents:
-        candidate = parent / "HistoricoPuro" / "particiones_seleccionadas_resumen.json"
+        candidate = parent / "HistoricosEnUso" / "particiones_seleccionadas_resumen.json"
         if candidate.is_file():
             return candidate
-    return Path(__file__).resolve().parents[3] / "HistoricoPuro" / "particiones_seleccionadas_resumen.json"
+    return Path(__file__).resolve().parents[3] / "HistoricosEnUso" / "particiones_seleccionadas_resumen.json"
 
 
 def resolve_manifest_source(manifest_path: Path, source_path: str) -> Path:
     path = Path(source_path)
     if path.is_file():
         return path
-    # The checked-in manifest stores Windows paths; Docker mounts the same files
+    # Legacy manifests store Windows paths; Docker mounts the same files
     # under the manifest directory, so resolve by the exact recorded basename.
     candidate = Path(manifest_path).parent / PureWindowsPath(str(source_path)).name
     return candidate if candidate.is_file() else path

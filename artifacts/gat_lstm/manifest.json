@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "model_id": "669501ff239c48eaaeafce499bdb8d43",
+  "dataset_id": "3c145354dcda4cefb68f1811a21ef488",
+  "archive": "snapshot.tar.gz",
+  "sha256": "70737e165e99a547fa31d7cf266ef2f5944d7c2245ea401cb84f5cb1d77af13a",
+  "compressed_bytes": 375561186,
+  "files": [
+    {
+      "path": "active.json",
+      "size": 117,
+      "sha256": "ef73531fce10e3b753d9cbe30461647a8aa17c2eb49dec237582443c0fc4ca0e"
+    },
+    {
+      "path": "datasets/3c145354dcda4cefb68f1811a21ef488.json",
+      "size": 11280,
+      "sha256": "f0c36c541208631c6e53421400dda5b5e03845ce4946e4cd3152253b1fe81dcd"
+    },
+    {
+      "path": "models/669501ff239c48eaaeafce499bdb8d43.json",
+      "size": 52815776,
+      "sha256": "481296b44eabad7e46cce7e272c21313a7ceb3faaf75a3af27cc01c0c236afb6"
+    },
+    {
+      "path": "weights/669501ff239c48eaaeafce499bdb8d43.pt",
+      "size": 48553,
+      "sha256": "d36b3760f00a8b99140ff3c6fa88c61d040c01532d839f4c81d83193df55e0c7"
+    },
+    {
+      "path": "graphs/669501ff239c48eaaeafce499bdb8d43.json",
+      "size": 2231,
+      "sha256": "c82ae8f1fc4e5cffebf4dbf747b9583c8fa5a2d4595bce1c7ddb3d6202affd72"
+    },
+    {
+      "path": "preprocessors/669501ff239c48eaaeafce499bdb8d43.json",
+      "size": 8634,
+      "sha256": "21e46697725d5887b687d8341d703d6d148e87bd5d451efdee240425c4ede816"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/config.json",
+      "size": 683,
+      "sha256": "13ba9b0729c3714ef50b87721a1b5a050c2aea46133a8e9270588b252e067f6a"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/dev_tune_label_mask.npy",
+      "size": 211748,
+      "sha256": "304a9e1db0e682bb3d65ae1ec8f5a5412f671bc97c6b3b9d603812a8ddaf6eac"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/dev_tune_metadata.jsonl",
+      "size": 28855161,
+      "sha256": "1e816155236301e7e544d624bac8fb59506b9411282b9b781cc718eef689164a"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/dev_tune_node_present.npy",
+      "size": 12697328,
+      "sha256": "632768b5acef7d62f3bff349b369405d8ceebea8f592d7ce208266d1b2bbeb0d"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/dev_tune_state_ids.npy",
+      "size": 101577728,
+      "sha256": "ebafd34ba29be4da7f73c573a1f41406ddc2f3d60937cae844205ec4654a96f5"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/dev_tune_X.npy",
+      "size": 1117353728,
+      "sha256": "804a1446dd3a020211aca08fa656630897362f1303b25bb3f98379d2804dbf9e"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/dev_tune_y.npy",
+      "size": 1693088,
+      "sha256": "933c541422bbb5d0e8de74890e26353411298ce75eee462579589a7074dad2fd"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/graph.json",
+      "size": 2231,
+      "sha256": "c82ae8f1fc4e5cffebf4dbf747b9583c8fa5a2d4595bce1c7ddb3d6202affd72"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/preprocessor.json",
+      "size": 8634,
+      "sha256": "21e46697725d5887b687d8341d703d6d148e87bd5d451efdee240425c4ede816"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/train_fit_label_mask.npy",
+      "size": 819224,
+      "sha256": "fb99a5a41ba357b5542de0e9569bea0f0e8e2e6b306aae04f8727d484ceb9f89"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/train_fit_metadata.jsonl",
+      "size": 111754611,
+      "sha256": "03cd774d6be029f3815a019675172fcb12fedfe1312d2bc09ed133d89ad15f73"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/train_fit_node_present.npy",
+      "size": 49145888,
+      "sha256": "9bac4845b077041b25030d2d428448fb0e97ae8214e323ef33e03b26f5b13863"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/train_fit_state_ids.npy",
+      "size": 393166208,
+      "sha256": "480f87ac3367c7a478ef88e8a7efb63a156deaef99c00077bafb6101e5f0071d"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/train_fit_X.npy",
+      "size": 4324827008,
+      "sha256": "0ee26f793974c08f5a7d640a314853fcc000807a5c6d43c1399a35823b6477dc"
+    },
+    {
+      "path": "sequences/3c145354dcda4cefb68f1811a21ef488/train_fit_y.npy",
+      "size": 6552896,
+      "sha256": "de4e270ee29571fec5b389aa4d89707ee4b9fe56923116602192adef78312d51"
+    }
+  ]
+}

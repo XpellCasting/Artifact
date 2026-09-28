@@ -39,9 +39,9 @@ from .Diagnostico_Patrones import CATALOG, ENGINE_VERSION, build_reference, extr
 from .GAT_LSTM.config import Config as GATConfig, historical_manifest_path
 from .GAT_LSTM import LABELS as GAT_LABELS
 from .GAT_LSTM.pipeline import (build_sequence_dataset, canonical_sources, development_annotations, development_sources,
-                                load_partition, load_pretraining_partition)
+                                load_partition)
 from .GAT_LSTM.audit import sha256_file
-from .GAT_LSTM.storage import sample_summaries
+from .GAT_LSTM.storage import open_training_partitions, sample_summaries
 from .GAT_LSTM.evaluation import metrics as gat_metrics
 
 MAX_ROWS = 250_000
@@ -112,37 +112,57 @@ class DiagnosticRunSession:
             end, _ = parse_time(reference["end"])
             self.references.setdefault(str(reference["entity_id"]), []).append((end, reference))
         for values in self.references.values(): values.sort(key=lambda item: item[0])
-        self.events, self.seen, self.pending = {}, set(), []
-        self.last_flush = time.monotonic(); self.stats = {"snapshot_loads": 1, "event_rows": 0, "decision_writes": 0, "flushes": 0, "write_ms": 0.0}
+        self.events, self.event_heads, self.seen, self.pending = {}, {}, set(), []
+        self.sensor_profiles = ({item["entity_id"]: item for item in workbench._list("sensors")
+                                 if item.get("status") == "available"}
+                                if self.snapshot.get("model", {}).get("method") == "gat_lstm" else {})
+        self.last_flush = time.monotonic(); self.stats = {
+            "snapshot_loads": 1, "event_rows": 0, "buffered_event_rows": 0,
+            "decision_writes": 0, "flushes": 0, "write_ms": 0.0,
+            "gat_candidates": 0, "gat_samples": 0, "gat_sample_rejections": 0,
+            "gat_sample_ms": 0.0, "gat_inferences": 0, "gat_inference_ms": 0.0,
+        }
 
-    def add_events(self, frame):
+    def add_events(self, frame, *, events_sorted=False):
         if not isinstance(frame, pd.DataFrame) or frame.empty: return
         time_column = "timestamp_dt" if "timestamp_dt" in frame else "timestamp" if "timestamp" in frame else "last_changed"
         order = [time_column, "entity_id"] + (["_raw_index"] if "_raw_index" in frame else [])
-        for ordinal, row in enumerate(frame.sort_values(order, kind="stable").to_dict("records")):
+        ordered = frame if events_sorted else frame.sort_values(order, kind="stable")
+        for ordinal, row in enumerate(ordered.to_dict("records")):
             at = pd.to_datetime(row.get(time_column), utc=True, errors="coerce")
             if pd.isna(at): continue
             entity = str(row.get("entity_id", ""))
             raw_index = row.get("_raw_index")
-            source_row = int(raw_index) if isinstance(raw_index, (int, float)) and not pd.isna(raw_index) else ordinal
+            try:
+                source_row = int(raw_index) if not pd.isna(raw_index) else ordinal
+            except (TypeError, ValueError, OverflowError):
+                source_row = ordinal
             key = (entity, at.value, source_row)
             if key in self.seen: continue
             self.seen.add(key)
-            self.events.setdefault(entity, []).append((at, {"timestamp": at.isoformat(), "state": str(row.get("state", "")), "source_row": source_row}))
+            self.events.setdefault(entity, []).append((at, {
+                "entity_id": entity, "timestamp": at.isoformat(),
+                "state": str(row.get("state", "")), "source_row": source_row,
+                "provenance": {"source": self.source, "run_id": self.run_id}}))
             self.stats["event_rows"] += 1
-        if self.snapshot.get("model", {}).get("method") == "gat_lstm":
-            latest = max((items[-1][0] for items in self.events.values() if items), default=None)
-            if latest is not None:
-                cutoff = latest - pd.Timedelta(seconds=self.window_seconds)
-                for entity, items in list(self.events.items()):
-                    kept = [item for item in items if item[0] >= cutoff]
-                    if kept:
-                        self.events[entity] = kept
-                    else:
-                        self.events.pop(entity, None)
-                active_keys = {(entity, at.value, row.get("source_row"))
-                               for entity, rows in self.events.items() for at, row in rows}
-                self.seen.intersection_update(active_keys)
+            self.stats["buffered_event_rows"] += 1
+        latest = max((items[-1][0] for items in self.events.values() if items), default=None)
+        if latest is not None:
+            cutoff = latest - pd.Timedelta(seconds=self.window_seconds)
+            for entity, items in list(self.events.items()):
+                head = self.event_heads.get(entity, 0)
+                boundary = bisect_left(items, cutoff, lo=head, key=lambda item: item[0])
+                for at, row in items[head:boundary]:
+                    self.seen.discard((entity, at.value, row.get("source_row")))
+                self.stats["buffered_event_rows"] -= boundary - head
+                if boundary >= len(items):
+                    self.events.pop(entity, None)
+                    self.event_heads.pop(entity, None)
+                    continue
+                if boundary >= 1024 and boundary * 2 >= len(items):
+                    del items[:boundary]
+                    boundary = 0
+                self.event_heads[entity] = boundary
 
     def reference_for(self, entity_id, at):
         values = self.references.get(str(entity_id), [])
@@ -151,16 +171,18 @@ class DiagnosticRunSession:
 
     def rows_for(self, entity_id, at, window_seconds):
         values = self.events.get(str(entity_id), [])
+        head = self.event_heads.get(str(entity_id), 0)
         start = at - pd.Timedelta(seconds=window_seconds)
-        left = bisect_left(values, start, key=lambda item: item[0]); right = bisect_right(values, at, key=lambda item: item[0])
+        left = bisect_left(values, start, lo=head, key=lambda item: item[0]); right = bisect_right(values, at, lo=head, key=lambda item: item[0])
         return [row for _, row in values[left:right]]
 
     def events_between(self, start, end, entity_ids):
         result = []
         for entity in entity_ids:
             values = self.events.get(str(entity), [])
-            left = bisect_left(values, start, key=lambda item: item[0])
-            right = bisect_right(values, end, key=lambda item: item[0])
+            head = self.event_heads.get(str(entity), 0)
+            left = bisect_left(values, start, lo=head, key=lambda item: item[0])
+            right = bisect_right(values, end, lo=head, key=lambda item: item[0])
             result.extend(row for _, row in values[left:right])
         return result
 
@@ -195,7 +217,7 @@ class DiagnosticWorkbench:
         self.injections = InjectionStore(self.review)
         self.directory = Path(directory) / "diagnostics"
         for folder in ("references", "datasets", "models", "jobs", "weights", "preprocessors",
-                       "graphs", "sequences", "experiments", "encoders", "configurations"):
+                       "graphs", "sequences", "experiments", "encoders", "configurations", "sensors"):
             (self.directory / folder).mkdir(parents=True, exist_ok=True)
         self.database = self.directory / "diagnostics.sqlite3"
         self.lock = RLock()
@@ -252,6 +274,9 @@ class DiagnosticWorkbench:
                                  "gat_lstm": gat_available,
                                  "pytorch_available": gat_available},
                 "gat_configurations": self.configurations(),
+                "sensor_profiles": [{key: item.get(key) for key in
+                    ("profile_id", "entity_id", "kind", "unit", "status", "reference_end", "reference_rows", "reference_annotation_id")}
+                    for item in self._list("sensors")],
                 "gat_encoders": self.encoders(),
                 "datasets": sorted([self._dataset_summary(item) for item in self._list("datasets")], key=lambda item: item["created_at"], reverse=True),
                 "models": sorted([dict(self._model_summary(item), active=item["model_id"] == active) for item in self._list("models")], key=lambda item: item["created_at"], reverse=True)}
@@ -330,6 +355,56 @@ class DiagnosticWorkbench:
                  "created_at": _now(), "method": "gat_lstm"}
         _write(self._path("configurations", identifier), saved)
         return saved
+
+    def register_gat_sensor(self, payload):
+        """Onboards a new shared-model sensor from a manually reviewed normal interval."""
+        from collections import Counter
+        from statistics import median
+        from .Estados_Validos import valid_state
+        from .GAT_LSTM.features import _finite_number, _quantiles
+        if set(payload) != {"entity_id", "reference_annotation_id"}:
+            raise ReviewError("Indica entity_id y reference_annotation_id de una referencia normal revisada.")
+        entity_id = str(payload["entity_id"]).strip()
+        annotation = self.review.annotation(str(payload["reference_annotation_id"]))
+        if annotation.get("entity_id") != entity_id or annotation.get("label") != "normal" or annotation.get("review_status") != "reviewed":
+            raise ReviewError("La entidad necesita una referencia Normal revisada que coincida exactamente.")
+        dataset = self.review.dataset(annotation["dataset_id"])
+        if dataset.get("partition") != "development":
+            raise ReviewError("La referencia de incorporación debe venir de Desarrollo.")
+        kind_row = next((item for item in dataset.get("entities", []) if item["entity_id"] == entity_id), None)
+        if not kind_row or kind_row.get("kind") not in {"continuous", "binary", "multistate"}:
+            raise ReviewError("No se pudo determinar un tipo compatible para la entidad.")
+        start_us, _ = parse_time(annotation["start"]); end_us, _ = parse_time(annotation["end"])
+        with self.review.connect() as connection:
+            rows = [dict(row) for row in connection.execute(
+                "SELECT source_row, timestamp, state FROM events WHERE dataset_id=? AND entity_id=? AND ts BETWEEN ? AND ? AND is_valid=1 ORDER BY ts, source_row",
+                (dataset["dataset_id"], entity_id, start_us, end_us))]
+        if len(rows) < 3:
+            raise ReviewError("La referencia normal debe contener al menos tres lecturas válidas.")
+        states = [str(row["state"]) for row in rows if valid_state(str(row["state"]))]
+        kind = kind_row["kind"]
+        profile_entity = {"kind": kind, "max_age_seconds": 900, "normal_references": []}
+        if kind == "continuous":
+            values = [float(value) for value in states if _finite_number(value)]
+            if len(values) < 3:
+                raise ReviewError("La referencia normal no contiene suficientes valores numéricos.")
+            q1, center, q3 = _quantiles(values)
+            profile_entity.update(median=center, scale=(q3 - q1) or 1.0,
+                histogram_edges=[] if min(values) == max(values) else [min(values) + (max(values) - min(values)) * i / 16 for i in range(1, 16)])
+            stride = max(1, len(values) // 256)
+            profile_entity["normal_references"] = [[(value - center) / profile_entity["scale"]
+                for value in values[::stride][:256]]]
+        else:
+            counts = Counter(states)
+            profile_entity["vocab"] = {value: index + 3 for index, value in enumerate(sorted(counts, key=lambda value: (-counts[value], value))[:64])}
+        profile_id = uuid4().hex
+        profile = {"profile_id": profile_id, "entity_id": entity_id, "kind": kind,
+            "unit": kind_row.get("unit") or "", "status": "available", "reference_dataset_id": dataset["dataset_id"],
+            "reference_annotation_id": annotation["annotation_id"], "reference_start": annotation["start"],
+            "reference_end": annotation["end"], "reference_rows": len(rows), "entity": profile_entity,
+            "onboarding_policy": "reviewed_normal_reference_v1", "created_at": _now()}
+        _write(self._path("sensors", profile_id), profile)
+        return {key: profile[key] for key in profile if key != "entity"}
 
     def _active(self):
         path = self.directory / "active.json"
@@ -565,12 +640,27 @@ class DiagnosticWorkbench:
         config = GATConfig(**(gat_config or dataset["config"]))
         built_config = dataset["config"]
         for key in ("grid_seconds", "sequence_steps", "feature_window_seconds", "graph_top_k",
-                    "max_nodes", "use_entropy", "use_dtw"):
-            if getattr(config, key) != built_config[key]:
+                    "max_nodes", "use_entropy", "use_dtw", "architecture_version"):
+            built_value = built_config.get(key, "gat_lstm_v1_entity" if key == "architecture_version" else None)
+            if getattr(config, key) != built_value:
                 raise ReviewError(f"La configuración {key} cambió; prepara nuevamente el conjunto.")
-        progress(1, "Cargando el dataset para entrenar el candidato", phase="loading")
-        train_samples = load_partition(dataset, "train_fit")
-        dev_samples = load_partition(dataset, "dev_tune")
+        progress(1, "Preparando almacenamiento de secuencias para entrenar", phase="cache_preparation")
+        def cache_progress(ratio):
+            if ratio is not None:
+                progress(1 + 3 * ratio, "Preparando almacenamiento de secuencias para entrenar",
+                         phase="cache_preparation", cache_progress=ratio * 100)
+        with open_training_partitions(dataset, progress=cache_progress) as (train_samples, dev_samples, storage):
+            if storage.get("cache_warning"):
+                progress(4, storage["cache_warning"], phase="loading", **storage)
+            else:
+                progress(4, f"Dataset preparado desde {storage['source']}", phase="loading", **storage)
+            return self._train_gat_candidate(dataset_id, encoder_id, dataset, config,
+                train_samples, dev_samples, storage, progress)
+
+    def _train_gat_candidate(self, dataset_id, encoder_id, dataset, config,
+                             train_samples, dev_samples, storage, progress):
+        if config.architecture_version == "gat_lstm_v2_shared_type" and encoder_id:
+            raise ReviewError("GAT-LSTM v2 usa su encoder compartido; no admite encoders predictivos v1.")
         support = {part: dataset.get("label_counts", {}).get(part, {})
                    for part in ("train_fit", "dev_tune")}
         missing = {part: [label for label in GAT_LABELS if counts.get(label, 0) == 0]
@@ -626,6 +716,7 @@ class DiagnosticWorkbench:
         model, metrics = train_classifier(train_samples, dev_samples, config,
                                           category_sizes, entity_kinds, training_progress, encoder,
                                           batch_progress=training_batch_progress)
+        metrics["storage"] = storage
         progress(90, "Guardando pesos, grafo, preprocesador y política de rechazo", phase="saving")
         candidate = save_candidate(model, preprocessor, graph, config, self.directory, metrics)
         all_train_meta = [sample["metadata"] for sample in
@@ -643,7 +734,10 @@ class DiagnosticWorkbench:
             "source_hashes": dataset["source_hashes"], "validated": False,
             "evaluation_status": "candidate", "label_support": support,
             "evidence_origins": dataset.get("evidence_origins", []), "evaluations": [],
-            "exploratory": dataset.get("exploratory", False)})
+            "exploratory": dataset.get("exploratory", False),
+            "runtime": metrics.get("runtime"),
+            "runtime_parameters": metrics.get("runtime_parameters"),
+            "storage": storage})
         _write(self._path("models", candidate["model_id"]), candidate)
         progress(100, "Entrenamiento completado: candidato listo", phase="completed")
         return self._model_summary(candidate)
@@ -661,9 +755,22 @@ class DiagnosticWorkbench:
                     "max_nodes", "use_entropy", "use_dtw"):
             if getattr(config, key) != dataset["config"][key]:
                 raise ReviewError(f"La configuración {key} cambió; prepara nuevamente el conjunto.")
+        progress(1, "Preparando almacenamiento de secuencias predictivas", phase="cache_preparation")
+        def cache_progress(ratio):
+            if ratio is not None:
+                progress(1 + 3 * ratio, "Preparando almacenamiento de secuencias predictivas",
+                         phase="cache_preparation", cache_progress=ratio * 100)
         from .GAT_LSTM.pretraining import pretrain_encoder, save_encoder
-        train_samples = load_pretraining_partition(dataset, "train_fit")
-        dev_samples = load_pretraining_partition(dataset, "dev_tune")
+        with open_training_partitions(dataset, predictive=True, progress=cache_progress) as (train_samples, dev_samples, storage):
+            if storage.get("cache_warning"):
+                progress(4, storage["cache_warning"], phase="loading", **storage)
+            else:
+                progress(4, f"Dataset predictivo preparado desde {storage['source']}", phase="loading", **storage)
+            return self._pretrain_gat_encoder(dataset_id, dataset, config, train_samples,
+                dev_samples, storage, progress)
+
+    def _pretrain_gat_encoder(self, dataset_id, dataset, config, train_samples,
+                              dev_samples, storage, progress):
         if not train_samples or not dev_samples:
             raise ReviewError(json.dumps({"code": "insufficient_predictive_targets",
                 "train_fit": dataset.get("pretrain_support_by_entity", {}).get("train_fit", {}),
@@ -681,10 +788,14 @@ class DiagnosticWorkbench:
             progress(min(85, percent), message)
         weights, metrics = pretrain_encoder(train_samples, dev_samples, config, categories, kinds,
                                             pretraining_progress)
+        metrics["storage"] = storage
         manifest = save_encoder(weights, preprocessor, graph, config, self.directory, metrics)
         manifest.update({"dataset_id": dataset_id, "source_hashes": dataset["source_hashes"],
                          "support_train_fit": dataset.get("pretrain_support_by_entity", {}).get("train_fit", {}),
-                         "support_dev_tune": dataset.get("pretrain_support_by_entity", {}).get("dev_tune", {})})
+                         "support_dev_tune": dataset.get("pretrain_support_by_entity", {}).get("dev_tune", {}),
+                         "runtime": metrics.get("runtime"),
+                         "runtime_parameters": metrics.get("runtime_parameters"),
+                         "storage": storage})
         _write(self.directory / "encoders" / f"{manifest['encoder_id']}.json", manifest)
         progress(100, "Encoder predictivo guardado; requiere ajuste diagnóstico antes de activarse")
         return {key: value for key, value in manifest.items() if key not in {"preprocessor", "graph"}}
@@ -712,7 +823,7 @@ class DiagnosticWorkbench:
         snapshot_dir = self.directory
         from .GAT_LSTM.training import load_candidate
         import torch
-        model, _, graph, manifest = load_candidate(model_id, snapshot_dir)
+        model, preprocessor, graph, manifest = load_candidate(model_id, snapshot_dir)
         threshold = manifest.get("rejection_policy", {}).get("threshold", .4)
         margin = manifest.get("rejection_policy", {}).get("margin", 0.0)
         progress(10, f"Evaluando objetivos de {partition}")
@@ -732,16 +843,22 @@ class DiagnosticWorkbench:
                     if not active: continue
                     record = {"true_label": sample["y"][node], "scores": scores[node],
                               "episode_id": meta.get("parent_episode_id"), "sample_id": meta["sample_id"],
+                              "entity_id": meta["entity_ids"][node], "timestamp": meta["target_time"],
+                              "source_sha256": meta.get("source_sha256"),
+                              "source_dataset_id": meta.get("source_dataset_id"),
+                              "source_row": meta.get("source_row"),
+                              "provenance": meta.get("input_provenance", []),
                               "evidence_origin": meta.get("evidence_origin", "unspecified")}
                     records.append(record)
-                    predictions.append({**record, "entity_id": meta["entity_ids"][node],
-                                        "timestamp": meta["target_time"]})
+                    predictions.append(record)
                 if index % 25 == 0:
                     progress(10 + 75 * index / len(samples), "Calculando predicciones con política congelada")
         result = gat_metrics(records, threshold, margin)
         result.update({"evaluation_id": uuid4().hex, "dataset_id": dataset_id,
             "model_id": model_id, "partition": partition, "created_at": _now(),
             "scope": "classifier_windows_only_not_end_to_end", "threshold": threshold,
+            "preprocessor_version": preprocessor.get("schema_version"),
+            "graph_version": graph.get("graph_version"),
             "margin": margin, "label_support": result["per_class"],
             "evidence_origins": result["evidence_origins"], "predictions": predictions})
         experiment_dir = self.directory / "experiments" / model_id
@@ -961,6 +1078,9 @@ class DiagnosticWorkbench:
                         "timestamp": str(item.get("timestamp", "")), "status": "indeterminate",
                         "predicted_label": None, "fault_type": None, "method": "gat_lstm",
                         "compatibility": None, "confidence": 0.0,
+                        "fault_type_status": "not_supported",
+                        "preprocessor_version": trained.get("schema_version"),
+                        "graph_version": trained.get("graph_version"),
                         "confidence_kind": "uncalibrated_softmax", "class_scores": {},
                         "needs_review": True, "reasons": ["pytorch_dependency_missing"],
                         "model_version": trained["model_id"]}
@@ -969,6 +1089,9 @@ class DiagnosticWorkbench:
             return enriched
         preprocessor = gat_snapshot[1]
         entities = preprocessor["entity_ids"]
+        sensor_profiles = (session.sensor_profiles if session is not None else
+                           {item["entity_id"]: item for item in self._list("sensors")
+                            if item.get("status") == "available"})
         event_index = {}
         if session is not None:
             session.add_events(events)
@@ -977,14 +1100,19 @@ class DiagnosticWorkbench:
             rows_by_entity = {}
             if isinstance(events, pd.DataFrame) and not events.empty:
                 time_column = "timestamp_dt" if "timestamp_dt" in events else "timestamp" if "timestamp" in events else "last_changed"
-                selected = events[events["entity_id"].astype(str).isin(entities)].copy()
+                requested_entities = set(entities) | {str(item.get("entity_id", "")) for item in contextual_results}
+                selected = events[events["entity_id"].astype(str).isin(requested_entities)].copy()
                 selected["_diag_time"] = pd.to_datetime(selected[time_column], utc=True, errors="coerce")
                 for entity, group in selected.dropna(subset=["_diag_time"]).groupby("entity_id", sort=False):
                     values = []
                     for ordinal, row in enumerate(group.sort_values(["_diag_time"], kind="stable").to_dict("records")):
+                        try:
+                            source_row = int(row.get("_raw_index", ordinal))
+                        except (TypeError, ValueError, OverflowError):
+                            source_row = ordinal
                         values.append((row["_diag_time"], {"entity_id": str(entity),
                             "timestamp": row["_diag_time"].isoformat(), "state": str(row.get("state", "")),
-                            "source_row": int(row.get("_raw_index", ordinal)) if isinstance(row.get("_raw_index", ordinal), int) else ordinal}))
+                            "source_row": source_row, "provenance": {"source": source, "run_id": run_id}}))
                     rows_by_entity[str(entity)] = values
             def provider(start, end, requested):
                 found = []
@@ -995,6 +1123,7 @@ class DiagnosticWorkbench:
                     found.extend(row for _, row in values[left:right])
                 return found
         enriched, decisions = [], []
+        prediction_cache = {}
         for context in contextual_results:
             item = deepcopy(context)
             if item.get("routing", {}).get("terminal"):
@@ -1003,19 +1132,27 @@ class DiagnosticWorkbench:
                 continue
             entity_id, timestamp = str(item.get("entity_id", "")), str(item.get("timestamp", ""))
             try:
-                result = predict_at(gat_snapshot, provider, entity_id, timestamp)
+                if session is not None:
+                    session.stats["gat_candidates"] += 1
+                result = predict_at(gat_snapshot, provider, entity_id, timestamp, sensor_profiles,
+                                    metrics=session.stats if session is not None else None,
+                                    prediction_cache=prediction_cache)
                 target_us, _ = parse_time(timestamp)
                 if source != "history" and trained.get("training_end"):
                     if target_us <= parse_time(trained["training_end"])[0]:
                         result.update(status="indeterminate", predicted_label=None, confidence=0.0,
                                       class_scores={}, needs_review=True,
                                       reasons=["target_not_after_training_period"])
-            except (ValueError, KeyError, RuntimeError) as exc:
+            except (ValueError, KeyError, TypeError, OverflowError, RuntimeError) as exc:
+                reason = (exc.reason if hasattr(exc, "reason") else
+                          "invalid_event_format" if isinstance(exc, (ValueError, KeyError, TypeError, OverflowError))
+                          else "inference_error")
                 result = {"entity_id": entity_id, "timestamp": timestamp, "status": "indeterminate",
                           "predicted_label": None, "fault_type": None, "method": "gat_lstm",
                           "compatibility": None, "confidence": 0.0,
+                          "fault_type_status": "not_supported",
                           "confidence_kind": "uncalibrated_softmax", "class_scores": {},
-                          "needs_review": True, "reasons": [str(exc)],
+                          "needs_review": True, "reasons": [reason],
                           "model_version": trained["model_id"]}
             result.update(source=source, run_id=run_id, mode="active_model",
                           causal=source != "history",
@@ -1120,8 +1257,23 @@ class DiagnosticWorkbench:
         with self._connect() as connection:
             total = connection.execute("SELECT COUNT(*) FROM decisions" + where, args).fetchone()[0]
             rows = connection.execute("SELECT payload FROM decisions" + where + " ORDER BY timestamp DESC,decision_id DESC LIMIT ? OFFSET ?", [*args, limit, offset]).fetchall()
+            grouped = connection.execute(
+                "SELECT json_extract(payload,'$.status'), json_extract(payload,'$.reasons[0]'), COUNT(*) "
+                "FROM decisions" + where + " GROUP BY 1,2", args).fetchall()
         items = [json.loads(row[0]) for row in rows]
-        return {"items": items, "total": total, "offset": offset, "next_offset": offset + len(items) if offset + len(items) < total else None}
+        indeterminate_by_reason = {}
+        indeterminate = 0
+        for status, reason, count in grouped:
+            if status == "indeterminate":
+                key = reason or "unspecified"
+                indeterminate_by_reason[key] = count
+                indeterminate += count
+        return {"items": items, "total": total, "offset": offset,
+                "next_offset": offset + len(items) if offset + len(items) < total else None,
+                "summary": {"total": total, "determinate": total - indeterminate,
+                    "indeterminate": indeterminate,
+                    "coverage": (total - indeterminate) / total if total else None,
+                    "indeterminate_by_reason": indeterminate_by_reason}}
 
 
 def crear_router_diagnostico(workbench: DiagnosticWorkbench):
@@ -1152,6 +1304,10 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
         if set(payload) != {"name", "config"}:
             raise HTTPException(400, "Indica name y config para guardar una configuración GAT-LSTM.")
         return translate(workbench.save_gat_configuration, payload)
+
+    @router.post("/sensors/onboard")
+    def onboard_sensor(payload: dict):
+        return translate(workbench.register_gat_sensor, payload)
 
     @router.post("/build")
     def build(payload: BuildInput):

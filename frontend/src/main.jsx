@@ -358,7 +358,14 @@ function App() {
     runStep("init", async () => {
       setHealth(await api("/health"));
       const status = await api("/history/static/status?autoload=false");
-      applyHistoryStatus(status);
+      if (status.history_load && status.history_load.status !== "completed") {
+        setActiveModule("evaluacion");
+        const completed = await monitorHistoryLoad(status.history_load);
+        await finishHistoryLoad(completed);
+      } else {
+        applyHistoryStatus(status);
+        if (status.exists) await loadTimeline("", "");
+      }
       const replay = await api("/validation/replay/status");
       applyValidationPipeline(replay);
       if (replay?.loaded) {
@@ -928,6 +935,7 @@ function App() {
         <>
           <section className="workspace-grid lower single">
             <Panel title="Conjunto de datos">
+              <p>El histórico se conserva y se recupera automáticamente al reiniciar el servidor. Puedes subir otro archivo para reemplazarlo.</p>
               <div className="history-summary">
                 <SummaryRow label="API" value={health?.status || "-"} />
                 <SummaryRow label="Origen" value={historyStatus?.source_type || "-"} />

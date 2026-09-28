@@ -8,14 +8,17 @@ services:
         INSTALL_GAT: "1"
     environment:
       MULTISTATE_FIXTURE_DIR: /app/fixtures
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      GAT_SEQUENCE_CACHE_DIR: /app/gat_sequence_cache
       STATIC_HISTORY_DIR: /app/data/static_history
-      REAL_HISTORY_PATH: /app/data/datosreales/history.csv
-      VALIDATION_HISTORY_PATH: /app/data/datosreales/historico_validacion.csv
+      REAL_HISTORY_PATH: /app/HistoricosEnUso/cargados/history.csv
+      VALIDATION_HISTORY_PATH: /app/HistoricosEnUso/cargados/historico_validacion.csv
       ANALYSIS_CACHE_PATH: /app/data/cache/real_history_analysis.json
       CONTINUOUS_CONF_PATH: /app/data/cache/conf.txt
       CONTEXT_MAP_CACHE_PATH: /app/data/cache/contextual_map.json
       REVIEW_DATA_DIR: /app/data/review
-      HISTORICAL_DATA_DIR: /app/HistoricoPuro
+      HISTORICAL_DATA_DIR: /app/HistoricosEnUso
       FLOW_LAB_DB_PATH: /app/data/cache/flow_lab.sqlite3
       VALIDATION_REPLAY_MEMORY_RESULTS: "500"
       VALIDATION_REPLAY_STATUS_RESULTS: "25"
@@ -25,10 +28,13 @@ services:
     volumes:
       - ./data/fixtures:/app/fixtures:ro
       - ./data/static_history:/app/data/static_history
-      - ./data/datosreales:/app/data/datosreales
+      - ./HistoricosEnUso/cargados:/app/HistoricosEnUso/cargados
       - ./data/cache:/app/data/cache
       - ./data/review:/app/data/review
-      - ../HistoricoPuro:/app/HistoricoPuro:ro
+      - gat_sequence_cache:/app/gat_sequence_cache
+      - ./HistoricosEnUso:/app/HistoricosEnUso:ro
+      - ./artifacts/gat_lstm:/app/artifacts/gat_lstm:ro
+    command: ["python", "-m", "app.bootstrap_gat", "--bundle", "/app/artifacts/gat_lstm", "--serve"]
     ports:
       - "8000:8000"
 
@@ -41,3 +47,6 @@ services:
       - "5173:5173"
     depends_on:
       - api
+
+volumes:
+  gat_sequence_cache:

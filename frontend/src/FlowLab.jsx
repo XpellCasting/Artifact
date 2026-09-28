@@ -43,6 +43,13 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
   const phase = job?.phase || "evaluation";
   const title = phase === "preparation" ? "Preparando evaluación" : phase === "saving" ? "Guardando ejecución" : "Evaluando flujo";
   const detail = job?.detail || (phase === "preparation" ? "Calibrando modelos y preparando estados causales…" : phase === "saving" ? "Persistiendo resultados…" : null);
+  const groupStarted = job?.group_started_at ? Date.parse(job.group_started_at) : NaN;
+  const groupSeconds = Number.isFinite(groupStarted) ? Math.max(0, Math.floor((Date.now() - groupStarted) / 1000)) : null;
+  const lastCompleted = job?.last_completed_at ? Date.parse(job.last_completed_at) : NaN;
+  const noRecentGroups = job?.recent_events_per_second == null && Number.isFinite(lastCompleted) && Date.now() - lastCompleted >= 30000;
+  const rateDetail = job?.recent_events_per_second != null && Number.isFinite(Number(job.recent_events_per_second))
+    ? `${Number(job.recent_events_per_second).toLocaleString()} lecturas/s (últimos 30 s)`
+    : noRecentGroups ? "Sin grupos completados en los últimos 30 s" : "Calculando ritmo…";
   return <section className="history-load-progress fl-evaluation-progress" aria-live="polite">
     <div className="history-load-heading"><span>{title}</span><strong>{phase === "evaluation" ? `${Math.round(progress)}%` : "En curso"}</strong></div>
     <div className="progress-track" role="progressbar" aria-label="Progreso de evaluación del flujo" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(progress)} aria-valuetext={`${count(processed)} de ${total ? count(total) : "total por determinar"} lecturas procesadas`}>
@@ -50,6 +57,11 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
     </div>
     <p>{detail || (total ? `Procesadas ${count(processed)} de ${count(total)} lecturas del conjunto de evaluación.` : `Preparando las lecturas que se evaluarán…`)}</p>
     <div className="history-load-meta"><span>Lecturas procesadas: {phase === "evaluation" ? count(processed) : "—"}</span><span>Total: {phase === "evaluation" && total ? count(total) : "—"}</span></div>
+    {phase === "evaluation" && job?.current_timestamp && <div className="history-load-meta">
+      <span>Grupo actual: {new Date(job.current_timestamp).toLocaleString()} · {count(job.current_batch_rows || 0)} lecturas</span>
+      <span>{groupSeconds === null ? `Último grupo: ${Number(job.last_batch_ms || 0).toLocaleString()} ms` : `Procesando hace ${groupSeconds} s`}</span>
+      <span>{rateDetail}</span>
+    </div>}
   </section>;
 }
 
@@ -204,7 +216,7 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
         <p className="fl-hint">CSV etiquetado: entity_id, state, last_changed, es_sintetica, tipo, tipo_falla. Las etiquetas se usan solo para comprobar los resultados.</p>
         {replay?.loaded && <p><strong>{replay.filename}</strong> · {replay.rows} eventos · {replay.labelled ? "Con etiquetas" : "Sin etiquetas"}</p>}
         {upload && <p role="status">{upload.message}</p>}
-        {!historyReady && <p className="fl-required">Carga un histórico desde Estadístico y espera a que se prepare el detector.</p>}
+        {!historyReady && <p className="fl-required">Carga un histórico desde Evaluación y espera a que se prepare el detector.</p>}
         {job && <FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} />}
       </div><button className="fl-primary" disabled={busy || uploadBusy || !loaded || !historyReady || !replay?.loaded || !!errors.length} onClick={execute}><Play size={16} />{busy ? "Evaluando…" : dirty || !draft.flow_id ? "Guardar y evaluar" : "Evaluar flujo"}</button></section>
     </>}

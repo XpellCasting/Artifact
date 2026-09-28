@@ -5,7 +5,7 @@ import os
 import hashlib
 import sqlite3
 from collections import deque
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -31,6 +31,7 @@ from .Filtro_Estadistico.Episodios import (
 )
 from .Reproduccion_Validacion import MotorReproduccionValidacion
 from . import Evaluacion_Etiquetada as labelled_evaluation
+from . import Cache_Causal as causal_cache
 from .Revision_Fragmentos import crear_router_revision
 from .Diagnostico_Trabajo import DiagnosticWorkbench, crear_router_diagnostico
 from .Flujos import FlowRunner, FlowStore, default_flow, validate_flow
@@ -113,6 +114,7 @@ class EstadoAplicacion:
     future_evaluation_prepared_at: str | None = field(
         default=None, repr=False
     )
+    future_preparation_cache: dict[str, Any] = field(default_factory=dict, repr=False)
     history_load_jobs: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
     history_load_jobs_lock: Any = field(default_factory=Lock, repr=False)
     history_load_execution_lock: Any = field(default_factory=Lock, repr=False)
@@ -149,7 +151,9 @@ class EstadoAplicacion:
     validation_results_store_ready: bool = field(default=False, repr=False)
 
     def status(self, autoload: bool = True) -> dict[str, Any]:
-        if self.historial is None and autoload:
+        with self.history_load_jobs_lock:
+            has_load_job = bool(self.history_load_jobs)
+        if self.historial is None and autoload and not has_load_job:
             if self.real_history_path.exists():
                 try:
                     self.historial = self.cargador.cargar_real(self.real_history_path)
@@ -425,14 +429,15 @@ class EstadoAplicacion:
         return self._status_desde_historial(self.historial)
 
     def _preparar_continuidad_historica(self) -> None:
+        self.future_preparation_cache = {"reused": False, "persisted": False}
         if self.historial is None or self.historial.eventos.empty:
             self.future_baseline_template = None
             self.future_context_map_template = None
             self.future_context_events_template = None
             self.future_evaluation_prepared_at = None
             return
-        eventos_capturados = self.historial.eventos.copy(deep=True)
-        entidades_capturadas = self.historial.entidades.copy(deep=True)
+        eventos_capturados = self.historial.eventos
+        entidades_capturadas = self.historial.entidades
         entity_ids = set(eventos_capturados["entity_id"].astype(str))
         ajustes = self.filtro_estadistico.continuos.ajustes_manuales(entity_ids)
         identidad = build_baseline_identity(eventos_capturados, entidades_capturadas, ajustes)
@@ -440,6 +445,22 @@ class EstadoAplicacion:
         self.future_context_map_template = None
         self.future_context_events_template = None
         self.future_evaluation_prepared_at = None
+        cache_path = self.analysis_cache_path.parent / "causal_preparation.pkl"
+        key = causal_cache.cache_key(
+            identidad, self.historial, self.filtro_contextual.config,
+            self._ruta_mapa_contextual_cache(),
+        )
+        cached = causal_cache.load(cache_path, key)
+        if cached is not None:
+            self.future_baseline_template = cached["baseline"]
+            self.future_context_map_template = cached["context_map"]
+            self.future_context_events_template = cached["context_events"]
+            self.future_evaluation_prepared_at = cached["prepared_at"]
+            self.mapa_contextual_cache = deepcopy(cached["context_map"])
+            self.future_preparation_cache = {"reused": True, "persisted": True}
+            return
+        eventos_capturados = eventos_capturados.copy(deep=True)
+        entidades_capturadas = entidades_capturadas.copy(deep=True)
         baseline = MotorReproduccionValidacion(
             self.filtro_estadistico
         ).construir_baseline(
@@ -484,6 +505,17 @@ class EstadoAplicacion:
         self.future_evaluation_prepared_at = datetime.now(
             timezone.utc
         ).isoformat()
+        # La construcción puede actualizar el mapa: guardar su huella definitiva.
+        key = causal_cache.cache_key(
+            identidad, self.historial, self.filtro_contextual.config,
+            self._ruta_mapa_contextual_cache(),
+        )
+        self.future_preparation_cache["persisted"] = causal_cache.save(cache_path, key, {
+            "baseline": self.future_baseline_template,
+            "context_map": self.future_context_map_template,
+            "context_events": self.future_context_events_template,
+            "prepared_at": self.future_evaluation_prepared_at,
+        })
 
     def subir_validacion(
         self,
@@ -2047,6 +2079,7 @@ class EstadoAplicacion:
                 and self.future_context_events_template is not None
             ),
             "future_evaluation_prepared_at": self.future_evaluation_prepared_at,
+            "future_preparation_cache": dict(self.future_preparation_cache),
             "future_baseline_summary": (
                 {}
                 if self.future_baseline_template is None
@@ -2319,6 +2352,15 @@ def serializable_json(valor: Any) -> Any:
     return str(valor)
 
 
+@asynccontextmanager
+async def lifespan(api: FastAPI):
+    # El CSV vive en el volumen persistente; reconstruir el detector en segundo
+    # plano permite consultar el progreso sin bloquear el arranque de la API.
+    if state.historial is None and state.real_history_path.is_file():
+        state.iniciar_carga_real()
+    yield
+
+
 def crear_app() -> FastAPI:
     api = FastAPI(
         title="Artefacto de tesis",
@@ -2327,6 +2369,7 @@ def crear_app() -> FastAPI:
             "contextual con cierre ambiental. Tercer filtro pendiente de implementacion."
         ),
         version="0.5.0",
+        lifespan=lifespan,
     )
     cors_origins = [
         origin.strip()
@@ -2364,7 +2407,7 @@ state = EstadoAplicacion(
     real_history_path=Path(
         os.getenv(
             "REAL_HISTORY_PATH",
-            str(ARTIFACT_ROOT / "data/datosreales/history.csv"),
+            str(ARTIFACT_ROOT / "HistoricosEnUso/cargados/history.csv"),
         )
     ),
     analysis_cache_path=Path(
@@ -2376,7 +2419,7 @@ state = EstadoAplicacion(
     validation_history_path=Path(
         os.getenv(
             "VALIDATION_HISTORY_PATH",
-            str(ARTIFACT_ROOT / "data/datosreales/historico_validacion.csv"),
+            str(ARTIFACT_ROOT / "HistoricosEnUso/cargados/historico_validacion.csv"),
         )
     ),
     context_map_cache_path=Path(
@@ -2406,7 +2449,11 @@ def health() -> dict[str, Any]:
 def history_static_status(
     autoload: bool = Query(default=True),
 ) -> dict[str, Any]:
-    return state.status(autoload=autoload)
+    payload = state.status(autoload=autoload)
+    with state.history_load_jobs_lock:
+        job_id = next(reversed(state.history_load_jobs), None)
+    payload["history_load"] = state.estado_carga_real(job_id) if job_id else None
+    return payload
 
 
 @app.post("/history/static/ensure", tags=["history"])
@@ -2677,8 +2724,9 @@ def run_flow(flow_id: str, request: FlowRunRequest) -> dict[str, Any]:
             truth = labelled_evaluation.read_truth(state._ruta_almacen_resultados_validacion()) if state.validation_replay_state.get("labelled") else []
             filename = state.validation_replay_state.get("filename")
             runner = CausalFlowRunner(deepcopy(state.filtro_estadistico), deepcopy(state.filtro_contextual), state.diagnostic_workbench)
-        def evaluate(progress):
-            summary, results, snapshot = runner.evaluate(flow, development, future, entities, context_map, baseline, truth, progress)
+        def evaluate(progress, result_sink):
+            summary, results, snapshot = runner.evaluate(flow, development, future, entities, context_map, baseline, truth, progress,
+                                                         result_sink=result_sink)
             snapshot["source"]["filename"] = filename
             return summary, results, snapshot
         return flow_evaluation_jobs.start(flow_id, evaluate)

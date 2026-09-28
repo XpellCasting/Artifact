@@ -266,6 +266,36 @@ class FlowStore:
             db.executemany("INSERT INTO flow_results VALUES (?,?,?,?,?)", records)
         return run_id
 
+    def save_run_stream(self, flow_id: str, snapshot: dict[str, Any], summary: dict[str, Any], records) -> tuple[str, float]:
+        """Persist a completed spool atomically without materializing its rows."""
+        run_id = uuid4().hex
+        started = perf_counter()
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            def values():
+                for record in records:
+                    yield (run_id, record["node_id"], record["observation_id"],
+                           record["sequence"], _json(record["payload"]))
+            db.executemany("INSERT INTO flow_results VALUES (?,?,?,?,?)", values())
+            insert_ms = round((perf_counter() - started) * 1000, 3)
+            performance = summary.setdefault("performance", {})
+            phases = performance.setdefault("phases_ms", {})
+            phases["result_persistence_before_commit"] = insert_ms
+            phases["total_with_result_inserts"] = round(phases.get("total", 0) + insert_ms, 3)
+            included = performance.setdefault("included_in", {})
+            included["result_persistence_before_commit"] = "total_with_result_inserts"
+            included["total_with_result_inserts"] = "evaluation and result insertion; excludes commit latency"
+            db.execute("INSERT INTO flow_runs VALUES (?,?,?,?,?)",
+                       (run_id, flow_id, _json(snapshot), _json(summary), _now()))
+            db.commit()
+            return run_id, round((perf_counter() - started) * 1000, 3)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def list_runs(self, flow_id: str | None = None) -> list[dict[str, Any]]:
         clause, args = (" WHERE flow_id=?", [flow_id]) if flow_id else ("", [])
         with self._database() as db:
@@ -425,6 +455,9 @@ class FlowRunner:
             requests.append({**item, "is_suspicious": True, "passed_to_contextual_filter": True, "suspicion_score": next((e["data"].get("suspicion_score") for e in reversed(item.get("evidence", [])) if isinstance(e.get("data"), dict) and e["data"].get("suspicion_score") is not None), None), "_flow_has_statistical": has_statistical})
         requests_by_id = {item["observation_id"]: item for item in requests}
         causal_options = {"concurrence_state": self.context_states.setdefault(node_id, {})} if hasattr(self, "context_states") else {}
+        prepared_state = getattr(self, "context_sessions", {}).get(node_id)
+        if prepared_state is not None:
+            causal_options["prepared_state"] = prepared_state
         raw = self.contextual.analizar_causal(requests, events, entities, context_map, accept_all=True, **causal_options)
         indexed = {str(item.get("observation_id")): item for item in raw.get("results", [])}
         output = []

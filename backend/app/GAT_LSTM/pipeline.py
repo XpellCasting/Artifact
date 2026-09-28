@@ -28,6 +28,7 @@ from .storage import DiskPartition, PartitionWriter
 from ..Tipos_Entidad import infer_kind
 from ..Estados_Validos import valid_state
 from ..CSV_Etiquetado import labelled_columns, read_label
+from ..Diagnostico_Patrones import CATALOG
 
 
 def canonical_sources(manifest_path: Path):
@@ -84,11 +85,12 @@ def development_annotations(review_store, source_hashes):
         if dataset.get("sha256") not in hashes or dataset_id in seen:
             continue
         seen.add(dataset_id)
-        result.extend(review_store.list_annotations(dataset_id=dataset_id))
+        result.extend({**annotation, "partition": "development"}
+                      for annotation in review_store.list_annotations(dataset_id=dataset_id))
     return result
 
 
-def _load_events(path: Path, *, read_row_labels=False):
+def _load_events(path: Path, *, read_row_labels=False, source_id=None):
     by_entity = defaultdict(list)
     kinds_states = defaultdict(set)
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
@@ -105,7 +107,8 @@ def _load_events(path: Path, *, read_row_labels=False):
                 continue
             at = parse_utc(timestamp)
             value = {"entity_id": entity, "timestamp": at.isoformat(), "_time": at,
-                     "state": str(row.get("state", "")), "source_row": source_row}
+                     "state": str(row.get("state", "")), "source_row": source_row,
+                     "provenance": source_id or path.name}
             if columns is not None:
                 imported = read_label([raw.get(reader.fieldnames[index], "") for index in columns],
                                       [0, 1, 2])
@@ -214,7 +217,8 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     event_index, state_values = {}, {}
     for name, source in sources.items():
         event_index[name], state_values[name] = _load_events(
-            Path(source["path"]), read_row_labels=bool(source.get("labelled_import")))
+            Path(source["path"]), read_row_labels=bool(source.get("labelled_import")),
+            source_id=source["source_id"])
     eligible_events = defaultdict(list)
     for rows_by_entity in event_index.values():
         for rows in rows_by_entity.values():
@@ -267,6 +271,17 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
                  if actual_partition(parse_utc(a["start"]), bounds) == "train_fit"
                  and actual_partition(parse_utc(a["end"]), bounds) == "train_fit"]
     preprocessor = fit_preprocessor(train_fit, train_ann, config, entities)
+    for source in sources.values():
+        if source.get("dataset_id"):
+            source_dataset = review_store.dataset(source["dataset_id"])
+            for entity in source_dataset.get("entities", []):
+                if entity["entity_id"] in preprocessor["entities"]:
+                    preprocessor["entities"][entity["entity_id"]]["unit"] = entity.get("unit") or ""
+    shared_type_model = config.architecture_version == "gat_lstm_v2_shared_type"
+    if shared_type_model:
+        preprocessor["feature_names"].extend([
+            "state_transition_ratio", "dominant_state_fraction", "state_diversity_ratio"])
+        preprocessor["architecture_version"] = config.architecture_version
     catalog = [{"entity_id": entity, "sensor_kind": kind, "domain": entity.split(".", 1)[0]}
                for entity, kind in entities.items()]
     graph = build_graph(train_fit, catalog, config)
@@ -286,6 +301,11 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     root.mkdir(parents=True, exist_ok=True)
     final_dir = root / identifier
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{identifier}-", dir=root))
+    fault_types = {item["fault_type"] for item in CATALOG}
+    fault_type_windows = {part: Counter() for part in ("train_fit", "dev_tune")}
+    fault_type_entity_windows = {part: defaultdict(Counter) for part in ("train_fit", "dev_tune")}
+    fault_type_episodes = {part: defaultdict(lambda: defaultdict(set))
+                           for part in ("train_fit", "dev_tune")}
     try:
         with ExitStack() as stack:
             supervised = {part: stack.enter_context(PartitionWriter(temp_dir, part))
@@ -298,8 +318,14 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
                 target_time = parse_utc(target.timestamp)
                 # Each sample supervises the annotated node only. Other nodes are context.
                 sample = build_causal_sample(provider, target_time, preprocessor, graph, config,
-                                             {target.entity_id: target.label})
+                                             {target.entity_id: target.label},
+                                             portable_features=shared_type_model)
                 original = annotations_by_id[target.annotation_id]
+                fault_type = original.get("fault_type")
+                if (target.label == LABELS.index("sensor_fault") and fault_type in fault_types):
+                    fault_type_windows[target.partition][fault_type] += 1
+                    fault_type_entity_windows[target.partition][fault_type][target.entity_id] += 1
+                    fault_type_episodes[target.partition][fault_type][target.entity_id].add(target.episode_id)
                 sample["metadata"].update({"sample_id": hashlib.sha256(
                     f"{target.annotation_id}:{target.timestamp}:{target.entity_id}".encode()).hexdigest(),
                     "annotation_id": target.annotation_id, "parent_episode_id": target.episode_id,
@@ -371,7 +397,8 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
                                 if len(candidates) >= config.pretrain_max_samples: break
                         if not progressed: break
                     for entity, target_at, future_row, target_value in candidates:
-                        sample = build_causal_sample(provider, target_at, preprocessor, graph, config)
+                        sample = build_causal_sample(provider, target_at, preprocessor, graph, config,
+                            portable_features=shared_type_model)
                         targets_vec = [0.0] * len(preprocessor["entity_ids"])
                         observed = [False] * len(preprocessor["entity_ids"])
                         node = preprocessor["entity_ids"].index(entity)
@@ -408,6 +435,21 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     partition_counts.setdefault("validation", 0); partition_counts.setdefault("test", 0)
     label_counts.setdefault("validation", {}); label_counts.setdefault("test", {})
     episode_counts.setdefault("validation", {}); episode_counts.setdefault("test", {})
+    fault_type_inventory = {}
+    for part in ("train_fit", "dev_tune"):
+        fault_type_inventory[part] = {}
+        for fault_type in sorted(fault_types):
+            by_entity = fault_type_episodes[part].get(fault_type, {})
+            episodes = sum(len(ids) for ids in by_entity.values())
+            fault_type_inventory[part][fault_type] = {
+                "windows": fault_type_windows[part][fault_type],
+                "independent_episodes": episodes,
+                "entities": len(by_entity),
+                "by_entity": {entity: {"windows": fault_type_entity_windows[part][fault_type][entity],
+                                        "independent_episodes": len(ids)}
+                              for entity, ids in sorted(by_entity.items())},
+                "minimum_independent_episodes": 3,
+                "support_status": "supported" if episodes >= 3 else "insufficient_support"}
     result = {"dataset_id": identifier, "method": "gat_lstm", "created_at": datetime.now(timezone.utc).isoformat(),
              "sequence_dir": str(final_dir), "source_ids": selected,
              "source_hashes": {name: source["actual_sha256"] for name, source in sources.items()},
@@ -419,6 +461,7 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
              "label_counts": label_counts, "episode_counts": episode_counts, "exclusions": exclusions,
              "pretrain_counts": {part: sum(counts.values()) for part, counts in pretrain_support.items()},
              "pretrain_support_by_entity": {part: dict(counts) for part, counts in pretrain_support.items()},
+             "fault_type_inventory": fault_type_inventory,
              "spatial_evidence": graph["spatial_evidence"], "graph_version": graph["graph_version"], "exploratory": False,
              "config": config.as_dict(), "schema_version": config.schema_version}
     progress(98, "Finalizando el registro del dataset")

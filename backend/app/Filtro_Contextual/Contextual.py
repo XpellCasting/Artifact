@@ -89,6 +89,7 @@ class ConfiguracionContextual:
         )
         return payload
 
+
     def ventanas(self) -> list[int]:
         return sorted({self.window_seconds, *(
             value for value in self.window_candidates_seconds
@@ -100,6 +101,49 @@ class ConfiguracionContextual:
         return sorted(offset for offset in {0, seconds, 2 * seconds, 3 * seconds,
                       6 * seconds, self.window_seconds, maximum // 2, maximum}
                       if offset <= maximum and offset % seconds == 0)
+
+
+class PreparedCausalEvents:
+    """Prepared per-entity event indexes updated in chronological batches."""
+    def __init__(self, filtro, entidades: pd.DataFrame, eventos: pd.DataFrame):
+        self.filtro = filtro
+        prepared = filtro._preparar_eventos(eventos)
+        self.catalog = filtro._catalogo(entidades, prepared)
+        self.observations = filtro._indexar_observaciones(prepared, self.catalog)
+
+    def advance(self, events: pd.DataFrame, cutoff: pd.Timestamp) -> None:
+        if not isinstance(events, pd.DataFrame) or events.empty:
+            return
+        prepared = self.filtro._preparar_eventos(events)
+        for entity_id, rows in prepared.groupby("entity_id", sort=False):
+            entity_id = str(entity_id)
+            if entity_id not in self.catalog:
+                # Future values do not define metadata. Only declared type/domain
+                # fields and the stable entity id are consulted for new entities.
+                first = rows.iloc[0]
+                metadata = {key: first.get(key) for key in ("sensor_kind", "domain")}
+                self.catalog[entity_id] = {
+                    "entity_id": entity_id,
+                    **metadata,
+                    "sensor_kind": self.filtro._tipo_entidad(metadata, entity_id),
+                }
+            current = self.observations.get(entity_id)
+            incoming = rows.set_index("timestamp_dt")
+            if current is None:
+                current = incoming
+            elif not incoming.empty:
+                current = pd.concat([current, incoming]).sort_index(kind="stable")
+            self.observations[entity_id] = current
+        for entity_id, current in self.observations.items():
+            boundary = int(current.index.searchsorted(cutoff, side="left"))
+            if boundary:
+                self.observations[entity_id] = pd.concat(
+                    [current.iloc[boundary - 1:boundary], current.iloc[boundary:]]
+                )
+
+    @property
+    def buffered_event_rows(self) -> int:
+        return sum(len(frame) for frame in self.observations.values())
 
 
 class FiltroContextualEspacioTemporal:
@@ -117,6 +161,9 @@ class FiltroContextualEspacioTemporal:
 
     def __init__(self, config: ConfiguracionContextual | None = None) -> None:
         self.config = config or ConfiguracionContextual()
+
+    def preparar_eventos_causales(self, entidades: pd.DataFrame, eventos: pd.DataFrame) -> PreparedCausalEvents:
+        return PreparedCausalEvents(self, entidades, eventos)
 
     def implementation_sha256(self) -> str:
         return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -347,12 +394,17 @@ class FiltroContextualEspacioTemporal:
         mapa: dict[str, Any],
         concurrence_state: dict[tuple[str, str], pd.Timestamp] | None = None,
         accept_all: bool = False,
+        prepared_state: PreparedCausalEvents | None = None,
     ) -> dict[str, Any]:
         """Evalua cada sospecha usando solo observaciones con fecha no futura."""
         inicio = perf_counter()
-        trabajo = self._preparar_eventos(eventos_disponibles)
-        catalogo = self._catalogo(entidades, trabajo)
-        observaciones = self._indexar_observaciones(trabajo, catalogo)
+        if prepared_state is None:
+            trabajo = self._preparar_eventos(eventos_disponibles)
+            catalogo = self._catalogo(entidades, trabajo)
+            observaciones = self._indexar_observaciones(trabajo, catalogo)
+        else:
+            catalogo = prepared_state.catalog
+            observaciones = prepared_state.observations
         edges_by_source: dict[str, list[dict[str, Any]]] = {}
         for edge in mapa.get("edges", []):
             if edge.get("accepted"):
