@@ -64,6 +64,22 @@ class ResidualRuntime:
     focus: Any = None
     focus_index: int = 0
 
+    def __getstate__(self):
+        """Persist runtime state without the third-party Focus instance.
+
+        changepoint-online's Gaussian owns a local lambda and cannot be
+        pickled.  A prepared historical baseline always starts a fresh
+        sequential detector, so the instance can be recreated lazily on its
+        first update after loading the cache.
+        """
+        state = self.__dict__.copy()
+        state["focus"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.focus = None
+
     def reset_sequential(self, method: str) -> None:
         self.ewma = self.energy = 0.0
         self.focus_index = 0

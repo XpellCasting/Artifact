@@ -7,9 +7,25 @@ import "./flow-lab.css";
 
 const PRESETS = templates();
 const PAGE_SIZE = 50;
+const DRAFT_STORAGE_KEY = "flow-lab-selected-draft-v1";
 const DESCRIPTIONS = { input: "Lecturas del histórico seleccionado", statistical: "Sospechas temporales", statistical_focus: "Cambios secuenciales en residuos", contextual: "Coherencia entre entidades", classifier: "Compatibilidad con patrones", merge: "Reúne las evidencias de las ramas", decision: "Distribuye según la señal recibida", output: "Resultado final por lectura" };
+function restoreFlowDraft() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY) || "null");
+    if (saved?.draft?.nodes && saved?.draft?.edges) {
+      return { draft: clone(saved.draft), savedKey: typeof saved.savedKey === "string" ? saved.savedKey : "" };
+    }
+  } catch { /* Una copia local incompleta se descarta y se abre la plantilla inicial. */ }
+  return { draft: clone(PRESETS[0]), savedKey: "" };
+}
 async function request(base, path, options = {}) {
-  const response = await fetch(`${base}${path}`, { ...options, headers: { "Content-Type": "application/json", ...options.headers } });
+  let response;
+  try {
+    response = await fetch(`${base}${path}`, { ...options, headers: { "Content-Type": "application/json", ...options.headers } });
+  } catch (error) {
+    if (error instanceof TypeError) throw new Error(`No se pudo conectar con la API (${base}). Comprueba que Docker/API esté activo y que el navegador pueda acceder a esa dirección.`);
+    throw error;
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : `No se pudo completar la operación (${response.status}).`);
   return payload;
@@ -66,10 +82,12 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
 }
 
 function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, onUpload, onLabelledUpload }) {
-  const [draft, setDraft] = useState(() => clone(PRESETS[0]));
-  const [savedKey, setSavedKey] = useState("");
+  const [draft, setDraft] = useState(() => restoreFlowDraft().draft);
+  const [savedKey, setSavedKey] = useState(() => restoreFlowDraft().savedKey);
   const [flows, setFlows] = useState([]);
   const [runs, setRuns] = useState([]);
+  const [classifierModels, setClassifierModels] = useState([]);
+  const [activeClassifierModelId, setActiveClassifierModelId] = useState(null);
   const [selection, setSelection] = useState(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -95,9 +113,13 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
   const errors = useMemo(() => validateDraft(draft), [draft]);
   const node = selection?.kind === "node" ? graph.nodes.find((item) => item.id === selection.id) : null;
   const edge = selection?.kind === "edge" ? graph.edges.find((item) => item.id === selection.id) : null;
+  useEffect(() => {
+    try { localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ draft, savedKey })); }
+    catch { /* La edición sigue disponible en memoria si el navegador no admite almacenamiento local. */ }
+  }, [draft, savedKey]);
   const refresh = useCallback(async () => {
-    const [f, r] = await Promise.all([request(apiBaseUrl, "/flows"), request(apiBaseUrl, "/flow-runs")]);
-    setFlows(f.items || []); setRuns(r.items || []); setLoaded(true);
+    const [f, r, models] = await Promise.all([request(apiBaseUrl, "/flows"), request(apiBaseUrl, "/flow-runs"), request(apiBaseUrl, "/diagnostics/classifier-models")]);
+    setFlows(f.items || []); setRuns(r.items || []); setClassifierModels(models.models || []); setActiveClassifierModelId(models.active_model_id || null); setLoaded(true);
   }, [apiBaseUrl]);
   useEffect(() => { refresh().catch((reason) => setError(reason.message)); }, [refresh]);
   useEffect(() => {
@@ -204,6 +226,7 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
         {["statistical", "statistical_focus", "contextual", "classifier"].includes(node.type) && <label className="fl-check"><input type="checkbox" checked={node.config?.enabled !== false} onChange={(event) => configure({ enabled: event.target.checked })} />Filtro activado</label>}
         {node.type === "statistical" && <><label>Continuos<select value={node.config?.continuous_method || "temporal_quantile_v1"} onChange={(event) => configure({ continuous_method: event.target.value, ...(event.target.value === "residual_ewma_v1" ? { signal_policy: "detection_before_suppression" } : {}) })}><option value="temporal_quantile_v1">Cuantiles temporales</option><option value="residual_ewma_v1">Residuos + EWMA</option></select></label><span className="fl-hint">Los métodos por residuos usan la predicción central actual, normalizan residuos en Desarrollo y calibran un presupuesto empírico de hasta un episodio diario. No son probabilidades ni diagnósticos.</span><label>Umbral de sospecha<input type="number" min="0.01" max="0.99" step="0.01" value={node.config?.suspicion_threshold === null ? "" : node.config?.suspicion_threshold ?? .6} onChange={(event) => configure({ suspicion_threshold: event.target.value === "" ? null : Number(event.target.value) })} /><span className="fl-hint">Este umbral solo controla binarios y multivalóricos; el continuo nuevo se calibra en Desarrollo.</span></label></>}
         {node.type === "statistical_focus" && <><p><strong>Continuos:</strong> FOCuS sobre residuos normalizados</p><span className="fl-hint">Combina FOCuS con canales puntual, energía y constancia. Un aviso puede originarse en cualquiera de ellos; no confirma un tipo de falla.</span></>}
+        {node.type === "classifier" && <label>Modelo<select aria-label="Modelo del clasificador" value={node.config?.model_id || ""} onChange={(event) => configure({ model_id: event.target.value || null })}><option value="">Modelo activo{activeClassifierModelId ? ` · ${activeClassifierModelId.slice(0, 8)}` : " · ninguno"}</option>{classifierModels.map((model) => <option key={model.model_id} value={model.model_id}>{model.method === "gat_lstm" ? "GAT-LSTM" : "Prototipos robustos"} · {model.model_id.slice(0, 8)}{model.active ? " (activo)" : ""}</option>)}</select><span className="fl-hint">La elección queda guardada en este nodo. “Modelo activo” usa el seleccionado en Diagnóstico.</span></label>}
         {node.type === "merge" && <label>Señal de la unión<select value={node.config?.mode || "any"} onChange={(event) => configure({ mode: event.target.value })}><option value="any">Cualquiera positiva (O)</option><option value="all">Todas positivas (Y)</option></select><span className="fl-hint">La evidencia conserva su origen. Una rama no evaluada no cuenta como respaldo.</span></label>}
         {node.type === "decision" && <><Signals legend="Resultado verdadero cuando recibe" value={node.config?.accept || ["positive"]} onChange={(accept) => configure({ accept })} /><p className="fl-hint">Verdadero produce señal positiva; falso, sin señal. Una entrada no evaluable permanece desconocida salvo que la selecciones explícitamente.</p></>}
         {!["input", "output"].includes(node.type) && <button className="fl-danger" onClick={deleteSelection}><Trash2 size={15} />Eliminar nodo y conexiones</button>}

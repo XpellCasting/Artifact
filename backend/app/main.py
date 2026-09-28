@@ -221,7 +221,7 @@ class EstadoAplicacion:
                 96.0,
                 "Preparando el estado causal al final del historico",
             )
-        self._preparar_continuidad_historica()
+        self._preparar_continuidad_historica(progress_callback=progress_callback)
         if progress_callback is not None:
             progress_callback("finalizing", 99.0, "Preparando el estado para la interfaz")
         return self._status_desde_historial(self.historial)
@@ -280,26 +280,14 @@ class EstadoAplicacion:
             elapsed = max(0.0, (completed_epoch or now) - started_epoch)
         payload["elapsed_seconds"] = round(elapsed, 3)
 
-        progress = float(payload.get("progress", 0.0))
-        estimated_total = payload.get("estimated_total_seconds")
-        if payload.get("status") == "completed":
-            payload["eta_seconds"] = 0.0
-        else:
-            dynamic_total = elapsed * 100.0 / progress if progress >= 2.0 else None
-            candidates = [
-                float(value)
-                for value in (estimated_total, dynamic_total)
-                if value is not None
-            ]
-            effective_total = max(candidates) if candidates else None
-            payload["estimated_total_seconds"] = (
-                None if effective_total is None else round(effective_total, 3)
-            )
-            payload["eta_seconds"] = (
-                None
-                if effective_total is None
-                else round(max(0.0, effective_total - elapsed), 3)
-            )
+        end = completed_epoch or now
+        phase_started = payload.pop("_phase_started_epoch", None)
+        last_progress = payload.pop("_last_progress_epoch", None)
+        payload["phase_elapsed_seconds"] = round(max(0.0, end - phase_started), 3) if phase_started else 0.0
+        payload["seconds_since_progress"] = round(max(0.0, end - last_progress), 3) if last_progress else 0.0
+        # Los porcentajes representan etapas, no una fracción del tiempo de cálculo.
+        payload["estimated_total_seconds"] = elapsed if payload.get("status") == "completed" else None
+        payload["eta_seconds"] = 0.0 if payload.get("status") == "completed" else None
         return payload
 
     def _crear_job_carga(
@@ -406,6 +394,11 @@ class EstadoAplicacion:
         with self.history_load_jobs_lock:
             job = self.history_load_jobs.get(job_id)
             if job is not None:
+                now = time()
+                if changes.get("phase", job.get("phase")) != job.get("phase") or "_phase_started_epoch" not in job:
+                    job["_phase_started_epoch"] = now
+                if any(changes.get(key, job.get(key)) != job.get(key) for key in ("phase", "progress", "message")):
+                    job["_last_progress_epoch"] = now
                 job.update(changes)
 
     def _fallar_job_carga(self, job_id: str, exc: Exception) -> None:
@@ -428,7 +421,12 @@ class EstadoAplicacion:
         self._preparar_continuidad_historica()
         return self._status_desde_historial(self.historial)
 
-    def _preparar_continuidad_historica(self) -> None:
+    def _preparar_continuidad_historica(self, progress_callback=None) -> None:
+        def report(phase, progress, message):
+            if progress_callback is not None:
+                progress_callback(phase, progress, message)
+
+        report("causal_identity", 96.0, "Calculando la identidad del histórico")
         self.future_preparation_cache = {"reused": False, "persisted": False}
         if self.historial is None or self.historial.eventos.empty:
             self.future_baseline_template = None
@@ -446,9 +444,10 @@ class EstadoAplicacion:
         self.future_context_events_template = None
         self.future_evaluation_prepared_at = None
         cache_path = self.analysis_cache_path.parent / "causal_preparation.pkl"
+        report("causal_cache", 96.05, "Comprobando la preparación causal guardada")
         key = causal_cache.cache_key(
             identidad, self.historial, self.filtro_contextual.config,
-            self._ruta_mapa_contextual_cache(),
+            self._ruta_cache_contextual(),
         )
         cached = causal_cache.load(cache_path, key)
         if cached is not None:
@@ -459,6 +458,7 @@ class EstadoAplicacion:
             self.mapa_contextual_cache = deepcopy(cached["context_map"])
             self.future_preparation_cache = {"reused": True, "persisted": True}
             return
+        report("baseline_prepare", 96.1, "Preparando eventos para construir la base estadística")
         eventos_capturados = eventos_capturados.copy(deep=True)
         entidades_capturadas = entidades_capturadas.copy(deep=True)
         baseline = MotorReproduccionValidacion(
@@ -466,7 +466,9 @@ class EstadoAplicacion:
         ).construir_baseline(
             eventos_desarrollo=eventos_capturados,
             entidades_desarrollo=entidades_capturadas,
+            progress_callback=lambda phase, progress, message: report(phase, 96.1 + progress * 0.009, message),
         )
+        report("baseline_manifest", 97.0, "Guardando los parámetros de la base estadística")
         parametros = baseline_effective_parameters(baseline)
         source = {
             "name": Path(str(self.historial.metadatos.get("source_path") or "")).name,
@@ -486,7 +488,10 @@ class EstadoAplicacion:
             "effective_parameters_sha256": manifest["effective_parameters_sha256"],
             "manifest_path": str(manifest_path),
         }
-        mapa = self._asegurar_mapa_contextual()
+        mapa = self._asegurar_mapa_contextual(
+            progress_callback=lambda phase, progress, message: report(phase, 97.1 + progress * 0.014, message)
+        )
+        report("causal_snapshot", 98.5, "Preparando el estado y los eventos del final del histórico")
         fin_historico = pd.to_datetime(
             self.historial.metadatos.get("end"), errors="coerce", utc=True
         )
@@ -505,10 +510,11 @@ class EstadoAplicacion:
         self.future_evaluation_prepared_at = datetime.now(
             timezone.utc
         ).isoformat()
+        report("causal_save", 98.8, "Guardando la preparación causal para próximas cargas")
         # La construcción puede actualizar el mapa: guardar su huella definitiva.
         key = causal_cache.cache_key(
             identidad, self.historial, self.filtro_contextual.config,
-            self._ruta_mapa_contextual_cache(),
+            self._ruta_cache_contextual(),
         )
         self.future_preparation_cache["persisted"] = causal_cache.save(cache_path, key, {
             "baseline": self.future_baseline_template,
@@ -1936,7 +1942,9 @@ class EstadoAplicacion:
             mapa=mapa,
         )
 
-    def _asegurar_mapa_contextual(self, force: bool = False) -> dict[str, Any]:
+    def _asegurar_mapa_contextual(self, force: bool = False, progress_callback=None) -> dict[str, Any]:
+        if progress_callback is not None:
+            progress_callback("context_cache", 0.0, "Comprobando el mapa contextual guardado")
         if self.historial is None:
             raise ValueError("Primero debes cargar un historial.")
         previous = self.mapa_contextual_cache or self._leer_mapa_contextual_cache()
@@ -1961,11 +1969,14 @@ class EstadoAplicacion:
             entidades=self.historial.entidades,
             trigger=trigger,
             mapa_anterior=previous,
+            **({"progress_callback": progress_callback} if progress_callback is not None else {}),
         )
         mapa["refresh"]["rebuild_reasons"] = list(
             dict.fromkeys([*reasons, *mapa["refresh"].get("rebuild_reasons", [])])
         )
         self.mapa_contextual_cache = mapa
+        if progress_callback is not None:
+            progress_callback("context_save", 99.0, "Guardando el mapa contextual")
         self._guardar_mapa_contextual_cache(mapa)
         return mapa
 

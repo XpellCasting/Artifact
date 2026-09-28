@@ -7,7 +7,10 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+from ..Calibracion_Contextual import PreparedFeatures, calibrate_relation, calibrate_relations
 
 
 ESTADOS_ACTIVOS = {"on", "open", "home", "active", "detected", "true", "1", "heat", "cool"}
@@ -166,7 +169,9 @@ class FiltroContextualEspacioTemporal:
         return PreparedCausalEvents(self, entidades, eventos)
 
     def implementation_sha256(self) -> str:
-        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        digest = hashlib.sha256(Path(__file__).read_bytes())
+        digest.update((Path(__file__).resolve().parents[1] / "Calibracion_Contextual.py").read_bytes())
+        return digest.hexdigest()
 
     def fingerprint(self, eventos: pd.DataFrame, entidades: pd.DataFrame) -> dict[str, Any]:
         trabajo = self._preparar_eventos(eventos)
@@ -240,25 +245,37 @@ class FiltroContextualEspacioTemporal:
         *,
         trigger: str = "missing_map",
         mapa_anterior: dict[str, Any] | None = None,
+        progress_callback=None,
     ) -> dict[str, Any]:
+        def report(phase, progress, message):
+            if progress_callback is not None:
+                progress_callback(phase, progress, message)
+
+        report("context_prepare", 0.0, "Preparando eventos y particiones del mapa contextual")
         inicio_calculo = perf_counter()
         trabajo = self._preparar_eventos(eventos)
         catalogo = self._catalogo(entidades, trabajo)
         partitions = self._particiones_desarrollo(trabajo)
         ajuste = self._filtrar_particion(trabajo, partitions, "fit")
+        report("context_signals", 5.0, "Construyendo señales por sensor")
         signals, availability, stats, full_index = self._construir_senales(ajuste, catalogo)
         entity_ids = sorted(signals)
+        report("context_timing", 10.0, "Calibrando tiempos de los sensores")
         temporal = self._calibrar_tiempos(ajuste, catalogo)
         resolutions = set(self.config.ventanas())
         grids = {self.config.window_seconds: (signals, availability, stats, full_index)}
         for seconds in sorted(resolutions - grids.keys()):
+            report("context_windows", 15.0, f"Construyendo señales con ventanas de {seconds} segundos")
             grids[seconds] = self._construir_senales(ajuste, catalogo, seconds)
 
         edges: list[dict[str, Any]] = []
+        total_pairs = len(entity_ids) * max(0, len(entity_ids) - 1)
         for source in entity_ids:
             for target in entity_ids:
                 if source == target:
                     continue
+                report("context_pairs", 20.0 + 35.0 * len(edges) / max(1, total_pairs),
+                       f"Comparando {source} → {target} ({len(edges)}/{total_pairs} pares completados)")
                 relation = self._seleccionar_ventana(source, target, catalogo, grids)
                 _, _, pair_stats, _ = grids[relation["window_seconds"]]
                 relation["source_stats"] = pair_stats[source]
@@ -266,16 +283,16 @@ class FiltroContextualEspacioTemporal:
                 relation["max_age_seconds"] = temporal[target]["max_age_seconds"]
                 edges.append(relation)
 
+        report("context_select", 55.0, f"Seleccionando relaciones: {len(edges)}/{total_pairs} pares completados")
         self._aplicar_top_k(edges)
         observaciones = self._indexar_observaciones(trabajo, catalogo)
-        for edge in edges:
-            if (edge.get("accepted") and edge.get("relation_family") == "continuous_continuous"):
-                edge["temporal_models"] = self._calibrar_modelos_temporales(
-                    edge, observaciones, partitions
-                )
+        temporal_edges = [edge for edge in edges if edge.get("accepted") and edge.get("relation_family") == "continuous_continuous"]
+        calibrate_relations(self.config, temporal_edges, observaciones, partitions, report)
+        report("context_decisions", 75.0, "Calibrando decisiones contextuales")
         decision_calibrations = self._calibrar_decisiones_temporales(
-            edges, observaciones, partitions
+            edges, observaciones, partitions, progress_callback=progress_callback
         )
+        report("context_finalize", 95.0, "Construyendo matrices y resumen del mapa contextual")
         # Solo las relaciones utilizables necesitan payload de inferencia y
         # auditoria de candidatos; no multiplicarlo por todos los pares rechazados.
         for edge in edges:
@@ -821,36 +838,7 @@ class FiltroContextualEspacioTemporal:
         return result
 
     def _muestras_modelo_temporal(self, edge, observations, bounds: dict[str, Any]) -> dict[str, pd.DataFrame]:
-        source, target = str(edge["source"]), str(edge["target"])
-        source_events, target_events = observations.get(source), observations.get(target)
-        rows = {name: [] for name in ("level", "innovation", "trend")}
-        if source_events is None or target_events is None or source_events.empty or target_events.empty:
-            return {name: pd.DataFrame(columns=["target", "context", "timestamp"]) for name in rows}
-        start, end = (pd.to_datetime(bounds.get(key), errors="coerce", utc=True) for key in ("start", "end"))
-        if pd.isna(start) or pd.isna(end):
-            return {name: pd.DataFrame(columns=["target", "context", "timestamp"]) for name in rows}
-        candidates = source_events[(source_events.index > start) & (source_events.index <= end)]
-        # Solo la ultima lectura estable de un timestamp puede ser x(t).
-        candidates = candidates[~candidates.index.duplicated(keep="last")]
-        for timestamp, row in candidates.iterrows():
-            if not bool(row.get("is_valid_value")):
-                continue
-            actual = self._numeric_or_none(row.get("value", row.get("state")))
-            if actual is None:
-                continue
-            source_features = self._caracteristicas_continuas(
-                source_events, timestamp, source, window_seconds=int(edge["window_seconds"]),
-                max_age_seconds=edge.get("max_age_seconds"), current_value=actual, partition_start=start,
-            )
-            target_features = self._caracteristicas_continuas(
-                target_events, timestamp - pd.Timedelta(seconds=int(edge.get("lag_seconds", 0))), target,
-                window_seconds=int(edge["window_seconds"]), max_age_seconds=edge.get("max_age_seconds"), partition_start=start,
-            )
-            for name in rows:
-                response, predictor = source_features.get(name), target_features.get(name)
-                if response is not None and predictor is not None:
-                    rows[name].append({"timestamp": timestamp, "target": response, "context": predictor})
-        return {name: pd.DataFrame(values, columns=["timestamp", "target", "context"]) for name, values in rows.items()}
+        return PreparedFeatures(observations, self.config).samples(edge, bounds)
 
     def _ajustar_modelo_temporal(self, feature: str, fit: pd.DataFrame, tolerance: pd.DataFrame) -> dict[str, Any]:
         metadata = {"feature": feature, "fit_observations": int(len(fit)), "tolerance_observations": int(len(tolerance))}
@@ -872,29 +860,53 @@ class FiltroContextualEspacioTemporal:
                 "context_min": float(fit["context"].min()), "context_max": float(fit["context"].max())}
 
     def _calibrar_modelos_temporales(self, edge, observations, partitions) -> dict[str, Any]:
-        fit = self._muestras_modelo_temporal(edge, observations, partitions["fit"])
-        tolerance = self._muestras_modelo_temporal(edge, observations, partitions["tolerance"])
-        models = {name: self._ajustar_modelo_temporal(name, fit[name], tolerance[name])
-                  for name in ("level", "innovation", "trend")}
-        return {"partitioning": partitions, "models": models,
-                "sample_counts": {name: {"fit": len(fit[name]), "tolerance": len(tolerance[name])} for name in models}}
+        return calibrate_relation(self, edge, partitions, PreparedFeatures(observations, self.config))
 
-    def _calibrar_decisiones_temporales(self, edges, observations, partitions) -> dict[str, Any]:
+    def _calibrar_decisiones_temporales(self, edges, observations, partitions, progress_callback=None) -> dict[str, Any]:
         by_source: dict[str, list[dict[str, Any]]] = {}
         for edge in edges:
             if edge.get("accepted") and edge.get("relation_family") == "continuous_continuous":
                 by_source.setdefault(str(edge["source"]), []).append(edge)
         results: dict[str, Any] = {}
-        for source, source_edges in by_source.items():
+        for source_index, (source, source_edges) in enumerate(by_source.items()):
+            if progress_callback is not None:
+                progress_callback("context_decisions", 75.0 + 20.0 * source_index / max(1, len(by_source)),
+                                  f"Calibrando decisiones: {source} ({source_index}/{len(by_source)} sensores completados)")
             events = observations.get(source)
             bounds = partitions["decision"]
             start, end = (pd.to_datetime(bounds.get(key), errors="coerce", utc=True) for key in ("start", "end"))
             groups: dict[str, list[dict[str, Any]]] = {}
             if events is not None and not pd.isna(start) and not pd.isna(end):
                 candidates = events[(events.index > start) & (events.index <= end)]
-                for timestamp, row in candidates[~candidates.index.duplicated(keep="last")].iterrows():
+                candidates = candidates[~candidates.index.duplicated(keep="last")]
+                prepared = PreparedFeatures(observations, self.config)
+                values = pd.to_numeric(candidates.get("value", candidates.get("state")), errors="coerce").to_numpy(dtype=float, na_value=np.nan).copy()
+                values[~candidates["is_valid_value"].to_numpy(dtype=bool)] = np.nan
+                tables = {}
+                for edge_index, edge in enumerate(source_edges):
+                    window = int(edge.get("window_seconds") or self.config.window_seconds)
+                    for feature_index, (entity, explicit, lag) in enumerate(((source, True, 0), (str(edge["target"]), False, int(edge.get("lag_seconds", 0))))):
+                        key = (entity, window, explicit, lag, edge.get("max_age_seconds"))
+                        if key not in tables and entity in observations:
+                            def report_features(done, total):
+                                if progress_callback is not None:
+                                    progress_callback("context_decisions", 75.0 + 20.0 * (source_index + .5 * (edge_index + .5 * (feature_index + done / max(1, total))) / max(1, len(source_edges))) / max(1, len(by_source)),
+                                        f"Preparando decisiones de {source}: {entity}, {done}/{total} eventos")
+                            tables[key] = prepared.features(entity, candidates.index - pd.Timedelta(seconds=lag), window,
+                                edge.get("max_age_seconds"), start, values if explicit else None, report_features)
+                for row_index, (timestamp, row) in enumerate(candidates.iterrows()):
+                    def feature_provider(events, reference, entity_id, **kwargs):
+                        explicit = "current_value" in kwargs
+                        lag = 0 if explicit else int((timestamp - reference).total_seconds())
+                        key = (entity_id, kwargs["window_seconds"], explicit, lag, kwargs.get("max_age_seconds"))
+                        return {family: None if np.isnan(value) else float(value)
+                                for family, value in zip(("level", "innovation", "trend"), tables[key][row_index])}
+
+                    if progress_callback is not None and row_index % 100 == 0:
+                        progress_callback("context_decisions", 75.0 + 20.0 * (source_index + .5 + .5 * row_index / max(1, len(candidates))) / max(1, len(by_source)),
+                                          f"Calibrando decisiones: {source} — {row_index}/{len(candidates)} eventos; {source_index}/{len(by_source)} sensores completados")
                     actual = self._numeric_or_none(row.get("value", row.get("state"))) if bool(row.get("is_valid_value")) else None
-                    scores = self._puntajes_familiares(source, timestamp, actual, source_edges, observations, partition_start=start)
+                    scores = self._puntajes_familiares(source, timestamp, actual, source_edges, observations, partition_start=start, feature_provider=feature_provider)
                     families = scores["available_families"]
                     if families:
                         key = "+".join(families)
@@ -1256,7 +1268,7 @@ class FiltroContextualEspacioTemporal:
             "accepted": accepted_values,
         }
 
-    def _puntajes_familiares(self, source, timestamp, current_value, edges, observations, *, partition_start=None):
+    def _puntajes_familiares(self, source, timestamp, current_value, edges, observations, *, partition_start=None, feature_provider=None):
         families = ("level", "innovation", "trend")
         source_events = observations.get(source)
         family_rows = {name: [] for name in families}
@@ -1264,6 +1276,7 @@ class FiltroContextualEspacioTemporal:
         total_weights = {name: 0.0 for name in families}
         evaluated_weights = {name: 0.0 for name in families}
         source_feature_cache: dict[int, dict[str, Any]] = {}
+        features = feature_provider or self._caracteristicas_continuas
         for edge in edges:
             weight = abs(float(edge.get("association_signed", 0.0))) * float(edge.get("stability_score", 0.0))
             model_bundle = edge.get("temporal_models", {}).get("models", {})
@@ -1273,13 +1286,13 @@ class FiltroContextualEspacioTemporal:
                 continue
             window = int(edge.get("window_seconds") or self.config.window_seconds)
             if window not in source_feature_cache:
-                source_feature_cache[window] = self._caracteristicas_continuas(
+                source_feature_cache[window] = features(
                     source_events, timestamp, source, window_seconds=window,
                     max_age_seconds=edge.get("max_age_seconds"), current_value=current_value,
                     partition_start=partition_start,
                 )
             source_features = source_feature_cache[window]
-            target_features = self._caracteristicas_continuas(
+            target_features = features(
                 target_events, timestamp - pd.Timedelta(seconds=int(edge.get("lag_seconds", 0))), target,
                 window_seconds=window, max_age_seconds=edge.get("max_age_seconds"), partition_start=partition_start,
             )

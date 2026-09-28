@@ -90,9 +90,12 @@ class DiagnosticRunSession:
     It removes repeated snapshot reads, reference parsing and SQLite commits from
     the timestamp-group hot path.  The caller owns the session and must flush it.
     """
-    def __init__(self, workbench, source, run_id):
+    def __init__(self, workbench, source, run_id, model_id=None):
         self.workbench, self.source, self.run_id = workbench, source, run_id
-        self.snapshot = workbench._run_snapshot(source, run_id)
+        snapshot_loader = getattr(workbench, "_run_snapshot_for_model", workbench._run_snapshot)
+        self.snapshot = (snapshot_loader(source, run_id, model_id=model_id)
+                        if model_id is not None and hasattr(workbench, "_run_snapshot_for_model")
+                        else snapshot_loader(source, run_id))
         self.gat_snapshot = None
         if self.snapshot.get("model", {}).get("method") == "gat_lstm":
             from .GAT_LSTM.runtime import load_snapshot
@@ -283,8 +286,12 @@ class DiagnosticWorkbench:
 
     def sources(self, gat_only=False):
         manifest_path = historical_manifest_path()
-        training = [{key: value for key, value in item.items() if key != "path"}
+        # A missing optional history manifest should not make the source-list
+        # endpoint fail. Review datasets can still be displayed and the UI can
+        # explain that no canonical Development history is currently available.
+        training = ([{key: value for key, value in item.items() if key != "path"}
                     for item in development_sources(manifest_path, self.review)]
+                    if manifest_path.exists() else [])
         if gat_only:
             hashes = {item["sha256"] for item in training}
             annotations = development_annotations(self.review, hashes)
@@ -1038,13 +1045,16 @@ class DiagnosticWorkbench:
             raise
 
     def _run_snapshot(self, source, run_id):
-        key = f"{source}:{run_id}"
+        return self._run_snapshot_for_model(source, run_id, None)
+
+    def _run_snapshot_for_model(self, source, run_id, model_id=None):
+        key = f"{source}:{run_id}" if model_id is None else f"{source}:{run_id}:{model_id}"
         with self.lock, self._connect() as connection:
             existing = connection.execute("SELECT payload FROM runs WHERE run_id=?", (key,)).fetchone()
             if existing:
                 return json.loads(existing[0])
-            active = self._active()
-            trained = self._read("models", active) if active else None
+            selected = model_id or self._active()
+            trained = self._read("models", selected) if selected else None
             references = ([self._read("references", identifier) for identifier in trained.get("reference_ids", [])]
                           if trained and trained.get("method") != "gat_lstm"
                           else [] if trained else [ref for ref in self._list("references") if ref["partition"] == "development"])
@@ -1052,15 +1062,26 @@ class DiagnosticWorkbench:
             connection.execute("INSERT INTO runs VALUES (?,?)", (key, _canonical(snapshot)))
             return snapshot
 
-    def window_seconds_for_run(self, source, run_id):
-        snapshot = self._run_snapshot(source, run_id)
+    def window_seconds_for_run(self, source, run_id, model_id=None):
+        snapshot = self._run_snapshot_for_model(source, run_id, model_id)
         if snapshot.get("model", {}).get("method") == "gat_lstm":
             config = snapshot["model"]["config"]
             return (config["sequence_steps"] - 1) * config["grid_seconds"] + config["feature_window_seconds"]
         return snapshot["model"]["window_seconds"] if snapshot["model"] else 3600
 
-    def create_run_session(self, source, run_id):
-        return DiagnosticRunSession(self, source, run_id)
+    def create_run_session(self, source, run_id, model_id=None):
+        return DiagnosticRunSession(self, source, run_id, model_id=model_id)
+
+    def classifier_models(self):
+        active = self._active()
+        models = []
+        for path in (self.directory / "models").glob("*.json"):
+            model = _read_json(path)
+            models.append({key: model.get(key) for key in
+                           ("model_id", "method", "created_at", "validated", "exploratory", "window_seconds")})
+            models[-1]["active"] = models[-1]["model_id"] == active
+        return {"active_model_id": active,
+                "models": sorted(models, key=lambda item: item.get("created_at") or "", reverse=True)}
 
     def _enrich_gat_contextual(self, statistical_results, contextual_results, events,
                                source, run_id, session, snapshot):
@@ -1290,6 +1311,10 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
     @router.get("/status")
     def status():
         return translate(workbench.status)
+
+    @router.get("/classifier-models")
+    def classifier_models():
+        return translate(workbench.classifier_models)
 
     @router.get("/sources")
     def sources(method: Literal["robust_nearest_prototype", "gat_lstm"] | None = Query(None)):

@@ -124,6 +124,8 @@ def validate_flow(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         if "enabled" in config and not isinstance(config["enabled"], bool):
             errors.append("La activación de un nodo debe ser booleana.")
+        if node["type"] == "classifier" and config.get("model_id") is not None and (not isinstance(config["model_id"], str) or not config["model_id"].strip()):
+            errors.append("El modelo del clasificador debe ser un identificador válido o quedar sin seleccionar.")
         if node["type"] in {"statistical", "statistical_focus"}:
             threshold = config.get("suspicion_threshold", .6)
             if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or not .01 <= threshold <= .99:

@@ -1,13 +1,15 @@
 services:
   api:
-    mem_limit: 4g
-    memswap_limit: 4g
+    mem_limit: 10g
+    memswap_limit: 10g
     build:
       context: ./backend
       args:
         INSTALL_GAT: "1"
     environment:
       MULTISTATE_FIXTURE_DIR: /app/fixtures
+      HISTORY_TRAINING_WORKERS: ${HISTORY_TRAINING_WORKERS:-4}
+      CONTEXT_CALIBRATION_WORKERS: ${CONTEXT_CALIBRATION_WORKERS:-4}
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
       GAT_SEQUENCE_CACHE_DIR: /app/gat_sequence_cache

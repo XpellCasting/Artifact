@@ -8,6 +8,8 @@ from copy import deepcopy
 
 import pandas as pd
 
+from .Entrenamiento_Paralelo import train_sensors
+
 from .Filtro_Estadistico.Continuos import (
     DETALLE_INDICADOR as DETALLE_CONTINUO,
     INDICADORES_CONTINUOS,
@@ -18,7 +20,7 @@ from .Filtro_Estadistico.Continuos_Temporales import (
 )
 from .Filtro_Estadistico.Residuos_Secuenciales import (
     RESIDUAL_METHODS, RESIDUAL_EWMA_METHOD, RESIDUAL_FOCUS_METHOD,
-    prepare_sensor, update_channels,
+    update_channels,
 )
 from .Filtro_Estadistico.Estados_Binarios import (
     DETALLE_INDICADOR as DETALLE_BINARIO,
@@ -49,7 +51,22 @@ class MotorReproduccionValidacion:
         entidades_desarrollo: pd.DataFrame,
         entidades_objetivo: set[str] | None = None,
         continuous_method: str = CONTINUOUS_METHOD,
+        progress_callback=None,
     ) -> dict[str, Any]:
+        def report(phase, progress, message):
+            if progress_callback is not None:
+                progress_callback(phase, progress, message)
+
+        def groups(kind, phase, label, start, span):
+            grouped = trabajo[trabajo["sensor_kind"].eq(kind)].groupby("entity_id", sort=False)
+            total = len(grouped)
+            for index, (entity_id, group) in enumerate(grouped):
+                report(phase, start + span * index / max(1, total),
+                       f"{label}: {entity_id} ({index}/{total} sensores completados)")
+                yield entity_id, group
+            report(phase, start + span, f"{label}: {total}/{total} sensores completados")
+
+        report("baseline_prepare", 0.0, "Ordenando eventos de la base estadística")
         if continuous_method not in {CONTINUOUS_METHOD, *RESIDUAL_METHODS}:
             raise ValueError(f"Método continuo desconocido: {continuous_method}")
         if eventos_desarrollo.empty or "sensor_kind" not in eventos_desarrollo.columns:
@@ -79,9 +96,7 @@ class MotorReproduccionValidacion:
             "last_emitted": {},
         }
 
-        for entity_id, grupo in trabajo[
-            trabajo["sensor_kind"].eq("continuous")
-        ].groupby("entity_id", sort=False):
+        for entity_id, grupo in groups("continuous", "baseline_continuous", "Calculando normalidad continua", 5, 20):
             serie = grupo.sort_values("timestamp_dt").copy()
             if "is_valid_value" in serie.columns:
                 serie = serie[serie["is_valid_value"].astype(bool)].copy()
@@ -116,15 +131,17 @@ class MotorReproduccionValidacion:
 
         temporal_models: dict[str, Any] = {}
         temporal_entries: dict[str, Any] = {}
-        for entity_id, grupo in trabajo[trabajo["sensor_kind"].eq("continuous")].groupby("entity_id", sort=False):
+        continuous_groups = trabajo[trabajo["sensor_kind"].eq("continuous")].groupby("entity_id", sort=False)
+        for entity_id, learned, runtime in train_sensors(
+            self.filtro.continuos_temporales, continuous_groups, continuous_method,
+            lambda progress, message: report("baseline_training", 25 + progress * .45, message),
+        ):
             if continuous_method in RESIDUAL_METHODS:
-                learned = prepare_sensor(self.filtro.continuos_temporales, grupo, str(entity_id), continuous_method)
                 learned["constant_base"] = (baseline["continuous"].get(str(entity_id)) or {}).get("base")
                 temporal_models[str(entity_id)] = {key: value for key, value in learned.items() if key not in {"predictor", "runtime"}}
                 if learned.get("eligible"):
                     temporal_entries[str(entity_id)] = learned
                 continue
-            learned = self.filtro.continuos_temporales.train_sensor(grupo, str(entity_id))
             temporal_models[str(entity_id)] = learned
             if isinstance(learned, TemporalSensorModel):
                 constant_reference = baseline["continuous"].get(str(entity_id))
@@ -132,18 +149,19 @@ class MotorReproduccionValidacion:
                     "model": learned,
                     "metadata": dict(learned.metadata),
                     "runtime": {
-                        **self.filtro.continuos_temporales.runtime(grupo),
+                        **runtime,
                         "constant_state": self.filtro.continuos._estado_constancia_vacio(),
                         "last_timestamp": None,
                     },
                     "constant_base": None if constant_reference is None else constant_reference.get("base"),
                 }
+        # El orden de finalización de los procesos no cambia el orden del baseline.
+        temporal_entries = dict(sorted(temporal_entries.items()))
+        temporal_models = dict(sorted(temporal_models.items()))
         baseline["continuous"] = temporal_entries
         baseline["continuous_model_manifest"] = serializable_manifest(temporal_models) if continuous_method == CONTINUOUS_METHOD else temporal_models
 
-        for entity_id, grupo in trabajo[
-            trabajo["sensor_kind"].eq("binary")
-        ].groupby("entity_id", sort=False):
+        for entity_id, grupo in groups("binary", "baseline_binary", "Preparando sensores binarios", 70, 10):
             serie = grupo.sort_values("timestamp_dt").copy()
             if "is_valid_value" in serie.columns:
                 serie = serie[serie["is_valid_value"].astype(bool)].copy()
@@ -177,9 +195,7 @@ class MotorReproduccionValidacion:
             }
 
         multivalor = self.filtro.multivalor
-        for entity_id, grupo in trabajo[
-            trabajo["sensor_kind"].eq("multistate")
-        ].groupby("entity_id", sort=False):
+        for entity_id, grupo in groups("multistate", "baseline_multistate", "Preparando sensores multivalor", 80, 10):
             serie = multivalor._serie_valida(grupo)
             diagnostico = multivalor._diagnosticar(str(entity_id), grupo, serie)
             if diagnostico["status"] != "eligible":
@@ -216,6 +232,7 @@ class MotorReproduccionValidacion:
                 },
             }
 
+        report("baseline_hourly", 90.0, "Calculando referencias horarias y excursiones repetidas")
         trabajo["hour"] = trabajo["timestamp_dt"].dt.hour
         baseline["context"] = {
             "continuous": self.filtro._baseline_horario_continuo(trabajo),
@@ -229,6 +246,7 @@ class MotorReproduccionValidacion:
             "binary": len(baseline["binary"]),
             "multistate": len(baseline["multistate"]),
         }
+        report("baseline_ready", 100.0, "Base estadística preparada")
         return baseline
 
     def analizar_lote(

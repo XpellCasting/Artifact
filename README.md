@@ -78,3 +78,40 @@ cd ../frontend
 npm ci
 npm run build
 ```
+
+### Paralelismo del histórico
+
+El servicio `api` configura `HISTORY_TRAINING_WORKERS=4`: entrena hasta cuatro
+sensores continuos simultáneamente, con un hilo numérico por proceso hijo.
+La cola mantiene como máximo un sensor por proceso para acotar las copias en
+memoria. La interfaz muestra los sensores en curso y los completados.
+Con `HISTORY_TRAINING_WORKERS=1` se usa ejecución secuencial (también es el valor
+predeterminado fuera de Compose).
+
+`CONTEXT_CALIBRATION_WORKERS=4` calibra las relaciones continuas del mapa en
+hasta cuatro procesos, con un hilo numérico por proceso. Las relaciones del
+mismo sensor de origen se agrupan para reutilizar características. Solo se envían
+los sensores necesarios a cada proceso, con un máximo de cuatro grupos en curso.
+La extracción usa bloques de 2.048 consultas y una caché de características de
+hasta 64 MiB por grupo. La calibración de decisiones también usa características
+por bloques, manteniendo su ejecución secuencial. La búsqueda inicial de pares
+sigue siendo secuencial.
+
+El progreso contextual muestra relaciones completadas, partición de ajuste o
+tolerancia y eventos procesados. `CONTEXT_CALIBRATION_WORKERS=1` permite calibrar
+sin procesos hijos (valor predeterminado fuera de Compose).
+
+Los cambios requieren reconstruir y recrear el API; una carga que ya está en
+curso conserva el código anterior. Cambiar la implementación invalida las cachés
+contextual y causal para evitar reutilizar resultados de otra versión.
+
+Medición local de la calibración presión relativa → temperatura interior:
+111.274 y 73.594 registros respectivamente, ventana de 300 s y desfase de 0 s.
+En una ejecución aislada por versión, con un hilo numérico, la implementación
+escalar tardó 210,0 s y la extracción por bloques 6,4 s (32,8×). Los modelos,
+umbrales y cantidades de muestras coincidieron exactamente; el pico de RSS
+observado fue de unos 167 MiB por proceso en ambas ejecuciones. Esta medición
+corresponde únicamente a esa relación y no estima la duración del histórico
+completo ni la memoria conjunta de cuatro procesos. Las pruebas de regresión
+están en `backend/tests/test_contextual_calibration.py`, con la implementación
+escalar de referencia en `backend/tests/contextual_reference.py`.

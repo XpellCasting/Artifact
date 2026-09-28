@@ -149,7 +149,13 @@ class CausalFlowRunner(FlowRunner):
         if hasattr(self.diagnostic, "_run_snapshot"):
             for node in flow["nodes"]:
                 if node["type"] == "classifier" and node.get("config", {}).get("enabled") is not False:
-                    diagnostic_snapshots[node["id"]] = self.diagnostic._run_snapshot("flow_evaluation", f"{self.execution_id}:{node['id']}")
+                    model_id = node.get("config", {}).get("model_id")
+                    snapshot_fn = (self.diagnostic._run_snapshot_for_model
+                                   if hasattr(self.diagnostic, "_run_snapshot_for_model") else self.diagnostic._run_snapshot)
+                    args = ("flow_evaluation", f"{self.execution_id}:{node['id']}")
+                    diagnostic_snapshots[node["id"]] = (snapshot_fn(*args, model_id=model_id)
+                                                         if model_id and hasattr(self.diagnostic, "_run_snapshot_for_model")
+                                                         else snapshot_fn(*args))
         statistical_nodes = [n for n in flow["nodes"] if n["type"] in {"statistical", "statistical_focus"} and n.get("config", {}).get("enabled") is not False]
         motor = MotorReproduccionValidacion(self.statistical)
         # Models may be shared internally, but each node receives an independent runtime.
@@ -220,7 +226,9 @@ class CausalFlowRunner(FlowRunner):
             for node in flow["nodes"]:
                 if (available is not None and node["type"] == "classifier"
                         and node.get("config", {}).get("enabled") is not False):
-                    session = self.diagnostic.create_run_session("flow_evaluation", f"{self.execution_id}:{node['id']}")
+                    model_id = node.get("config", {}).get("model_id")
+                    session = (self.diagnostic.create_run_session("flow_evaluation", f"{self.execution_id}:{node['id']}", model_id=model_id)
+                              if model_id else self.diagnostic.create_run_session("flow_evaluation", f"{self.execution_id}:{node['id']}"))
                     session.add_events(available)
                     self.diagnostic_sessions[node["id"]] = session
         if contextual_nodes:

@@ -2205,7 +2205,7 @@ function HistoryLoadProgress({ job }) {
     >
       <div className="history-load-heading">
         <span>{ready ? "Historico listo" : failed ? "Carga fallida" : historyLoadPhaseLabel(job?.phase)}</span>
-        <strong>{Math.round(progress)}%</strong>
+        <strong>{Number(progress.toFixed(1))}%</strong>
       </div>
       <div
         className="progress-track"
@@ -2218,9 +2218,12 @@ function HistoryLoadProgress({ job }) {
         <span style={{ width: `${progress}%` }} />
       </div>
       <p>{job?.error || job?.message || "Preparando carga"}</p>
+      {!ready && !failed && <small>El porcentaje indica etapas completadas; cada etapa puede tardar un tiempo diferente.</small>}
       <div className="history-load-meta">
         <span>Transcurrido: {formatDuration(job?.elapsed_seconds)}</span>
-        <span>Restante: {ready ? "0 s" : formatDuration(job?.eta_seconds, "estimando")}</span>
+        <span>En esta fase: {formatDuration(job?.phase_elapsed_seconds)}</span>
+        <span>Último avance hace: {formatDuration(job?.seconds_since_progress)}</span>
+        <span>Restante: {ready ? "0 s" : formatDuration(job?.eta_seconds, "sin estimación fiable")}</span>
         <span>Archivo: {formatBytes(job?.file_size_bytes)}</span>
       </div>
     </section>
@@ -3390,6 +3393,30 @@ function historyLoadPhaseLabel(phase) {
     history_ready: "Historico normalizado",
     resetting_state: "Reiniciando estado",
     persisting_normality: "Persistiendo normalidad",
+    preparing_future_evaluation: "Preparando estado causal",
+    causal_identity: "Identificando histórico",
+    causal_cache: "Comprobando preparación guardada",
+    baseline_prepare: "Ordenando base estadística",
+    baseline_continuous: "Calculando normalidad continua",
+    baseline_training: "Entrenando modelos por sensor",
+    baseline_binary: "Preparando sensores binarios",
+    baseline_multistate: "Preparando sensores multivalor",
+    baseline_hourly: "Calculando referencias horarias",
+    baseline_ready: "Base estadística preparada",
+    baseline_manifest: "Guardando parámetros estadísticos",
+    context_cache: "Comprobando mapa contextual",
+    context_prepare: "Preparando contexto",
+    context_signals: "Construyendo señales",
+    context_timing: "Calibrando tiempos",
+    context_windows: "Construyendo ventanas",
+    context_pairs: "Comparando pares de sensores",
+    context_select: "Seleccionando relaciones",
+    context_models: "Calibrando modelos contextuales",
+    context_decisions: "Calibrando decisiones contextuales",
+    context_finalize: "Finalizando mapa contextual",
+    context_save: "Guardando mapa contextual",
+    causal_snapshot: "Preparando estado final",
+    causal_save: "Guardando preparación causal",
     finalizing: "Finalizando carga",
     building_timeline: "Preparando visualizacion",
     ready: "Historico listo",
