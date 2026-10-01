@@ -3,20 +3,20 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'Artifact/backend'))
-from app.Cargar_Historial.Cargar_Historial import CargadorHistorial
-from app.Filtro_Contextual import FiltroContextualEspacioTemporal
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'backend'))
+from app.services.historial.cargar_historial import CargadorHistorial
+from app.modulos.contextual import FiltroContextualEspacioTemporal
 
 
 def main():
-    path = ROOT / 'Artifact/data/cache/contextual_map.json'
+    path = ROOT / 'storage/cache/contextual_map.json'
     previous = json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
-    history = CargadorHistorial().cargar_real(ROOT / 'Artifact/HistoricosEnUso/historico_desarrollo.csv')
+    history = CargadorHistorial().cargar_real(ROOT / 'data/history/historico_desarrollo.csv')
     filtro = FiltroContextualEspacioTemporal()
     mapa = filtro.construir_mapa(history.eventos, history.entidades,
                                  trigger='window_selection_upgrade', mapa_anterior=previous)
-    output = ROOT / 'outputs/analisis_temperaturas'
+    output = ROOT / 'storage/cache/analisis_temperaturas'
     output.mkdir(parents=True, exist_ok=True)
     backup = output / 'contextual_map_antes_v3.json'
     if previous and not backup.exists():

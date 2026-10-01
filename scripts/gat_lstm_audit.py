@@ -5,8 +5,8 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
-from app.GAT_LSTM.audit import audit_sources
-from app.GAT_LSTM.config import Config
+from app.services.auditoria import audit_sources
+from app.modulos.clasificador.config import Config
 
 
 def main():

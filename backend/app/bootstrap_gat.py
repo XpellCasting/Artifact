@@ -1,4 +1,5 @@
 """Restaura el paquete GAT-LSTM de Git LFS sin reconstruir ni entrenar."""
+from app.config import ARTIFACT_ROOT, MODELS_DIR, artifact_file, artifact_directory
 import argparse
 import hashlib
 import json
@@ -14,9 +15,9 @@ def digest(path):
 
 
 def relocate_dataset(destination, dataset_id):
-    path = destination / 'datasets' / f'{dataset_id}.json'
+    path = artifact_directory(destination, 'datasets') / f'{dataset_id}.json'
     dataset = json.loads(path.read_text(encoding='utf-8'))
-    sequences = (destination / 'sequences' / dataset_id).resolve()
+    sequences = (artifact_directory(destination, 'sequences') / dataset_id).resolve()
     if not Path(dataset['sequence_dir']).is_dir() and sequences.is_dir():
         dataset['sequence_dir'] = str(sequences)
         temporary = path.with_suffix('.json.restore.tmp')
@@ -32,12 +33,12 @@ def restore(bundle: Path, destination: Path):
         relative = PurePosixPath(name)
         if relative.is_absolute() or '..' in relative.parts or '\\' in name or ':' in name:
             raise ValueError(f'Ruta invalida en el paquete: {name}')
-        target = (destination / name).resolve()
-        if not target.is_relative_to(destination.resolve()):
+        target = (artifact_file(destination, name)).resolve()
+        if not target.is_relative_to(artifact_directory(destination, relative.parts[0]).resolve() if len(relative.parts) > 1 else destination.resolve()):
             raise ValueError(f'Ruta fuera del destino: {name}')
         inventory[name] = entry
     # Existing installations retain their datasets, models and activation choice.
-    missing = {name for name in inventory if not (destination / name).is_file()}
+    missing = {name for name in inventory if not (artifact_file(destination, name)).is_file()}
     if not missing:
         relocate_dataset(destination, manifest['dataset_id'])
         return
@@ -55,7 +56,7 @@ def restore(bundle: Path, destination: Path):
             entry = inventory[member.name]
             if member.size != entry['size']:
                 raise ValueError(f'Tamano incorrecto: {member.name}')
-            target = destination / member.name
+            target = artifact_file(destination, member.name)
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_name(target.name + '.restore.tmp')
             try:
@@ -74,11 +75,10 @@ def restore(bundle: Path, destination: Path):
 
 
 def main():
-    root = Path(__file__).resolve().parents[2]
+    root = ARTIFACT_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bundle', type=Path, default=root / 'artifacts/gat_lstm')
-    parser.add_argument('--destination', type=Path, default=Path(
-        os.environ.get('REVIEW_DATA_DIR', str(root / 'data/review'))) / 'diagnostics')
+    parser.add_argument('--destination', type=Path, default=MODELS_DIR)
     parser.add_argument('--serve', action='store_true')
     args = parser.parse_args()
     restore(args.bundle, args.destination)

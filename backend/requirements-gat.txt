@@ -1,2 +1,4 @@
 # Optional CPU neural engine for the local backend and Docker image.
 torch==2.14.0
+torch-geometric==2.8.0.post1
+tzdata==2025.2

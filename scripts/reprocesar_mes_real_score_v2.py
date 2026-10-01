@@ -1,7 +1,7 @@
 """Reprocesa el mes real y resume el puntaje continuo v2.
 
 No carga ni crea el historial canonico/simulado. La ejecucion usa
-``HistoricosEnUso/cargados/history.csv`` y actualiza la cache normal de la aplicacion.
+``data/history/cargados/history.csv`` y actualiza la cache normal de la aplicacion.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import sys
 ARTIFACT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ARTIFACT_ROOT / "backend"))
 
-from app.main import state  # noqa: E402
+from app.services.runtime import state
 
 
 def construir_resumen(

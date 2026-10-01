@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.vite/
 .venv/
 venv/
 node_modules/
@@ -42,6 +43,21 @@ Thumbs.db
 !/data/fixtures/.gitkeep
 /data/review/*
 !/data/review/.gitkeep
+!/data/defaults/
+
+# Estado local organizado; los pesos publicados siguen en artifacts/gat_lstm.
+/models/*
+!/models/.gitkeep
+/storage/*
+!/storage/database/
+!/storage/cache/
+!/storage/jobs/
+/storage/database/*
+!/storage/database/.gitkeep
+/storage/cache/*
+!/storage/cache/.gitkeep
+/storage/jobs/*
+!/storage/jobs/.gitkeep
 
 # Material de investigacion, respaldos y recursos no usados
 /docs/

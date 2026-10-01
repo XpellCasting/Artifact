@@ -1,0 +1,634 @@
+from __future__ import annotations
+
+from collections import Counter, deque
+import math
+from time import perf_counter
+from typing import Any
+from copy import deepcopy
+
+import pandas as pd
+
+from app.services.entrenamiento_paralelo import train_sensors
+
+from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_FOCUS_METHOD as CONTINUOUS_METHOD
+from app.modulos.estadistico.continuos_temporales import causal_features
+from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_METHODS
+from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_FOCUS_METHOD
+from app.modulos.estadistico.residuos_secuenciales import update_channels
+from app.modulos.estadistico.estados_binarios import DETALLE_INDICADOR as DETALLE_BINARIO
+from app.modulos.estadistico.estados_binarios import INDICADORES_BINARIOS
+from app.modulos.estadistico.estados_multivalor import DETALLE_INDICADOR as DETALLE_MULTIVALOR
+from app.modulos.estadistico.estados_multivalor import INDICADORES_MULTIESTADO
+
+
+class MotorReproduccionValidacion:
+    """Evalua lotes cronologicos contra una base fija de Desarrollo.
+
+    El motor no genera eventos. Mantiene solamente el estado causal necesario
+    entre lotes para que cada lectura de Validacion se evalue sin observar filas
+    futuras del mismo archivo.
+    """
+
+    VERSION = "validation-focus-replay-v2"
+
+    def __init__(self, filtro_estadistico: Any) -> None:
+        self.filtro = filtro_estadistico
+
+    def construir_baseline(
+        self,
+        eventos_desarrollo: pd.DataFrame,
+        entidades_desarrollo: pd.DataFrame,
+        entidades_objetivo: set[str] | None = None,
+        continuous_method: str = CONTINUOUS_METHOD,
+        progress_callback=None,
+    ) -> dict[str, Any]:
+        def report(phase, progress, message):
+            if progress_callback is not None:
+                progress_callback(phase, progress, message)
+
+        def groups(kind, phase, label, start, span):
+            grouped = trabajo[trabajo["sensor_kind"].eq(kind)].groupby("entity_id", sort=False)
+            total = len(grouped)
+            for index, (entity_id, group) in enumerate(grouped):
+                report(phase, start + span * index / max(1, total),
+                       f"{label}: {entity_id} ({index}/{total} sensores completados)")
+                yield entity_id, group
+            report(phase, start + span, f"{label}: {total}/{total} sensores completados")
+
+        report("baseline_prepare", 0.0, "Ordenando eventos de la base estadística")
+        if continuous_method not in RESIDUAL_METHODS:
+            raise ValueError(f"Método continuo desconocido: {continuous_method}")
+        if eventos_desarrollo.empty or "sensor_kind" not in eventos_desarrollo.columns:
+            raise ValueError("Desarrollo no contiene eventos normalizados para construir la base.")
+        trabajo = eventos_desarrollo.copy()
+        trabajo["__baseline_order"] = range(len(trabajo))
+        trabajo["timestamp_dt"] = pd.to_datetime(
+            trabajo["timestamp_dt"], errors="coerce", utc=True
+        )
+        if entidades_objetivo:
+            trabajo = trabajo[trabajo["entity_id"].isin(entidades_objetivo)].copy()
+        trabajo = trabajo.sort_values(
+            ["entity_id", "timestamp_dt", "__baseline_order"], kind="stable"
+        ).drop(columns=["__baseline_order"])
+        lookup = (
+            entidades_desarrollo.set_index("entity_id").to_dict("index")
+            if not entidades_desarrollo.empty
+            else {}
+        )
+        baseline: dict[str, Any] = {
+            "version": self.VERSION,
+            "continuous_method": continuous_method,
+            "continuous": {},
+            "binary": {},
+            "multistate": {},
+            "context": {},
+            "last_emitted": {},
+        }
+
+        temporal_models: dict[str, Any] = {}
+        temporal_entries: dict[str, Any] = {}
+        continuous_groups = trabajo[trabajo["sensor_kind"].eq("continuous")].groupby("entity_id", sort=False)
+        for entity_id, learned, runtime in train_sensors(
+            self.filtro.continuos_temporales, continuous_groups, continuous_method,
+            lambda progress, message: report("baseline_training", 25 + progress * .45, message),
+        ):
+            if learned.get("eligible"):
+                serie = trabajo[trabajo["entity_id"].astype(str).eq(str(entity_id))].copy()
+                if "is_valid_value" in serie:
+                    serie = serie[serie["is_valid_value"].astype(bool)]
+                serie["value"] = pd.to_numeric(serie["value"], errors="coerce")
+                serie = serie.dropna(subset=["value", "timestamp_dt"])
+                learned["constant_base"] = self.filtro.continuos._construir_base_normalidad(
+                    serie, str(entity_id), persistir_perfil_calculado=False,
+                )
+                temporal_entries[str(entity_id)] = learned
+            temporal_models[str(entity_id)] = {key: value for key, value in learned.items() if key not in {"predictor", "runtime", "constant_base"}}
+        # El orden de finalización de los procesos no cambia el orden del baseline.
+        temporal_entries = dict(sorted(temporal_entries.items()))
+        temporal_models = dict(sorted(temporal_models.items()))
+        baseline["continuous"] = temporal_entries
+        baseline["continuous_model_manifest"] = temporal_models
+
+        for entity_id, grupo in groups("binary", "baseline_binary", "Preparando sensores binarios", 70, 10):
+            serie = grupo.sort_values("timestamp_dt").copy()
+            if "is_valid_value" in serie.columns:
+                serie = serie[serie["is_valid_value"].astype(bool)].copy()
+            serie["value"] = (
+                pd.to_numeric(serie["value"], errors="coerce")
+                .fillna(0.0)
+                .clip(lower=0.0, upper=1.0)
+            )
+            serie = serie[serie["timestamp_dt"].notna()].copy()
+            if len(serie) < self.filtro.binarios.min_history_events:
+                continue
+            entidad = lookup.get(str(entity_id), {})
+            perfil = self.filtro.binarios._perfil_binario(
+                str(entity_id), str(entidad.get("device_class", ""))
+            )
+            features = self.filtro.binarios._extraer_features(serie, perfil)
+            if features.empty:
+                continue
+            ultima_fecha = serie["timestamp_dt"].max()
+            tail = serie[
+                serie["timestamp_dt"].ge(
+                    ultima_fecha - pd.Timedelta(seconds=perfil.window_seconds * 2)
+                )
+            ].copy()
+            baseline["binary"][str(entity_id)] = {
+                "perfil": perfil,
+                "base": self.filtro.binarios._construir_base_normalidad(
+                    features, perfil
+                ),
+                "runtime": {"tail": tail},
+            }
+
+        multivalor = self.filtro.multivalor
+        for entity_id, grupo in groups("multistate", "baseline_multistate", "Preparando sensores multivalor", 80, 10):
+            serie = multivalor._serie_valida(grupo)
+            diagnostico = multivalor._diagnosticar(str(entity_id), grupo, serie)
+            if diagnostico["status"] != "eligible":
+                continue
+            features = multivalor._extraer_features(serie)
+            base = multivalor._construir_base(features)
+            transiciones = features[features["state_change_event"].eq(1)]
+            transition_counts = Counter(
+                zip(transiciones["previous_state_key"], transiciones["state_key"])
+            )
+            source_counts = Counter(transiciones["previous_state_key"])
+            ultima = serie.tail(1).iloc[0]
+            ultimo_estado = str(ultima["state_key"])
+            mascara_cambio = serie["state_key"].ne(serie["state_key"].shift(1))
+            inicio_estado = serie.loc[mascara_cambio, "timestamp_dt"].iloc[-1]
+            cambios_recientes = features[
+                features["state_change_event"].eq(1)
+                & features["timestamp_dt"].ge(
+                    ultima["timestamp_dt"]
+                    - pd.Timedelta(seconds=multivalor.window_seconds)
+                )
+            ]["timestamp_dt"].tolist()
+            baseline["multistate"][str(entity_id)] = {
+                "base": base,
+                "state_counts": Counter(features["state_key"]),
+                "transition_counts": transition_counts,
+                "source_counts": source_counts,
+                "runtime": {
+                    "last_timestamp": ultima["timestamp_dt"],
+                    "last_state": str(ultima["state"]),
+                    "last_state_key": ultimo_estado,
+                    "state_started_at": inicio_estado,
+                    "change_times": deque(cambios_recientes),
+                },
+            }
+
+        report("baseline_hourly", 90.0, "Calculando referencias horarias y excursiones repetidas")
+        trabajo["hour"] = trabajo["timestamp_dt"].dt.hour
+        baseline["context"] = {
+            "continuous": self.filtro._baseline_horario_continuo(trabajo),
+            "binary": self.filtro._baseline_horario_binario(trabajo),
+            "repeated_continuous": self.filtro._excursiones_repetidas_continuas(
+                trabajo
+            ),
+        }
+        baseline["summary"] = {
+            "continuous": len(baseline["continuous"]),
+            "binary": len(baseline["binary"]),
+            "multistate": len(baseline["multistate"]),
+        }
+        report("baseline_ready", 100.0, "Base estadística preparada")
+        return baseline
+
+    def analizar_lote(
+        self,
+        nuevos_eventos: pd.DataFrame,
+        baseline: dict[str, Any],
+        suspicion_threshold: float,
+        continuous_method: str | None = None,
+    ) -> dict[str, Any]:
+        inicio = perf_counter()
+        if nuevos_eventos.empty:
+            return self._resultado([], inicio, {}, detections=[])
+        umbral_local = min(float(suspicion_threshold), self.filtro.umbral_activacion_lapsos)
+
+        inicio_tipo = perf_counter()
+        method = continuous_method or baseline.get("continuous_method", CONTINUOUS_METHOD)
+        if method not in RESIDUAL_METHODS:
+            raise ValueError(f"Método continuo desconocido: {method}")
+        continuos = self._analizar_continuos_residuos(nuevos_eventos, baseline, method)
+        tiempo_continuos = (perf_counter() - inicio_tipo) * 1000.0
+        inicio_tipo = perf_counter()
+        binarios = self._analizar_binarios(nuevos_eventos, baseline, umbral_local)
+        tiempo_binarios = (perf_counter() - inicio_tipo) * 1000.0
+        inicio_tipo = perf_counter()
+        multivalor = self._analizar_multivalor(
+            nuevos_eventos, baseline, umbral_local
+        )
+        tiempo_multivalor = (perf_counter() - inicio_tipo) * 1000.0
+
+        resultados_umbral = self._aplicar_contexto(
+            continuos + binarios + multivalor,
+            baseline.get("context", {}),
+            suspicion_threshold,
+        )
+        detections = deepcopy(resultados_umbral)
+        resultados = self._suprimir_repetidos(deepcopy(resultados_umbral), baseline)
+        return self._resultado(
+            resultados,
+            inicio,
+            {
+                "continuous": tiempo_continuos,
+                "binary": tiempo_binarios,
+                "multistate": tiempo_multivalor,
+            },
+            detections=detections,
+        )
+
+
+
+    def _analizar_continuos_residuos(self, nuevos: pd.DataFrame, baseline: dict[str, Any], method: str) -> list[dict[str, Any]]:
+        """Causal residual scoring; a timestamp group shares its sequential update."""
+        filtro = self.filtro.continuos
+        work = nuevos[nuevos["sensor_kind"].eq("continuous")].copy()
+        work["__order"] = range(len(work))
+        observations = baseline.setdefault("last_observations", {})
+        observations.clear(); results: list[dict[str, Any]] = []
+        for entity_id, rows in work.groupby("entity_id", sort=False):
+            cached = baseline.get("continuous", {}).get(str(entity_id))
+            if not cached:
+                continue
+            runtime, predictor = cached["runtime"], cached["predictor"]
+            ordered = rows.sort_values(["timestamp_dt", "__order"], kind="stable")
+            for timestamp, simultaneous in ordered.groupby("timestamp_dt", sort=True):
+                timestamp = pd.to_datetime(timestamp, errors="coerce", utc=True)
+                vector = causal_features(runtime.history, timestamp)
+                valid_rows, pending = [], []
+                for row in simultaneous.to_dict("records"):
+                    raw = row.get("_raw_index"); key = str(raw) if raw is not None else f"{entity_id}:{timestamp.isoformat()}:{row['__order']}"
+                    number = pd.to_numeric(pd.Series([row.get("value")]), errors="coerce").iloc[0]
+                    if pd.isna(timestamp) or not bool(row.get("is_valid_value", True)) or pd.isna(number) or not math.isfinite(float(number)):
+                        observations[key] = {"evaluable": False, "reason": "invalid_state", "continuous_method": method}; continue
+                    value = float(number); pending.append((timestamp, value))
+                    if vector is None:
+                        observations[key] = {"evaluable": False, "reason": "insufficient_history", "continuous_method": method}; continue
+                    expected = predictor.predict_raw(vector)[1]
+                    valid_rows.append((row, key, value, expected, (value - expected - cached["centre"]) / cached["scale"]))
+                if valid_rows:
+                    # One sequential update per simultaneous group, while P stays per reading.
+                    mean_z = sum(row[4] for row in valid_rows) / len(valid_rows)
+                    previous_timestamp = runtime.last_timestamp
+                    channels = update_channels(runtime, mean_z, timestamp, method, cached["half_life_seconds"])
+                    for row, key, value, expected, z in valid_rows:
+                        p = abs(z); d, n = channels["D"], channels["N"]
+                        qs = cached["channel_q99"]
+                        ratios = {"P": p / qs["P"], "D": d / qs["D"], "N": n / qs["N"]}
+                        score = max(ratios.values()); dominant = max(ratios, key=ratios.get)
+                        detected_numeric = score >= cached["threshold"]
+                        constant_score = 0.0
+                        # Preserve the established independent constancy check.
+                        constant_base = cached.get("constant_base")
+                        if constant_base:
+                            base_row = filtro._base_horaria(constant_base, {**row, "timestamp_dt": timestamp})
+                            previous = previous_timestamp
+                            gap = 0.0 if previous is None else max(0.0, (timestamp - previous).total_seconds())
+                            state, _ = filtro._actualizar_estado_constancia(runtime.__dict__.setdefault("constant_state", filtro._estado_constancia_vacio()), value, gap, base_row["epsilon_const"], base_row["gap_alert_seconds"])
+                            runtime.constant_state = state
+                            _, constant_score = filtro._score_persistencia_constante(float(state["duration_seconds"]), base_row)
+                        constant_detected = constant_score >= .6
+                        sources = (["residual_sequential"] if detected_numeric else []) + (["constant_persistence"] if constant_detected else [])
+                        detected = bool(sources)
+                        change = channels.get("focus_changepoint_index")
+                        observation = {
+                            "evaluable": True, "reason": None, "detected_before_suppression": detected,
+                            "continuous_method": method, "expected_value": expected, "residual": value - expected, "z": z,
+                            "channels": {"P": p, "D": d, "N": n}, "dominant_channel": dominant,
+                            "joint_score": score, "threshold": cached["threshold"], "detection_sources": sources,
+                            "channel_q99": cached["channel_q99"], "constant_score": constant_score,
+                            "focus_statistic": d if method == RESIDUAL_FOCUS_METHOD else None,
+                            "focus_changepoint_index": change,
+                        }
+                        observations[key] = observation
+                        if detected:
+                            results.append({
+                                "entity_id": str(entity_id), "source_raw_index": row.get("_raw_index"), "timestamp": str(row.get("timestamp") or timestamp.isoformat()),
+                                "window_start": str(row.get("timestamp") or timestamp.isoformat()), "window_end": str(row.get("timestamp") or timestamp.isoformat()),
+                                "sensor_kind": "continuous", "tipo_interno": "continua", "observed_state": str(row.get("state", value)), "value": value,
+                                "continuous_method": method, "expected_value": expected, "residual": value - expected, "z": z,
+                                "channels": observation["channels"], "dominant_channel": dominant, "joint_score": score, "threshold": cached["threshold"],
+                                "suspicion_score": score, "is_suspicious": True, "pattern": "stuck_value" if constant_detected and not detected_numeric else "residual_sequential_deviation",
+                                "suspected_pattern": "stuck_value" if constant_detected and not detected_numeric else "residual_sequential_deviation", "detection_sources": sources,
+                                "triggered_indicators": sources, "filter": method, "passed_to_contextual_filter": True,
+                                "reading": observation, "focus_changepoint_index": change,
+                            })
+                            runtime.reset_sequential(method)
+                for item in pending:
+                    runtime.history.append(item)
+        return results
+
+    def _analizar_binarios(
+        self,
+        nuevos: pd.DataFrame,
+        baseline: dict[str, Any],
+        suspicion_threshold: float,
+    ) -> list[dict[str, Any]]:
+        filtro = self.filtro.binarios
+        trabajo = nuevos[nuevos["sensor_kind"].eq("binary")].copy()
+        if "is_valid_value" in trabajo.columns:
+            trabajo = trabajo[trabajo["is_valid_value"].astype(bool)].copy()
+        resultados: list[dict[str, Any]] = []
+        raw_threshold = filtro._probabilidad_a_evidencia(suspicion_threshold)
+        for entity_id, filas in trabajo.groupby("entity_id", sort=False):
+            cached = baseline.get("binary", {}).get(str(entity_id))
+            if not cached:
+                continue
+            perfil = cached["perfil"]
+            runtime = cached["runtime"]
+            tail = runtime["tail"].assign(_replay_new=False)
+            actuales = filas.assign(_replay_new=True)
+            combinado = pd.concat([tail, actuales], ignore_index=True).sort_values("timestamp_dt")
+            combinado["value"] = (
+                pd.to_numeric(combinado["value"], errors="coerce")
+                .fillna(0.0)
+                .clip(lower=0.0, upper=1.0)
+            )
+            features = filtro._extraer_features(combinado, perfil)
+            timestamps_nuevos = set(
+                pd.to_datetime(
+                    actuales["timestamp_dt"], errors="coerce", utc=True
+                ).dropna()
+            )
+            features_nuevos = features[
+                features["timestamp_dt"].isin(timestamps_nuevos)
+            ]
+            for fila in features_nuevos.to_dict("records"):
+                raw, componentes, evidencia = filtro._puntuar_doble_horizonte(
+                    fila, cached["base"]
+                )
+                score = filtro._score_a_probabilidad(evidencia)
+                indicadores = filtro._indicadores_activados(componentes)
+                if not indicadores or evidencia < raw_threshold or score < suspicion_threshold:
+                    continue
+                principal = filtro._indicador_principal(componentes, indicadores)
+                patron = INDICADORES_BINARIOS[principal]
+                resultados.append(
+                    {
+                        "entity_id": str(entity_id),
+                        "source_raw_index": fila.get("_raw_index"),
+                        "timestamp": str(fila["timestamp"]),
+                        "window_start": str(fila["window_start"]),
+                        "window_end": str(fila["timestamp"]),
+                        "sensor_kind": "binary",
+                        "tipo_interno": "estado_binario",
+                        "observed_state": str(fila["state"]),
+                        "value": float(fila["value"]),
+                        "raw_score": filtro._raw_dominante(raw, principal),
+                        "evidence_score": round(evidencia, 6),
+                        "suspicion_score": round(score, 6),
+                        "is_suspicious": True,
+                        "pattern": patron,
+                        "suspected_pattern": patron,
+                        "pattern_detail": ", ".join(DETALLE_BINARIO[item] for item in indicadores),
+                        "filter": "statistical_temporal_validation_replay",
+                        "passed_to_contextual_filter": True,
+                        "triggered_indicators": indicadores,
+                        "reading": {
+                            "activations": int(fila["activations"]),
+                            "state_changes": int(fila["state_changes"]),
+                            "active_seconds": round(float(fila["active_seconds"]), 3),
+                            "inactive_seconds": round(float(fila["inactive_seconds"]), 3),
+                            "active_ratio": round(float(fila["active_ratio"]), 6),
+                            "gap_seconds": round(float(fila["gap_seconds"]), 3),
+                            "time_since_last_change_seconds": round(float(fila["time_since_last_change_seconds"]), 3),
+                            "report_gap_seconds": round(float(fila["report_gap_seconds"]), 3),
+                            "window_seconds": perfil.window_seconds,
+                            "components": componentes,
+                            "raw_components": raw,
+                        },
+                        "baseline_summary": filtro._resumen_base_para_salida(cached["base"]),
+                        "ground_truth_label": None,
+                        "severity": filtro._severidad(score),
+                    }
+                )
+            ultima_fecha = combinado["timestamp_dt"].max()
+            runtime["tail"] = combinado[
+                combinado["timestamp_dt"].ge(
+                    ultima_fecha - pd.Timedelta(seconds=perfil.window_seconds * 2)
+                )
+            ].drop(columns=["_replay_new"], errors="ignore")
+        return resultados
+
+    def _analizar_multivalor(
+        self,
+        nuevos: pd.DataFrame,
+        baseline: dict[str, Any],
+        suspicion_threshold: float,
+    ) -> list[dict[str, Any]]:
+        filtro = self.filtro.multivalor
+        trabajo = nuevos[nuevos["sensor_kind"].eq("multistate")].copy()
+        if "is_valid_value" in trabajo.columns:
+            trabajo = trabajo[trabajo["is_valid_value"].astype(bool)].copy()
+        resultados: list[dict[str, Any]] = []
+        for entity_id, filas in trabajo.groupby("entity_id", sort=False):
+            cached = baseline.get("multistate", {}).get(str(entity_id))
+            if not cached:
+                continue
+            runtime = cached["runtime"]
+            base = cached["base"]
+            for fila in filas.sort_values("timestamp_dt").to_dict("records"):
+                timestamp = pd.to_datetime(
+                    fila.get("timestamp_dt"), errors="coerce", utc=True
+                )
+                if pd.isna(timestamp):
+                    continue
+                state = str(fila.get("state", "")).strip()
+                state_key = state.casefold()
+                previous_state = runtime.get("last_state")
+                previous_key = runtime.get("last_state_key")
+                previous_timestamp = runtime.get("last_timestamp")
+                changed = previous_key is not None and state_key != previous_key
+                gap_seconds = (
+                    0.0
+                    if previous_timestamp is None
+                    else max(0.0, (timestamp - previous_timestamp).total_seconds())
+                )
+                if changed or runtime.get("state_started_at") is None:
+                    runtime["state_started_at"] = timestamp
+                    if changed:
+                        runtime["change_times"].append(timestamp)
+                limite = timestamp - pd.Timedelta(seconds=filtro.window_seconds)
+                while runtime["change_times"] and runtime["change_times"][0] <= limite:
+                    runtime["change_times"].popleft()
+                state_probability = cached["state_counts"].get(state_key, 0) / max(
+                    int(base["rows"]), 1
+                )
+                source_support = int(cached["source_counts"].get(previous_key, 0))
+                transition_probability = 1.0
+                if changed and previous_key is not None:
+                    transition_probability = cached["transition_counts"].get(
+                        (previous_key, state_key), 0
+                    ) / max(source_support, 1)
+                duracion = max(
+                    0.0, (timestamp - runtime["state_started_at"]).total_seconds()
+                )
+                feature = {
+                    "state_changes": len(runtime["change_times"]),
+                    "state_duration_seconds": duracion,
+                    "report_gap_seconds": gap_seconds,
+                    "state_probability": state_probability,
+                    "transition_probability": transition_probability,
+                    "transition_source_support": source_support,
+                }
+                raw, componentes = filtro._puntuar(feature, base)
+                indicadores = [
+                    item
+                    for item, componente in componentes.items()
+                    if componente >= filtro.component_minimum
+                ]
+                evidencia = max(componentes.values(), default=0.0)
+                if indicadores and evidencia >= suspicion_threshold:
+                    principal = max(indicadores, key=lambda item: componentes[item])
+                    patron = INDICADORES_MULTIESTADO[principal]
+                    resultados.append(
+                        {
+                            "entity_id": str(entity_id),
+                            "source_raw_index": fila.get("_raw_index"),
+                            "timestamp": str(fila.get("timestamp")),
+                            "window_start": (
+                                timestamp - pd.Timedelta(seconds=filtro.window_seconds)
+                            ).isoformat(),
+                            "window_end": str(fila.get("timestamp")),
+                            "sensor_kind": "multistate",
+                            "tipo_interno": "estado_multivalor",
+                            "observed_state": state,
+                            "value": None,
+                            "raw_score": round(float(raw[principal]), 6),
+                            "evidence_score": round(float(evidencia), 6),
+                            "suspicion_score": round(float(evidencia), 6),
+                            "is_suspicious": True,
+                            "pattern": patron,
+                            "suspected_pattern": patron,
+                            "pattern_detail": ", ".join(DETALLE_MULTIVALOR[item] for item in indicadores),
+                            "filter": "statistical_temporal_validation_replay",
+                            "passed_to_contextual_filter": True,
+                            "triggered_indicators": indicadores,
+                            "reading": {
+                                "state": state,
+                                "previous_state": previous_state,
+                                "state_changes": len(runtime["change_times"]),
+                                "state_duration_seconds": round(duracion, 3),
+                                "report_gap_seconds": round(gap_seconds, 3),
+                                "state_probability": round(state_probability, 6),
+                                "transition_probability": round(transition_probability, 6),
+                                "window_seconds": filtro.window_seconds,
+                                "components": {key: round(float(value), 6) for key, value in componentes.items()},
+                                "raw_components": {key: round(float(value), 6) for key, value in raw.items()},
+                            },
+                            "baseline_summary": filtro._base_para_salida(base),
+                            "ground_truth_label": None,
+                            "severity": filtro._severidad(evidencia),
+                            "score_version": filtro.score_version,
+                            "score_kind": filtro.score_kind,
+                        }
+                    )
+                runtime["last_timestamp"] = timestamp
+                runtime["last_state"] = state
+                runtime["last_state_key"] = state_key
+        return resultados
+
+    def _aplicar_contexto(
+        self,
+        resultados: list[dict[str, Any]],
+        context: dict[str, Any],
+        suspicion_threshold: float,
+    ) -> list[dict[str, Any]]:
+        filtrados = []
+        for resultado in resultados:
+            enriquecido = dict(resultado)
+            score_contexto = self.filtro._score_contexto_temporal(
+                enriquecido,
+                context.get("continuous", {}),
+                context.get("binary", {}),
+            )
+            repeticion = self.filtro._repeticion_continua(
+                enriquecido, context.get("repeated_continuous", {})
+            )
+            local = float(enriquecido.get("suspicion_score") or 0.0)
+            enriquecido["is_suspicious"] = bool(enriquecido.get("is_suspicious")) if enriquecido.get("continuous_method") == RESIDUAL_FOCUS_METHOD else local >= suspicion_threshold
+            enriquecido["time_window"] = (
+                "month_repetition"
+                if repeticion
+                else ("local" if score_contexto <= local else "hour_of_day")
+            )
+            enriquecido["temporal_context"] = {
+                "activation_threshold": self.filtro.umbral_activacion_lapsos,
+                "local_score": round(local, 6),
+                "hour_of_day_score": round(score_contexto, 6),
+                "temporal_consistency": self.filtro._consistencia_temporal(
+                    score_contexto, repeticion
+                ),
+                **repeticion,
+            }
+            if enriquecido["is_suspicious"]:
+                filtrados.append(enriquecido)
+        return filtrados
+
+    def _suprimir_repetidos(
+        self,
+        resultados: list[dict[str, Any]],
+        baseline: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        salida = []
+        ultimo = baseline.setdefault("last_emitted", {})
+        for resultado in sorted(resultados, key=self.filtro._clave_fecha_resultado):
+            clave = (str(resultado["entity_id"]), str(resultado["pattern"]))
+            timestamp = pd.to_datetime(resultado["timestamp"], errors="coerce", utc=True)
+            previo = ultimo.get(clave)
+            supresion = (
+                self.filtro.continuos.supresion_segundos
+                if resultado["sensor_kind"] == "continuous"
+                else 60 * 60
+            )
+            if previo is not None and pd.notna(timestamp) and (
+                timestamp - previo
+            ).total_seconds() <= supresion:
+                continue
+            ultimo[clave] = timestamp
+            salida.append(resultado)
+        return sorted(salida, key=self.filtro._clave_fecha_resultado, reverse=True)
+
+    def _resultado(
+        self,
+        resultados: list[dict[str, Any]],
+        inicio: float,
+        tiempos: dict[str, float],
+        *,
+        detections: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        detecciones = list(detections or [])
+        elapsed_ms = (perf_counter() - inicio) * 1000.0
+        resumen = {
+            "results": len(resultados),
+            "suspicious": len(resultados),
+            "by_kind": {
+                kind: sum(1 for item in resultados if item.get("sensor_kind") == kind)
+                for kind in ("continuous", "binary", "multistate")
+            },
+            "elapsed_ms": round(elapsed_ms, 3),
+            "timings_by_kind_ms": {
+                kind: round(float(tiempos.get(kind, 0.0)), 3)
+                for kind in ("continuous", "binary", "multistate")
+            },
+            "causal": True,
+            "baseline_partition": "development",
+            "evaluated_partition": "validation",
+            "uses_future_validation_rows": False,
+            "engine_version": self.VERSION,
+            "detection_count": len(detecciones),
+            "emitted_alert_count": len(resultados),
+            "suppressed_detection_count": max(0, len(detecciones) - len(resultados)),
+            "statistical_evaluation_version": "pre_suppression_v1",
+        }
+        return {
+            "detections": detecciones,
+            "results": resultados,
+            "all_results": resultados,
+            "summary": resumen,
+        }

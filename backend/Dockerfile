@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-ENV OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+ENV OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 ARTIFACT_ROOT=/app
 
 COPY requirements.txt requirements-gat.txt requirements-gat-docker.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

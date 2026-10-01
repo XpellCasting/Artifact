@@ -1,117 +1,155 @@
-# Aplicacion de diagnostico de sensores
+# Artifact: filtros y diagnóstico GAT-LSTM v2
 
-Aplicacion local con API FastAPI, interfaz React y filtros estadistico,
-contextual y diagnostico GAT-LSTM. Requiere Docker con Docker Compose.
+Aplicación local de la tesis: revisión de históricos, filtros estadístico y contextual,
+diagnóstico GAT-LSTM v2 y evaluación de flujos causales. La reorganización conserva
+las reglas de sensores binarios y multivalor. Los sensores continuos usan únicamente
+FOCuS sobre residuos mediante `changepoint-online==1.2.1`; se retiraron los detectores
+antiguos Hampel/CUSUM/DSPOT, la detección por intervalos y la alternativa EWMA.
 
-## Iniciar
+## Organización
 
-Desde la carpeta `Artifact` (la raiz de este repositorio):
+```text
+frontend/src/
+  app/                  # Arranque y coordinación de la interfaz
+  features/             # Históricos, revisión, inyecciones, escenarios,
+                        # filtros estadístico/contextual, diagnóstico y flujos
+  shared/               # Cliente HTTP, componentes y utilidades compartidas
+backend/app/
+  main.py               # Composición de FastAPI, middleware y ciclo de vida
+  config.py             # Rutas y configuración del almacenamiento
+  api/                  # Routers y contratos HTTP
+  services/             # Históricos, reproducción, análisis y ciclo del modelo
+  flow/                 # Definición, validación, ejecución y evaluación del grafo
+  nodos/                # Comportamiento de los nodos
+  modulos/
+    estadistico/        # FOCuS para continuos y reglas de binarios/multivalor
+    contextual/         # Filtro contextual y calibración
+    clasificador/       # Red, atención, características, entrenamiento e inferencia v2
+  database/             # Repositorios SQLite y migración de almacenamiento
+storage/
+  database/             # review.sqlite3, diagnostics.sqlite3, flow_lab.sqlite3,
+                        # validation_replay_results.sqlite3
+  cache/                # Análisis, configuración continua y cachés regenerables
+  jobs/                 # Progreso persistido del diagnóstico
+  migrations/           # Inventario y registro de la migración local
+models/gat_lstm/         # Pesos, metadatos, grafos, preprocesadores y modelo activo
+data/
+  defaults/             # Configuración inicial versionada
+  history/              # Históricos y manifiesto de particiones
+  review/               # Fuentes, anotaciones exportadas, inyecciones y escenarios
+  gat_lstm/             # Manifiestos de datasets y secuencias numéricas
+  fixtures/
+  static_history/
+scripts/                # Migración, empaquetado, entrenamiento y verificación
+tests/backend/
+tests/frontend/
+tests/fixtures/
+artifacts/gat_lstm/      # Paquete publicado en Git LFS, conservado
+```
+
+Cada funcionalidad conserva su propia base SQLite. Los datos locales, pesos y bases
+no se versionan. `artifacts/gat_lstm/` sigue siendo el paquete compartible mediante
+Git LFS; `models/` contiene los modelos de la instalación.
+
+## Migrar una instalación anterior
+
+Detener la API y los trabajos antes de migrar. La primera orden muestra el inventario
+sin modificar archivos; la segunda aplica la migración:
 
 ```powershell
+docker compose stop
+backend/.venv/Scripts/python.exe scripts/migrate_layout.py
+backend/.venv/Scripts/python.exe scripts/migrate_layout.py --apply --offline
+```
+
+La migración verifica integridad SQLite y conteos, mueve los archivos dentro de
+Artifact y registra el avance en `storage/migrations/layout-v2.json`. Puede reanudarse
+tras un fallo y no sobrescribe destinos incompatibles. Conserva IDs, datos fuente,
+anotaciones, revisiones y los modelos v2. Verifica los hashes de sus pesos antes de
+retirar artefactos antiguos.
+
+Se eliminan los pesos, configuraciones, referencias generadas y resultados exclusivos
+de prototipos robustos y GAT-LSTM v1. Los flujos guardados permanecen; una referencia
+a un modelo retirado requiere seleccionar un modelo v2 antes de ejecutar. No se
+convierten pesos v1 en v2 ni se reentrena el modelo activo. Los cachés de preparación
+que dependían de las rutas antiguas se reconstruyen al cargar Desarrollo.
+
+## Ejecutar con Docker
+
+```powershell
+git lfs pull
 docker compose up --build
 ```
 
-- Aplicacion: http://localhost:5173
-- API y estado: http://localhost:8000/health
-- Documentacion de la API: http://localhost:8000/docs
+Interfaz: http://localhost:5173. API y documentación: http://localhost:8000/docs.
+Los volúmenes `data/`, `storage/` y `models/` conservan el estado entre reinicios.
+El bootstrap restaura los archivos ausentes del paquete publicado y conserva la
+selección de modelo activo existente. No inicia un entrenamiento GAT-LSTM.
 
-Antes del primer inicio, instalar Git LFS y ejecutar `git lfs pull` desde este
-repositorio para descargar `artifacts/gat_lstm/snapshot.tar.gz`.
-Docker restaura automaticamente el dataset y el modelo GAT-LSTM activo en
-`data/review/diagnostics/`; no necesita reconstruir el dataset ni reentrenar.
-El primer inicio necesita aproximadamente 6 GiB adicionales para descomprimirlo.
+## Ejecutar localmente
 
-Docker instala las dependencias y PyTorch CPU. La aplicacion puede iniciar sin
-historicos; carga un CSV desde la interfaz para comenzar el analisis.
-
-## Carpetas
-
-- `backend/app/`: codigo de la API y filtros; `backend/requirements*.txt`: dependencias.
-- `frontend/src/`: interfaz y recursos utilizados; `frontend/package-lock.json`: dependencias fijadas.
-- `HistoricosEnUso/`: historicos locales, excluidos de Git.
-- `data/`: caches, revisiones y archivos generados locales, excluidos de Git.
-- `artifacts/gat_lstm/`: snapshot versionado con Git LFS, con dataset, pesos y configuracion del modelo activo.
-- `backend/tests/` y `scripts/`: pruebas y utilidades del codigo.
-- `docs/` y `local/`: documentacion de investigacion y recursos auxiliares conservados localmente, excluidos de Git.
-
-Los Dockerfile y `.dockerignore` limitan cada contexto de construccion al codigo
-y sus dependencias. No se incorporan historicos, caches ni entornos virtuales.
-
-## Historicos locales
-
-Para usar las particiones existentes, copiar en `HistoricosEnUso/`:
-
-- `historico_desarrollo.csv`
-- `historico_validacion.csv`
-- `historico_prueba.csv`
-- `historico_reserva_agosto.csv`
-- `particiones_seleccionadas_resumen.json`
-
-Los CSV etiquetados y sus resumenes tambien se conservan en esa carpeta.
-El manifiesto conserva la procedencia original; la aplicacion resuelve los
-archivos trasladados por su nombre dentro de `HistoricosEnUso`.
-
-`HistoricosEnUso/cargados/history.csv` conserva el historico base cargado desde
-la interfaz; `HistoricosEnUso/cargados/historico_validacion.csv` conserva la
-carga para reproduccion. Son copias de trabajo modificables por la aplicacion.
-Docker monta las particiones como solo lectura y `cargados/` como escritura.
-El historico base se recupera en segundo plano al reiniciar; una reproduccion
-en curso debe iniciarse nuevamente.
-
-Un clon nuevo incluye el dataset y el modelo GAT-LSTM del snapshot mediante
-Git LFS. No incluye historicos originales, anotaciones de revision ni caches.
-Para continuar un trabajo existente se deben transferir por separado
-`HistoricosEnUso/` y `data/`. Docker crea las carpetas necesarias al iniciar.
-Los respaldos y originales anteriores permanecen fuera del repositorio,
-en `../HistoricoPuro/`. La guia extensa local esta en `docs/Guia_Completa.md`.
-
-## Desarrollo local
-
-La API usa las mismas carpetas de datos por defecto. Las rutas se pueden
-sobrescribir con `REAL_HISTORY_PATH`, `VALIDATION_HISTORY_PATH` y
-`HISTORICAL_DATA_DIR`. Las pruebas y la compilacion web se ejecutan con:
+Requiere Python 3.12 y Node.js compatible con la versión de Vite del lockfile.
+Desde Artifact:
 
 ```powershell
-cd backend
-.venv/Scripts/python.exe -m unittest discover -s tests -v
-cd ../frontend
-npm ci
-npm run build
+python -m venv backend/.venv
+backend/.venv/Scripts/python.exe -m pip install -r backend/requirements.txt -r backend/requirements-gat.txt
+$env:PYTHONPATH = "$pwd/backend"
+backend/.venv/Scripts/python.exe -m app.bootstrap_gat --serve
 ```
 
-### Paralelismo del histórico
+En otra terminal:
 
-El servicio `api` configura `HISTORY_TRAINING_WORKERS=4`: entrena hasta cuatro
-sensores continuos simultáneamente, con un hilo numérico por proceso hijo.
-La cola mantiene como máximo un sensor por proceso para acotar las copias en
-memoria. La interfaz muestra los sensores en curso y los completados.
-Con `HISTORY_TRAINING_WORKERS=1` se usa ejecución secuencial (también es el valor
-predeterminado fuera de Compose).
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
 
-`CONTEXT_CALIBRATION_WORKERS=4` calibra las relaciones continuas del mapa en
-hasta cuatro procesos, con un hilo numérico por proceso. Las relaciones del
-mismo sensor de origen se agrupan para reutilizar características. Solo se envían
-los sensores necesarios a cada proceso, con un máximo de cuatro grupos en curso.
-La extracción usa bloques de 2.048 consultas y una caché de características de
-hasta 64 MiB por grupo. La calibración de decisiones también usa características
-por bloques, manteniendo su ejecución secuencial. La búsqueda inicial de pares
-sigue siendo secuencial.
+`ARTIFACT_ROOT` cambia la raíz completa de los datos; por defecto se deriva una sola
+vez de `app/config.py`. También se admiten `DATA_DIR`, `DATABASE_DIR`, `MODELS_DIR`,
+`REVIEW_DATA_DIR`, `HISTORICAL_DATA_DIR`, `CACHE_DIR`, `JOBS_DIR` y las rutas específicas
+que aparecen en Docker Compose. Un directorio de revisión explícito distinto del
+principal crea un espacio aislado, útil para pruebas.
 
-El progreso contextual muestra relaciones completadas, partición de ajuste o
-tolerancia y eventos procesados. `CONTEXT_CALIBRATION_WORKERS=1` permite calibrar
-sin procesos hijos (valor predeterminado fuera de Compose).
+## Contrato del clasificador
 
-Los cambios requieren reconstruir y recrear el API; una carga que ya está en
-curso conserva el código anterior. Cambiar la implementación invalida las cachés
-contextual y causal para evitar reutilizar resultados de otra versión.
+- Único método: `gat_lstm`; única arquitectura: `gat_lstm_v2_shared_type`.
+- Se conserva `schema_version="gat-lstm-entities-v1"`: identifica el esquema de
+  datos, no la arquitectura retirada.
+- Conserva clases Normal, anomalía ambiental y falla del sensor, más la cabeza de
+  tipo de falla y la política de abstención de v2.
+- Los artefactos deben declarar v2 explícitamente. Los modelos sin arquitectura
+  declarada no se reinterpretan como v2.
+- Sin modelo v2 utilizable, la salida es indeterminada con
+  `diagnosis_mode="unavailable"`; no hay fallback a patrones.
+- Se retiraron `/diagnostics/pretrain` y su script. `pretrain_enabled=false` y los
+  campos históricos de configuración se aceptan para cargar artefactos v2 existentes;
+  activar preentrenamiento se rechaza.
+- Se mantienen las rutas de las funcionalidades conservadas. Entrenar requiere
+  Desarrollo y el soporte supervisado existente, incluido el tipo de falla. La política
+  previa que reserva Validación/Prueba para eventos futuros permanece.
 
-Medición local de la calibración presión relativa → temperatura interior:
-111.274 y 73.594 registros respectivamente, ventana de 300 s y desfase de 0 s.
-En una ejecución aislada por versión, con un hilo numérico, la implementación
-escalar tardó 210,0 s y la extracción por bloques 6,4 s (32,8×). Los modelos,
-umbrales y cantidades de muestras coincidieron exactamente; el pico de RSS
-observado fue de unos 167 MiB por proceso en ambas ejecuciones. Esta medición
-corresponde únicamente a esa relación y no estima la duración del histórico
-completo ni la memoria conjunta de cuatro procesos. Las pruebas de regresión
-están en `backend/tests/test_contextual_calibration.py`, con la implementación
-escalar de referencia en `backend/tests/contextual_reference.py`.
+## Verificación
+
+```powershell
+backend/.venv/Scripts/python.exe scripts/run_tests.py
+npm --prefix frontend run build
+docker compose config --quiet
+```
+
+Las pruebas incluyen causalidad y calibración contextual, una referencia numérica del
+filtro estadístico obtenida del código anterior, entrenamiento y recarga de v2,
+rechazo de modelos retirados, ausencia de fallback, migración repetible, conflictos
+de destino y conservación de anotaciones. Las pruebas de interfaz viven fuera del
+bundle y usan `frontend/test-runtime.js` para resolver React, Vite y el DOM de pruebas.
+
+`scripts/package_gat_lstm.py` empaqueta el modelo activo con sus secuencias desde la
+nueva distribución y conserva el formato del paquete publicado. El resto de scripts
+de entrenamiento, auditoría y evaluación utiliza los mismos servicios que la API.
+
+La comprobación HTTP integrada se puede repetir con
+`python scripts/smoke_api.py --base http://127.0.0.1:18000 --disposable`.
+Debe apuntar a una API desechable con un modelo v2 activo: carga históricos sintéticos
+y guarda un flujo de prueba. El resumen de la validación de esta migración está en
+[REFACTOR_VALIDATION.md](REFACTOR_VALIDATION.md).

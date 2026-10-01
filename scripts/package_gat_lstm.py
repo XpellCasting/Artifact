@@ -3,6 +3,11 @@ import hashlib
 import json
 from pathlib import Path
 import tarfile
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "backend"))
+from app.config import MODELS_DIR, artifact_directory, artifact_file
 
 
 def digest(path):
@@ -12,20 +17,19 @@ def digest(path):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    source = root / 'data/review/diagnostics'
+    source = MODELS_DIR
     active = json.loads((source / 'active.json').read_text())
     model_id = active['model_id']
     model = json.loads((source / 'models' / f'{model_id}.json').read_text())
-    if model.get('method') != 'gat_lstm':
-        raise ValueError('El modelo activo no es GAT-LSTM')
+    if model.get('method') != 'gat_lstm' or model.get('config', {}).get('architecture_version') != 'gat_lstm_v2_shared_type':
+        raise ValueError('El modelo activo no es GAT-LSTM v2')
     dataset_id = model['dataset_id']
-    files = [source / 'active.json', source / 'datasets' / f'{dataset_id}.json']
-    files += [source / folder / f'{model_id}{suffix}' for folder, suffix in
+    files = ['active.json', f'datasets/{dataset_id}.json']
+    files += [f'{folder}/{model_id}{suffix}' for folder, suffix in
               [('models', '.json'), ('weights', '.pt'), ('graphs', '.json'), ('preprocessors', '.json')]]
-    if model.get('encoder_id'):
-        files += [source / 'encoders' / f"{model['encoder_id']}{suffix}" for suffix in ('.json', '.pt')]
-    files += sorted((source / 'sequences' / dataset_id).rglob('*'))
-    files = [path for path in files if path.is_file()]
+    sequence_root = artifact_directory(source, 'sequences')
+    files += [f'sequences/{path.relative_to(sequence_root).as_posix()}'
+              for path in sorted((sequence_root / dataset_id).rglob('*')) if path.is_file()]
     weights = source / 'weights' / f'{model_id}.pt'
     if digest(weights) != model['weights_sha256']:
         raise ValueError('Los pesos no coinciden con el modelo')
@@ -35,8 +39,8 @@ def main():
     temporary = archive.with_suffix('.gz.tmp')
     inventory = []
     with tarfile.open(temporary, 'w:gz', compresslevel=6) as tar:
-        for path in files:
-            relative = path.relative_to(source).as_posix()
+        for relative in files:
+            path = artifact_file(source, relative)
             checksum = digest(path)
             print(f'Empaquetando {relative} ({path.stat().st_size} bytes)', flush=True)
             tar.add(path, arcname=relative, recursive=False)
