@@ -7,7 +7,7 @@ Validación local realizada el 30 de septiembre de 2026.
 - Backend: **61 pruebas correctas** con `scripts/run_tests.py --backend-only`.
 - Frontend: **47 pruebas correctas**, incluidos eventos de clic y teclado; `npm run build` correcto.
 - Rutas HTTP comparadas con el inventario anterior: se conserva el conjunto, excepto `POST /diagnostics/pretrain`, retirado deliberadamente.
-- Arquitectura admitida: `gat_lstm_v2_shared_type`; se rechazan manifiestos sin arquitectura, v1 y solicitudes del método de prototipos.
+- Arquitectura admitida: `gat_lstm_v3_segments_multiscale`; se rechazan manifiestos sin arquitectura, v1 y solicitudes del método de prototipos.
 - Verificados el estado sin modelo y la ausencia de diagnósticos por fallback.
 - Entrenamiento corto, guardado y recarga v2 verificados por las pruebas de integración.
 

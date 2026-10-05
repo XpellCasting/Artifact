@@ -33,7 +33,7 @@ from app.database.review import UTC
 from app.services.inyecciones import InjectionStore
 from app.modulos.clasificador.catalogo import CATALOG
 from app.modulos.clasificador.disponibilidad import unavailable_results
-ENGINE_VERSION = "gat-lstm-v2"
+ENGINE_VERSION = "gat-lstm-segments-v3"
 from app.modulos.clasificador.config import Config as GATConfig
 from app.modulos.clasificador.config import historical_manifest_path
 from app.modulos.clasificador import LABELS as GAT_LABELS
@@ -226,13 +226,13 @@ class DiagnosticWorkbench(DiagnosticRepository):
         self.initialize_database()
 
     @staticmethod
-    def _is_v2(item):
-        return item.get("method", "gat_lstm") == "gat_lstm" and item.get("config", {}).get("architecture_version") in {"gat_lstm_v2_shared_type", "gat_lstm_v3_segments_multiscale"}
+    def _is_supported(item):
+        return item.get("method", "gat_lstm") == "gat_lstm" and item.get("config", {}).get("architecture_version") in {"gat_lstm_v3_segments_multiscale"}
 
     @classmethod
-    def _require_v2(cls, item):
-        if not cls._is_v2(item):
-            raise ReviewError("Artefacto incompatible: se admiten GAT-LSTM v2 y segmentos multiescala.", 409)
+    def _require_supported(cls, item):
+        if not cls._is_supported(item):
+            raise ReviewError("Artefacto incompatible: solo se admite SegmentGATLSTM (segmentos multiescala).", 409)
 
     def _path(self, folder, identifier):
         if not identifier or any(char not in "0123456789abcdef" for char in identifier) or len(identifier) != 32:
@@ -243,7 +243,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
         try:
             item = _read_json(self._path(folder, identifier))
             if folder in {"models", "datasets", "configurations"}:
-                self._require_v2(item)
+                self._require_supported(item)
             if folder == "datasets":
                 sequences = artifact_directory(self.directory, "sequences") / identifier
                 if sequences.is_dir():
@@ -254,7 +254,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
     def _list(self, folder):
         items = [_read_json(path) for path in (artifact_directory(self.directory, folder)).glob("*.json")]
-        return [item for item in items if folder not in {"models", "datasets", "configurations"} or self._is_v2(item)]
+        return [item for item in items if folder not in {"models", "datasets", "configurations"} or self._is_supported(item)]
 
     @staticmethod
     def _dataset_summary(dataset):
@@ -506,8 +506,8 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
     def _train_gat_candidate(self, dataset_id, encoder_id, dataset, config,
                              train_samples, dev_samples, storage, progress):
-        if config.architecture_version == "gat_lstm_v2_shared_type" and encoder_id:
-            raise ReviewError("GAT-LSTM v2 usa su encoder compartido; no admite encoders predictivos v1.")
+        if encoder_id:
+            raise ReviewError("SegmentGATLSTM usa su encoder de segmentos; no admite encoders predictivos v1.")
         support = {part: dataset.get("label_counts", {}).get(part, {})
                    for part in ("train_fit", "dev_tune")}
         missing = {part: [label for label in GAT_LABELS if counts.get(label, 0) == 0]
@@ -649,12 +649,10 @@ class DiagnosticWorkbench(DiagnosticRepository):
     def classifier_models(self):
         active = self._active()
         models = []
-        for path in (self.directory / "models").glob("*.json"):
-            model = _read_json(path)
-            if not self._is_v2(model):
-                continue
+        for model in self._list("models"):
             models.append({key: model.get(key) for key in
                            ("model_id", "method", "architecture_version", "created_at", "validated", "exploratory", "window_seconds")})
+            models[-1]["architecture_version"] = model.get("config", {}).get("architecture_version") or model.get("architecture_version")
             models[-1]["active"] = models[-1]["model_id"] == active
         return {"active_model_id": active,
                 "models": sorted(models, key=lambda item: item.get("created_at") or "", reverse=True)}
@@ -781,7 +779,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
         snapshot = session.snapshot if session is not None else self._run_snapshot(source, run_id)
         if not snapshot.get("model"):
             return unavailable_results(contextual_results)
-        self._require_v2(snapshot["model"])
+        self._require_supported(snapshot["model"])
         return self._enrich_gat_contextual(statistical_results, contextual_results, events,
                                            source, run_id, session, snapshot)
 

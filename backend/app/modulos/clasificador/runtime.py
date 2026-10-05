@@ -26,7 +26,6 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
     model, preprocessor, graph, manifest = snapshot
     from app.modulos.clasificador.config import Config
     config = Config(**manifest["config"])
-    segment_model = config.architecture_version == "gat_lstm_v3_segments_multiscale"
     base = {"entity_id": entity_id, "timestamp": timestamp, "method": "gat_lstm",
             "compatibility": None, "fault_type": None, "model_version": manifest["model_id"],
             "preprocessor_version": preprocessor.get("schema_version"),
@@ -40,7 +39,7 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
                 "reasons": [reason], "input_coverage": coverage or {}}
 
     newly_onboarded = entity_id not in preprocessor["entity_ids"]
-    if newly_onboarded and segment_model:
+    if newly_onboarded:
         profile = (sensor_profiles or {}).get(entity_id)
         if not profile or profile.get("status") != "available":
             return reject("incompatible_entity")
@@ -53,42 +52,13 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
                  "onboarding_policy": "within_entity_segments_v1"}
         graph["graph_version"] = hashlib.sha256(json.dumps({"graph": graph, "profile": profile}, sort_keys=True).encode()).hexdigest()
         base["graph_version"] = graph["graph_version"]
-    if newly_onboarded and not segment_model:
-        profile = (sensor_profiles or {}).get(entity_id)
-        if (manifest.get("architecture_version", config.architecture_version) != "gat_lstm_v2_shared_type"
-                or not profile or profile.get("status") != "available"):
-            return reject("incompatible_entity")
-        if parse_utc(timestamp) <= parse_utc(profile["reference_end"]):
-            return reject("reference_not_prior_to_target")
-        compatible = [key for key in preprocessor["entity_ids"]
-                      if preprocessor["entities"][key].get("kind") == profile.get("kind")
-                      and (not profile.get("unit") or preprocessor["entities"][key].get("unit") == profile.get("unit"))]
-        max_nodes = min(config.max_nodes, len(preprocessor["entity_ids"]) + 1)
-        context_ids = compatible[:max(0, max_nodes - 1)]
-        entity_ids = context_ids + [entity_id]
-        profile_entity = {**profile["entity"], "max_age_seconds": config.feature_window_seconds}
-        preprocessor = {**preprocessor, "entity_ids": entity_ids,
-            "entities": {key: preprocessor["entities"][key] for key in context_ids} | {entity_id: profile_entity},
-            "entity_kinds": {key: preprocessor["entities"][key]["kind"] for key in context_ids} | {entity_id: profile["kind"]}}
-        adjacency = [[i == j for j in range(len(entity_ids))] for i in range(len(entity_ids))]
-        target_node = len(entity_ids) - 1
-        for index, key in enumerate(context_ids):
-            adjacency[target_node][index] = adjacency[index][target_node] = True
-        dynamic_graph_version = hashlib.sha256(json.dumps(
-            {"base": graph.get("graph_version"), "entity_ids": entity_ids,
-             "adjacency": adjacency, "policy": "same_kind_unit_bounded_v1"}, sort_keys=True).encode()).hexdigest()
-        graph = {**graph, "adjacency": adjacency,
-                 "entity_ids": entity_ids, "graph_version": dynamic_graph_version,
-                 "onboarding_policy": "same_kind_unit_bounded_v1"}
-        base["graph_version"] = dynamic_graph_version
     cache_key = (manifest["model_id"], str(timestamp), tuple(preprocessor["entity_ids"]),
                  graph.get("graph_version"), tuple(tuple(row) for row in graph["adjacency"]))
     cache_entry = prediction_cache.get(cache_key) if prediction_cache is not None else None
     if cache_entry is None:
         sample_started = perf_counter()
         try:
-            sample = build_causal_sample(event_provider, timestamp, preprocessor, graph, config,
-                portable_features=manifest.get("architecture_version", config.architecture_version) == "gat_lstm_v2_shared_type")
+            sample = build_causal_sample(event_provider, timestamp, preprocessor, graph, config)
         except CausalInputError as exc:
             if metrics is not None:
                 metrics["gat_sample_ms"] = metrics.get("gat_sample_ms", 0.0) + (perf_counter() - sample_started) * 1000
@@ -111,24 +81,21 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
             metrics["gat_sample_cache_hits"] = metrics.get("gat_sample_cache_hits", 0) + 1
     index = preprocessor["entity_ids"].index(entity_id)
     present = sum(row[index] for row in sample["node_present"])
-    valid_feature = preprocessor["feature_names"].index("known_fraction" if segment_model else "valid_value")
+    valid_feature = preprocessor["feature_names"].index("known_fraction")
     valid_steps = sum(bool(row[index][valid_feature]) for row in sample["X"])
-    required_steps = len(sample["X"]) if segment_model else config.sequence_steps
+    required_steps = len(sample["X"])
     coverage = {"present_steps": present, "required_steps": required_steps,
                 "valid_value_steps": valid_steps,
                 "valid_value_coverage": valid_steps / required_steps,
                 "neighbor_ids": [preprocessor["entity_ids"][j] for j, allowed in
                                  enumerate(graph["adjacency"][index]) if allowed and j != index]}
-    if segment_model:
-        coverage["scales"] = sample["metadata"]["scale_coverage"][entity_id]
-        coverage["graph_method"] = "within_entity_segment_dtw"
-        if not any(s["usable"] for s in coverage["scales"]):
-            return reject("insufficient_scale_coverage", coverage)
+    coverage["scales"] = sample["metadata"]["scale_coverage"][entity_id]
+    coverage["graph_method"] = "within_entity_segment_dtw"
+    if not any(s["usable"] for s in coverage["scales"]):
+        return reject("insufficient_scale_coverage", coverage)
     if present == 0:
         return reject("insufficient_data", coverage)
-    architecture = manifest.get("architecture_version", config.architecture_version)
-    fault_types = None
-    from app.modulos.clasificador.network_v2 import FAULT_TYPES
+    from app.modulos.clasificador.model_constants import FAULT_TYPES
     fault_types = FAULT_TYPES
     if cache_entry["scores_by_node"] is None:
         inference_started = perf_counter()
@@ -136,7 +103,7 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
         from app.modulos.clasificador.training import _tensor_batch
         with torch.no_grad():
             x, state_ids, node_present, _, _, adjacency = _tensor_batch([sample], "cpu")
-            from app.modulos.clasificador.network_v2 import KIND_TO_ID
+            from app.modulos.clasificador.model_constants import KIND_TO_ID
             kinds = torch.tensor([KIND_TO_ID[preprocessor["entities"][key]["kind"]]
                                   for key in preprocessor["entity_ids"]], dtype=torch.long)
             class_logits, type_logits = model(x, state_ids, adjacency, node_present, kinds)
@@ -167,10 +134,8 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
         and type_validation.get("independent_episodes_by_type", {}).get(type_name, 0) >= 3
         and (type_validation.get("recall_by_type", {}).get(type_name) or 0) >= .5)
     reasons = ["score_below_rejection_policy"] if choice is None else []
-    if newly_onboarded and not segment_model and not coverage["neighbor_ids"]:
-        reasons.append("no_compatible_neighbors")
     return {**base, "status": status,
-            "fault_type_status": ("identified" if type_identified else "unknown") if architecture in {"gat_lstm_v2_shared_type", "gat_lstm_v3_segments_multiscale"} and choice == 2 else "not_supported" if choice == 2 else "not_applicable",
+            "fault_type_status": ("identified" if type_identified else "unknown") if choice == 2 else "not_applicable",
             "fault_type": type_name if type_identified else None,
             "fault_type_confidence": type_confidence,
             "predicted_label": label, "confidence": max(scores),

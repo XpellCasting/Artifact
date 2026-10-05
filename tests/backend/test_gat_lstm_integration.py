@@ -25,7 +25,7 @@ class IntegrationTests(unittest.TestCase):
     def test_prepare_train_and_explicitly_activate_development_only_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            bounds = [datetime(2026, 1, day, tzinfo=timezone.utc) for day in (1, 5, 7, 9)]
+            bounds = [datetime(2026, 1, day, tzinfo=timezone.utc) for day in (1, 21, 25, 28)]
             development, validation = root / "development.csv", root / "validation.csv"
             parts = {}
             for name, path, lower, upper in (
@@ -53,8 +53,8 @@ class IntegrationTests(unittest.TestCase):
 
             annotations = []
             labels = ("normal", "environmental_anomaly", "sensor_fault")
-            for partition, path, first_day in (("train", development, 2),
-                                                ("dev", development, 4)):
+            for partition, path, first_day in (("train", development, 5),
+                                                ("dev", development, 20)):
                 with path.open(encoding="utf-8", newline="") as stream:
                     source_rows = list(csv.DictReader(stream))
                 offset = bounds[0] if path == development else bounds[1]
@@ -75,13 +75,10 @@ class IntegrationTests(unittest.TestCase):
             config = Config(sequence_steps=2, feature_window_seconds=60, labelled_stride_seconds=60,
                             gat_heads=2, gat_head_dim=16, batch_size=3, max_epochs=2, patience=2,
                             dropout=0.0, use_entropy=False, use_dtw=False)
-            with patch("app.modulos.clasificador.pipeline.build_graph", return_value={
-                "entity_ids": ["binary.b", "sensor.a"], "adjacency": [[True, False], [True, True]], "edges": [],
-                "spatial_evidence": True, "graph_version": "fixture-graph"}):
-                dataset = build_sequence_dataset(workbench.review,
-                    ["canonical:desarrollo"],
-                    [item["annotation_id"] for item in annotations], config,
-                    workbench.directory, manifest)
+            dataset = build_sequence_dataset(workbench.review,
+                ["canonical:desarrollo"],
+                [item["annotation_id"] for item in annotations], config,
+                workbench.directory, manifest)
             _write(workbench._path("datasets", dataset["dataset_id"]), dataset)
 
             progress = []

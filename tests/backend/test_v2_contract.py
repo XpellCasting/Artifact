@@ -11,12 +11,12 @@ from app.services.diagnostico import DiagnosticWorkbench
 from app.database.review import ReviewError
 
 
-class V2ContractTests(unittest.TestCase):
+class SegmentContractTests(unittest.TestCase):
     def test_retired_artifacts_cannot_be_selected_or_listed(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = DiagnosticWorkbench(Path(tmp))
             identifier = "a" * 32
-            for architecture in (None, "gat_lstm_v1", "gat_lstm_v1_entity"):
+            for architecture in (None, "gat_lstm_v1", "gat_lstm_v1_entity", "gat_lstm_v2_shared_type"):
                 config = {} if architecture is None else {"architecture_version": architecture}
                 for folder in ("models", "datasets", "configurations"):
                     service._path(folder, identifier).write_text(json.dumps({"method": "gat_lstm", "config": config}))
@@ -27,7 +27,9 @@ class V2ContractTests(unittest.TestCase):
                 self.assertIsNone(service._active())
 
     def test_reject_legacy_and_predictive_architectures(self):
-        self.assertEqual(Config().architecture_version, "gat_lstm_v2_shared_type")
+        self.assertEqual(Config().architecture_version, "gat_lstm_v3_segments_multiscale")
+        with self.assertRaises(ValueError):
+            Config(architecture_version="gat_lstm_v2_shared_type")
         with self.assertRaises(ValueError):
             Config(architecture_version="gat_lstm_v1_entity")
         with self.assertRaises(ValueError):

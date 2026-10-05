@@ -17,7 +17,7 @@ def report(*args): print(json.dumps(args[0] if len(args) == 1 else args, ensure_
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset_id")
-    parser.add_argument("--config", type=Path, help="JSON opcional compatible con gat-lstm-entities-v1")
+    parser.add_argument("--config", type=Path, help="JSON opcional compatible con gat-lstm-segments-v1")
     parser.add_argument("--review-dir", type=Path, default=ROOT / "data" / "review")
     args = parser.parse_args()
     config = Config(**json.loads(args.config.read_text(encoding="utf-8"))) if args.config else None

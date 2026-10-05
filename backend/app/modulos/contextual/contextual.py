@@ -9,10 +9,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import networkx as nx
 
 from app.modulos.contextual.calibracion import PreparedFeatures
 from app.modulos.contextual.calibracion import calibrate_relation
 from app.modulos.contextual.calibracion import calibrate_relations
+from app.modulos.contextual.metrics import signed_association, nominal_association, mixed_information, numeric_dtw, library_versions
+from app.modulos.contextual.views import reconstruct, change_view, pair_support, observed_changes
 
 
 ESTADOS_ACTIVOS = {"on", "open", "home", "active", "detected", "true", "1", "heat", "cool"}
@@ -48,8 +51,20 @@ class ConfiguracionContextual:
     temporal_feature_min_observations: int = 2
     temporal_model_min_observations: int = 30
     temporal_decision_min_observations: int = 30
+    numeric_association: str = "spearman"
+    dtw_max_points: int = 256
+    dtw_band_fraction: float = 0.1
+    dtw_candidate_multiplier: int = 2
+    min_support_days: int = 3
 
     def __post_init__(self) -> None:
+        if isinstance(self.min_support_days, bool) or not isinstance(self.min_support_days, int) or self.min_support_days < 1:
+            raise ValueError("Dias de respaldo invalidos.")
+        if (self.numeric_association not in {"pearson", "spearman"}
+                or isinstance(self.dtw_max_points, bool) or not isinstance(self.dtw_max_points, int) or self.dtw_max_points < 2
+                or not 0 < self.dtw_band_fraction <= 1
+                or isinstance(self.dtw_candidate_multiplier, bool) or not isinstance(self.dtw_candidate_multiplier, int) or self.dtw_candidate_multiplier < 1):
+            raise ValueError("Configuracion de medidas contextuales invalida.")
         if (self.window_seconds <= 0 or self.max_lag_windows < 0
                 or self.common_cause_window_seconds <= 0
                 or self.cadence_ttl_multiplier < 1
@@ -78,7 +93,7 @@ class ConfiguracionContextual:
     def como_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["window_candidates_seconds"] = list(self.window_candidates_seconds)
-        payload["window_selection"] = "smallest_eligible_else_smallest"
+        payload["window_selection"] = "smallest_eligible_per_view_then_strength"
         payload["lag_candidates_seconds"] = [
             lag * self.window_seconds for lag in range(self.max_lag_windows + 1)
         ]
@@ -88,6 +103,7 @@ class ConfiguracionContextual:
         payload["acceptance_rule"] = (
             "n_observations >= min_observations AND "
             "coverage_ratio >= min_pair_coverage AND "
+            "support_days_utc >= min_support_days AND "
             "|association_signed| >= association_threshold AND "
             "stable_slices >= min_stable_slices AND "
             "sign_consistency >= min_sign_consistency; despues se conserva top_k por entidad"
@@ -162,10 +178,28 @@ class FiltroContextualEspacioTemporal:
     # v4 replaces the contradictory sign heuristic for continuous pairs with
     # conditional level residuals.  Maps from earlier implementations stay
     # intact and are rebuilt through the existing version check.
-    MAP_VERSION = "contextual-spatiotemporal-v5"
+    MAP_VERSION = "contextual-spatiotemporal-v7"
 
     def __init__(self, config: ConfiguracionContextual | None = None) -> None:
         self.config = config or ConfiguracionContextual()
+        self._runtime_graph_key = None
+        self._runtime_graph = nx.freeze(nx.MultiDiGraph())
+
+    def grafo_contextual(self, mapa):
+        """Cache accepted directed relations; detect replacement and in-place edits."""
+        accepted = [edge for edge in mapa.get("edges", []) if edge.get("accepted")]
+        key = (mapa.get("map_version"), mapa.get("built_at"), tuple(
+            (str(edge.get("edge_id", index)), str(edge["source"]), str(edge["target"]), id(edge))
+            for index, edge in enumerate(accepted)))
+        if key != self._runtime_graph_key:
+            graph = nx.MultiDiGraph()
+            graph.add_nodes_from(str(node["entity_id"]) for node in mapa.get("nodes", []) if "entity_id" in node)
+            for index, edge in enumerate(accepted):
+                graph.add_edge(str(edge["source"]), str(edge["target"]),
+                               key=str(edge.get("edge_id", index)), evidence=edge)
+            self._runtime_graph = nx.freeze(graph)
+            self._runtime_graph_key = key
+        return self._runtime_graph
 
     def preparar_eventos_causales(self, entidades: pd.DataFrame, eventos: pd.DataFrame) -> PreparedCausalEvents:
         return PreparedCausalEvents(self, entidades, eventos)
@@ -173,6 +207,9 @@ class FiltroContextualEspacioTemporal:
     def implementation_sha256(self) -> str:
         digest = hashlib.sha256(Path(__file__).read_bytes())
         digest.update(Path(__file__).with_name("calibracion.py").read_bytes())
+        digest.update(Path(__file__).with_name("metrics.py").read_bytes())
+        digest.update(Path(__file__).with_name("views.py").read_bytes())
+        digest.update(str(sorted(library_versions().items())).encode("utf-8"))
         return digest.hexdigest()
 
     def fingerprint(self, eventos: pd.DataFrame, entidades: pd.DataFrame) -> dict[str, Any]:
@@ -319,6 +356,9 @@ class FiltroContextualEspacioTemporal:
                     "unit_of_measurement": meta.get("unit_of_measurement", ""),
                     "observations": int(node_stats.get("observations", 0)),
                     "coverage_ratio": self._redondear(node_stats.get("coverage_ratio", 0.0)),
+                    "record_coverage": self._redondear(node_stats.get("record_coverage", 0.0)),
+                    "fresh_coverage": self._redondear(node_stats.get("fresh_coverage", 0.0)),
+                    "known_windows": node_stats.get("known_windows", 0),
                     "center": self._redondear_o_none(node_stats.get("center")),
                     "scale": self._redondear_o_none(node_stats.get("scale")),
                     "state_probabilities": node_stats.get("state_probabilities", {}),
@@ -345,6 +385,8 @@ class FiltroContextualEspacioTemporal:
 
         result = {
             "map_version": self.MAP_VERSION,
+            "library_versions": library_versions(),
+            "graph_backend": "networkx.MultiDiGraph",
             "implementation_sha256": self.implementation_sha256(),
             "built_at": pd.Timestamp.now(tz="UTC").isoformat(),
             "source_range": {"start": fingerprint["start"], "end": fingerprint["end"]},
@@ -424,10 +466,7 @@ class FiltroContextualEspacioTemporal:
         else:
             catalogo = prepared_state.catalog
             observaciones = prepared_state.observations
-        edges_by_source: dict[str, list[dict[str, Any]]] = {}
-        for edge in mapa.get("edges", []):
-            if edge.get("accepted"):
-                edges_by_source.setdefault(str(edge["source"]), []).append(edge)
+        graph = self.grafo_contextual(mapa)
         stats_mapa = self._estadisticas_mapa(mapa)
         concurrence_state = {} if concurrence_state is None else concurrence_state
         candidatas = sorted(
@@ -447,7 +486,7 @@ class FiltroContextualEspacioTemporal:
                 sospecha.get("timestamp"), errors="coerce", utc=True
             )
             entity_id = str(sospecha.get("entity_id", ""))
-            edges = edges_by_source.get(entity_id, [])
+            edges = [data["evidence"] for _, _, data in graph.out_edges(entity_id, data=True)] if entity_id in graph else []
             signals = {}
             stats = stats_mapa
             concurrentes = self._concurrencia_relacionada(sospecha, edges, concurrence_state)
@@ -601,62 +640,19 @@ class FiltroContextualEspacioTemporal:
                 continue
             grupo["bucket"] = grupo["timestamp_dt"].dt.floor(freq)
             kind = str(meta["sensor_kind"])
-            validity = (
-                grupo.groupby("bucket", sort=True)["is_valid_value"]
-                .last()
-                .reindex(full_index)
-            )
-            if kind in {"binary", "multistate"}:
-                validity = validity.ffill().fillna(False).astype(bool)
-            else:
-                validity = validity.fillna(False).astype(bool)
-
-            if kind == "continuous":
-                numeric = pd.to_numeric(grupo.get("value", grupo["state"]), errors="coerce")
-                numeric = numeric.replace([math.inf, -math.inf], float("nan"))
-                grupo["_feature"] = numeric.where(grupo["is_valid_value"])
-                signal = (
-                    grupo.groupby("bucket", sort=True)["_feature"]
-                    .median()
-                    .reindex(full_index)
-                )
-            elif kind == "binary":
-                if "value" in grupo.columns:
-                    numeric = pd.to_numeric(grupo["value"], errors="coerce")
-                else:
-                    numeric = pd.Series(float("nan"), index=grupo.index)
-                fallback = grupo["state"].str.lower().isin(ESTADOS_ACTIVOS).astype(float)
-                grupo["_feature"] = numeric.where(numeric.notna(), fallback)
-                grupo.loc[~grupo["is_valid_value"], "_feature"] = float("nan")
-                active_in_bucket = (
-                    grupo.groupby("bucket", sort=True)["_feature"]
-                    .max()
-                    .reindex(full_index)
-                )
-                state_at_end = (
-                    grupo.groupby("bucket", sort=True)["_feature"]
-                    .last()
-                    .reindex(full_index)
-                    .ffill()
-                )
-                signal = active_in_bucket.where(active_in_bucket.notna(), state_at_end)
-                signal = signal.where(validity)
-            else:
-                grupo["_feature"] = grupo["state"].where(grupo["is_valid_value"])
-                signal = (
-                    grupo.groupby("bucket", sort=True)["_feature"]
-                    .last()
-                    .reindex(full_index)
-                    .ffill()
-                    .where(validity)
-                )
+            signal, profile = reconstruct(grupo, full_index, window_seconds or self.config.window_seconds,
+                                          kind, self.config.antiguedad_maxima(entity_id))
+            validity = profile.known
 
             signal.name = entity_id
             signals[entity_id] = signal
             availability[entity_id] = validity
             valid_signal = signal.dropna()
             node_stats: dict[str, Any] = {
-                "observations": int(len(valid_signal)),
+                "observations": int(profile.records.sum()),
+                "known_windows": int(len(valid_signal)),
+                "record_coverage": float(profile.records.mean()),
+                "fresh_coverage": float(profile.fresh.mean()),
                 "coverage_ratio": float(len(valid_signal) / len(full_index)) if len(full_index) else 0.0,
             }
             if kind == "multistate":
@@ -951,26 +947,27 @@ class FiltroContextualEspacioTemporal:
 
     def _seleccionar_ventana(self, source, target, catalogo, grids) -> dict[str, Any]:
         candidates = []
-        for seconds in sorted(grids):
-            signals, _, _, index = grids[seconds]
-            candidates.append(self._mejor_relacion(
-                source, target, signals[source], signals[target],
-                catalogo[source]["sensor_kind"], catalogo[target]["sensor_kind"],
-                len(index), window_seconds=seconds,
-            ))
-        # La resolucion mas fina elegible prevalece sobre una correlacion mayor.
-        # Sin candidatas elegibles, mostrar la mas fina para auditar el rechazo.
-        selected = next((item for item in candidates if item["threshold_eligible"]), candidates[0])
-        selected["window_selection"] = "smallest_eligible_else_smallest"
-        selected["window_candidates"] = [
-            {key: item[key] for key in (
-                "window_seconds", "lag_seconds", "n_observations", "coverage_ratio",
-                "association_signed", "stable_slices", "sign_consistency",
-                "threshold_eligible", "rejection_reasons",
-            )} for item in candidates
-        ]
-        # Copiar motivos: top_k se aplica despues y no es un control de ventana.
-        for item in selected["window_candidates"]:
+        for view in ("state", "changes"):
+            for seconds in sorted(grids):
+                signals, _, _, index = grids[seconds]
+                left, right = signals[source], signals[target]
+                if view == "changes":
+                    left, right = change_view(left), change_view(right)
+                candidates.append(self._mejor_relacion(
+                    source, target, left, right,
+                    catalogo[source]["sensor_kind"], catalogo[target]["sensor_kind"],
+                    len(index), window_seconds=seconds, relation_view=view))
+        per_view = [next((item for item in candidates if item["relation_view"] == view and item["threshold_eligible"]),
+                         next(item for item in candidates if item["relation_view"] == view)) for view in ("state", "changes")]
+        selected = max(per_view, key=lambda item: (item["threshold_eligible"], item["strength"] * item["stability_score"],
+                                                  item["n_observations"], item["relation_view"] == "state"))
+        keys = ("relation_view", "window_seconds", "lag_seconds", "n_observations", "coverage_ratio", "pair_support",
+                "association_signed", "stable_slices", "sign_consistency", "threshold_eligible", "rejection_reasons")
+        selected["window_selection"] = "smallest_eligible_per_view_then_strength"
+        selected["window_candidates"] = [{key: item[key] for key in keys} for item in candidates
+                                         if item["relation_view"] == selected["relation_view"]]
+        selected["view_candidates"] = [{key: item[key] for key in keys} for item in per_view]
+        for item in selected["window_candidates"] + selected["view_candidates"]:
             item["rejection_reasons"] = list(item["rejection_reasons"])
         return selected
 
@@ -985,6 +982,7 @@ class FiltroContextualEspacioTemporal:
         total_windows: int,
         *,
         window_seconds: int | None = None,
+        relation_view: str = "state",
     ) -> dict[str, Any]:
         seconds = window_seconds or self.config.window_seconds
         candidates = []
@@ -992,21 +990,24 @@ class FiltroContextualEspacioTemporal:
         # multiplicar la busqueda por cada segundo de una grilla mas fina.
         for offset in self.config.desfases(seconds):
             lag = offset // seconds
-            aligned_source = source_signal
-            aligned_target = target_signal.shift(lag)
+            aligned_source, aligned_target, support = pair_support(source_signal, target_signal, lag, relation_view, total_windows)
             encoded = self._codificar_par(
                 aligned_source,
                 aligned_target,
-                source_kind,
-                target_kind,
+                "continuous" if relation_view == "changes" else source_kind,
+                "continuous" if relation_view == "changes" else target_kind,
             )
             pair = encoded["pair"]
+            correlation_method = self.config.numeric_association if relation_view == "changes" or source_kind == target_kind == "continuous" else "pearson"
+            pair.attrs["association_method"] = correlation_method
             association = self._correlacion(pair)
             stability = self._estabilidad(pair, association or 0.0)
-            coverage = float(len(pair) / total_windows) if total_windows else 0.0
+            coverage = support["coverage_ratio"] if support else (float(len(pair) / total_windows) if total_windows else 0.0)
+            observations = support["independent_observations"] if support else len(pair)
             checks = {
-                "insufficient_observations": len(pair) < self.config.min_observations,
+                "insufficient_observations": observations < self.config.min_observations,
                 "insufficient_pair_coverage": coverage < self.config.min_pair_coverage,
+                "insufficient_support_days": bool(support and support["support_days_utc"] < self.config.min_support_days),
                 "weak_association": abs(association or 0.0) < self.config.association_threshold,
                 "temporal_instability": stability["stable_slices"] < self.config.min_stable_slices,
                 "sign_instability": stability["sign_consistency"] < self.config.min_sign_consistency,
@@ -1016,7 +1017,8 @@ class FiltroContextualEspacioTemporal:
                     **encoded,
                     "association": association,
                     "lag_windows": lag,
-                    "n_observations": int(len(pair)),
+                    "n_observations": int(observations),
+                    "pair_support": support,
                     "coverage_ratio": coverage,
                     "stability": stability,
                     "rejection_reasons": [key for key, failed in checks.items() if failed],
@@ -1041,8 +1043,17 @@ class FiltroContextualEspacioTemporal:
             best.get("source_state"),
             best.get("target_state"),
         )
+        if relation_view == "changes":
+            metric = self.config.numeric_association
+            family = "continuous_continuous" if source_kind == target_kind == "continuous" else "transition_transition"
         conditional_probability, cooccurrence = self._coocurrencia(best["pair"])
+        nominal = (nominal_association(source_signal, target_signal.shift(best["lag_windows"]))
+                   if relation_view == "state" and source_kind != "continuous" and target_kind != "continuous" else None)
+        mixed = (mixed_information(source_signal, target_signal.shift(best["lag_windows"]), source_kind)
+                 if relation_view == "state" and (source_kind == "continuous") != (target_kind == "continuous") else None)
         return {
+            "relation_view": relation_view,
+            "pair_support": best["pair_support"],
             "edge_id": f"{source}->{target}",
             "source": source,
             "target": target,
@@ -1050,6 +1061,10 @@ class FiltroContextualEspacioTemporal:
             "target_kind": target_kind,
             "relation_family": family,
             "metric": metric,
+            "metric_library": "scipy",
+            "nominal_association": nominal,
+            "mixed_association": mixed,
+            "_dtw_pair": best["pair"] if threshold_eligible and source_kind == target_kind == "continuous" else None,
             "association_signed": self._redondear(association),
             "strength": self._redondear(abs(association)),
             "expected_sign": "positive" if association >= 0 else "negative",
@@ -1067,7 +1082,7 @@ class FiltroContextualEspacioTemporal:
             ],
             "expected_response": (
                 self._calibrar_respuesta(best["pair"])
-                if threshold_eligible and source_kind == target_kind == "continuous" else None
+                if threshold_eligible and (source_kind == target_kind == "continuous" or relation_view == "changes") else None
             ),
             "n_observations": int(best["n_observations"]),
             "coverage_ratio": self._redondear(best["coverage_ratio"]),
@@ -1086,6 +1101,7 @@ class FiltroContextualEspacioTemporal:
             "acceptance_checks": {
                 "observations": best["n_observations"] >= self.config.min_observations,
                 "coverage": best["coverage_ratio"] >= self.config.min_pair_coverage,
+                "support_days": not best["pair_support"] or best["pair_support"]["support_days_utc"] >= self.config.min_support_days,
                 "association": abs(association) >= self.config.association_threshold,
                 "stable_slices": stability["stable_slices"] >= self.config.min_stable_slices,
                 "sign_consistency": stability["sign_consistency"] >= self.config.min_sign_consistency,
@@ -1151,8 +1167,7 @@ class FiltroContextualEspacioTemporal:
             return None
         if pair["source"].nunique(dropna=True) < 2 or pair["target"].nunique(dropna=True) < 2:
             return None
-        value = pair["source"].corr(pair["target"], method="pearson")
-        return None if pd.isna(value) or not math.isfinite(float(value)) else float(value)
+        return signed_association(pair, pair.attrs.get("association_method", "pearson"))
 
     def _estabilidad(self, pair: pd.DataFrame, full_association: float) -> dict[str, Any]:
         if pair.empty:
@@ -1202,7 +1217,7 @@ class FiltroContextualEspacioTemporal:
         if source_state is not None or target_state is not None:
             return "mixed" if source_kind != target_kind else "state_state", "one_vs_rest_phi"
         if source_kind == "continuous" and target_kind == "continuous":
-            return "continuous_continuous", "pearson"
+            return "continuous_continuous", self.config.numeric_association
         if source_kind == "binary" and target_kind == "binary":
             return "state_state", "phi_cooccurrence"
         return "mixed", "point_biserial"
@@ -1218,13 +1233,13 @@ class FiltroContextualEspacioTemporal:
         return probability, cooccurrence
 
     def _aplicar_top_k(self, edges: list[dict[str, Any]]) -> None:
+        graph = nx.MultiDiGraph()
+        for edge in edges:
+            if edge["threshold_eligible"]:
+                graph.add_edge(str(edge["source"]), str(edge["target"]), key=edge["edge_id"], evidence=edge)
         sources = sorted({str(edge["source"]) for edge in edges})
         for source in sources:
-            candidates = [
-                edge
-                for edge in edges
-                if edge["source"] == source and edge["threshold_eligible"]
-            ]
+            candidates = [data["evidence"] for _, _, data in graph.out_edges(source, data=True)] if source in graph else []
             candidates.sort(
                 key=lambda edge: (
                     edge["strength"] * edge["stability_score"],
@@ -1234,7 +1249,17 @@ class FiltroContextualEspacioTemporal:
                 ),
                 reverse=True,
             )
-            selected = {edge["edge_id"] for edge in candidates[: self.config.top_k]}
+            shortlisted = candidates[: max(0, self.config.top_k) * self.config.dtw_candidate_multiplier]
+            for edge in shortlisted:
+                pair = edge.get("_dtw_pair")
+                if pair is not None:
+                    edge["dtw"] = numeric_dtw(pair, edge["association_signed"], self.config.dtw_max_points, self.config.dtw_band_fraction)
+            # Only numeric candidates receive a DTW shape factor. Nominal states
+            # retain their directional association rather than numeric state IDs.
+            shortlisted.sort(key=lambda edge: (edge["strength"] * edge["stability_score"]
+                               * (edge.get("dtw") or {}).get("similarity", 1.),
+                               edge["n_observations"], -edge["lag_windows"], edge["target"]), reverse=True)
+            selected = {edge["edge_id"] for edge in shortlisted[: max(0, self.config.top_k)]}
             for edge in edges:
                 if edge["source"] != source:
                     continue
@@ -1242,6 +1267,8 @@ class FiltroContextualEspacioTemporal:
                 edge["acceptance_checks"]["top_k"] = edge["accepted"]
                 if edge["threshold_eligible"] and not edge["accepted"]:
                     edge["rejection_reasons"].append("outside_top_k")
+        for edge in edges:
+            edge.pop("_dtw_pair", None)
 
     def _construir_matrices(
         self,
@@ -1350,7 +1377,7 @@ class FiltroContextualEspacioTemporal:
         continuous_observations=None, decision_calibrations=None,
     ) -> dict[str, Any]:
         continuous_edges = [edge for edge in edges if edge.get("relation_family") == "continuous_continuous"]
-        if map_quality.get("version") == self.MAP_VERSION and continuous_edges and continuous_observations is not None:
+        if map_quality.get("version") in {self.MAP_VERSION, "contextual-spatiotemporal-v5", "contextual-spatiotemporal-v6"} and continuous_edges and continuous_observations is not None:
             return self._evaluar_sospecha_v5(
                 sospecha=sospecha, signals=signals, stats=stats, edges=edges, map_quality=map_quality,
                 concurrent_entities=concurrent_entities, continuous_observations=continuous_observations,
@@ -1535,14 +1562,17 @@ class FiltroContextualEspacioTemporal:
             # level, not about which side of either sensor's historical centre
             # the readings fall on.  In particular, do not use source_z,
             # context_z, association sign, or delta_value as a proxy here.
-            if edge.get("relation_family") == "continuous_continuous":
+            if edge.get("relation_family") == "continuous_continuous" or edge.get("relation_view") == "changes":
                 model = edge.get("expected_response")
                 actual = self._numeric_or_none(target_value)
+                if edge.get("relation_view") == "changes":
+                    actual, _ = observed_changes(continuous_observations.get(entity_id, pd.DataFrame()), timestamp,
+                                                  int(edge["window_seconds"]), edge["source_kind"]) if continuous_observations else (None, {})
                 context_numeric = self._numeric_or_none(context_value)
                 unknown_reason = None
                 if not model:
                     unknown_reason = "missing_conditional_level_model"
-                elif not directional_applicable or actual is None:
+                elif (not directional_applicable and edge.get("relation_view") != "changes") or pattern == "missing_gap" or actual is None:
                     unknown_reason = "missing_evaluable_target_level"
                 elif context_numeric is None:
                     unknown_reason = "invalid_context_level"
@@ -1938,6 +1968,15 @@ class FiltroContextualEspacioTemporal:
 
     def _observacion_contextual(self, events, reference, entity_id, edge=None):
         edge = edge or {}
+        if edge.get("relation_view") == "changes":
+            value, details = observed_changes(events, reference, int(edge["window_seconds"]), edge["target_kind"])
+            limit = edge.get("max_age_seconds")
+            if limit is None:
+                limit = self.config.antiguedad_maxima(entity_id)
+            if edge["target_kind"] == "continuous" and details.get("observation_age_seconds", 0) > limit:
+                details["missing_reason"] = "expired_observation"
+                return None, details
+            return value, details
         if events.empty or events.iloc[-1].get("sensor_kind") == "continuous":
             return self._observacion_continua(
                 events, reference, entity_id, window_seconds=edge.get("window_seconds"),

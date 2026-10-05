@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import timezone
 import math
 from typing import Any, Iterable
 
@@ -24,14 +25,21 @@ MODEL_PARAMETERS = {
     "l2_regularization": 1.0, "early_stopping": False, "random_state": 42,
 }
 
+def utc_timestamp(value: Any) -> pd.Timestamp | None:
+    """Reuse normalized UTC timestamps; keep parsing for other input formats."""
+    if isinstance(value, pd.Timestamp) and value.tzinfo is timezone.utc:
+        return value
+    return pd.to_datetime(value, errors="coerce", utc=True)
+
+
 def causal_features(history: Iterable[tuple[Any, float]], at: Any) -> np.ndarray | None:
     """Return features made exclusively from the twelve earlier readings."""
-    timestamp = pd.to_datetime(at, errors="coerce", utc=True)
+    timestamp = utc_timestamp(at)
     rows = list(history)[-HISTORY_SIZE:]
     if pd.isna(timestamp) or len(rows) < HISTORY_SIZE:
         return None
     values = np.asarray([float(value) for _, value in rows], dtype=float)
-    times = [pd.to_datetime(item[0], errors="coerce", utc=True) for item in rows]
+    times = [utc_timestamp(item[0]) for item in rows]
     if not np.isfinite(values).all() or any(pd.isna(item) or item >= timestamp for item in times):
         return None
     ages = np.asarray([max(0.0, (timestamp - item).total_seconds()) for item in times])
@@ -49,7 +57,9 @@ class TemporalSensorModel:
     metadata: dict[str, Any]
 
     def predict_raw(self, features: np.ndarray) -> tuple[float, float, float]:
-        predicted = sorted(float(model.predict(features.reshape(1, -1))[0]) for model in self.models)
+        # Preserve quantile identities even when predictions cross: residuals
+        # must always use the q=.50 estimator at position 1.
+        predicted = [float(model.predict(features.reshape(1, -1))[0]) for model in self.models]
         return predicted[0], predicted[1], predicted[2]
 
 class FiltroContinuoTemporal:

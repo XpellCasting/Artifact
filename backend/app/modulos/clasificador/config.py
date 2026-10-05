@@ -18,7 +18,7 @@ class Config:
     method: str = "gat_lstm"
     schema_version: str = SCHEMA_VERSION
     task: str = "diagnostic_3class"
-    architecture_version: str = "gat_lstm_v2_shared_type"
+    architecture_version: str = "gat_lstm_v3_segments_multiscale"
     grid_seconds: int = 60
     sequence_steps: int = 60
     lookback_seconds: int | None = None
@@ -51,14 +51,13 @@ class Config:
     active_scales: tuple[bool, bool, bool] = (True, True, True)
 
     def __post_init__(self):
-        segment_model = self.architecture_version == "gat_lstm_v3_segments_multiscale"
-        expected_schema = "gat-lstm-segments-v1" if segment_model else SCHEMA_VERSION
+        expected_schema = SCHEMA_VERSION
         if self.method != "gat_lstm" or self.schema_version != expected_schema or self.task != "diagnostic_3class":
             raise ValueError("Método, tarea o versión de esquema incompatibles")
-        if self.architecture_version not in {"gat_lstm_v2_shared_type", "gat_lstm_v3_segments_multiscale"}:
+        if self.architecture_version not in {"gat_lstm_v3_segments_multiscale"}:
             raise ValueError("Versión de arquitectura GAT-LSTM incompatible")
         if self.pretrain_enabled:
-            raise ValueError("El preentrenamiento predictivo aún no está disponible en GAT-LSTM v2")
+            raise ValueError("El preentrenamiento predictivo aún no está disponible en GAT-LSTM por segmentos")
         expected_lookback = (self.sequence_steps - 1) * self.grid_seconds
         if self.lookback_seconds is None:
             object.__setattr__(self, "lookback_seconds", expected_lookback)
@@ -94,9 +93,7 @@ class Config:
 
     @property
     def context_seconds(self):
-        if self.architecture_version == "gat_lstm_v3_segments_multiscale":
-            return 259200
-        return (self.sequence_steps - 1) * self.grid_seconds + self.feature_window_seconds
+        return 259200
 
     @classmethod
     def from_json(cls, path: Path):

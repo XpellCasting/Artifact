@@ -22,17 +22,18 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNone(dtw_distance([1, 2], [1, 2, 3, 4], .1))
         self.assertEqual(dtw_summary([1, 2], []), (0.0, 0.0, 0.0, False))
 
-    def test_dtw_does_not_bridge_invalid_report(self):
-        config = Config(sequence_steps=2, grid_seconds=60, feature_window_seconds=120,
-                        use_dtw=True, use_entropy=False)
-        events = [{"entity_id": "sensor.a", "state": "1", "timestamp": "2026-02-02T00:00:00Z"},
-                  {"entity_id": "sensor.a", "state": "unavailable", "timestamp": "2026-02-02T00:00:30Z"},
-                  {"entity_id": "sensor.a", "state": "3", "timestamp": "2026-02-02T00:01:00Z"}]
+    def test_invalid_reports_remain_visible_in_segment_features(self):
+        from app.modulos.clasificador.segments import intervals
+        from datetime import datetime, timezone, timedelta
+        start = datetime(2026, 2, 2, tzinfo=timezone.utc)
+        config = Config()
+        events = [{"entity_id": "sensor.a", "state": state,
+                   "timestamp": (start + timedelta(seconds=seconds)).isoformat()}
+                  for seconds, state in [(0, "1"), (30, "unavailable"), (60, "3")]]
         prep = fit_preprocessor(events, [], config, {"sensor.a": "continuous"})
-        prep["entities"]["sensor.a"]["normal_references"] = [[0.0, 1.0, 2.0]]
-        sample = build_causal_sample(lambda *_: events, "2026-02-02T00:01:00Z", prep,
-                                     {"adjacency": [[True]]}, config)
-        self.assertEqual(sample["X"][-1][0][18], 0.0)
+        ticks = intervals(events, start, start + timedelta(seconds=90), 30,
+                          prep["entities"]["sensor.a"])
+        self.assertEqual([tick["invalid"] for tick in ticks], [0, 1, 0])
 
 
 if __name__ == "__main__":

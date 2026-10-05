@@ -21,8 +21,8 @@ def main():
     active = json.loads((source / 'active.json').read_text())
     model_id = active['model_id']
     model = json.loads((source / 'models' / f'{model_id}.json').read_text())
-    if model.get('method') != 'gat_lstm' or model.get('config', {}).get('architecture_version') != 'gat_lstm_v2_shared_type':
-        raise ValueError('El modelo activo no es GAT-LSTM v2')
+    if model.get('method') != 'gat_lstm' or model.get('config', {}).get('architecture_version') != 'gat_lstm_v3_segments_multiscale':
+        raise ValueError('El modelo activo no es SegmentGATLSTM')
     dataset_id = model['dataset_id']
     files = ['active.json', f'datasets/{dataset_id}.json']
     files += [f'{folder}/{model_id}{suffix}' for folder, suffix in

@@ -6,6 +6,7 @@ from uuid import uuid4
 import pandas as pd
 from app.flow.definitions import _time, observation_valid
 from app.flow.evidence import append_evidence, merge_evidence
+from app.modulos.estadistico.disponibilidad import availability_detection
 
 class NodeHandlers:
     def _with_evidence(self, item: dict[str, Any], node_id: str, signal: str, status: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -34,6 +35,10 @@ class NodeHandlers:
         duplicate_points = set(events.loc[events.duplicated(["entity_id", "timestamp_dt"], keep=False)].apply(lambda row: (str(row["entity_id"]), _time(row["timestamp_dt"])), axis=1))
         output = []
         for item in incoming:
+            availability = availability_detection(item)
+            if availability is not None:
+                output.append(self._with_evidence(item, node_id, "positive", "suspicion", availability))
+                continue
             if not observation_valid(item):
                 output.append(self._with_evidence(item, node_id, "unknown", "not_evaluable", {"reason": "invalid_state"}))
                 continue

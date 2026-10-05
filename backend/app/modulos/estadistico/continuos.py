@@ -96,7 +96,7 @@ class FiltroContinuoEstadistico:
 
     def especificacion_puntaje(self) -> dict[str, Any]:
         return {"version": "focus-residual-v1", "kind": "calibrated_evidence_not_probability",
-                "continuous_method": "residual_focus_v1", "library": "changepoint-online==1.2.1",
+                "continuous_method": "residual_focus_v1", "library": "focus-cpt==0.1.10",
                 "channels": ["point_residual", "focus", "residual_energy"],
                 "independent_check": "constant_persistence"}
 

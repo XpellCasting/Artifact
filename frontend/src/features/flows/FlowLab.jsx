@@ -111,6 +111,25 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
     setFlows(f.items || []); setRuns(r.items || []); setClassifierModels(models.models || []); setActiveClassifierModelId(models.active_model_id || null); setLoaded(true);
   }, [apiBaseUrl]);
   useEffect(() => { refresh().catch((reason) => setError(reason.message)); }, [refresh]);
+  const refreshClassifierModels = useCallback(async () => {
+    const models = await request(apiBaseUrl, "/diagnostics/classifier-models");
+    setClassifierModels(models.models || []);
+    setActiveClassifierModelId(models.active_model_id || null);
+  }, [apiBaseUrl]);
+  useEffect(() => {
+    if (node?.type === "classifier") refreshClassifierModels().catch((reason) => setError(reason.message));
+  }, [node?.id, node?.type, refreshClassifierModels]);
+  useEffect(() => {
+    const updateModels = () => {
+      if (document.visibilityState !== "hidden") refreshClassifierModels().catch((reason) => setError(reason.message));
+    };
+    window.addEventListener("focus", updateModels);
+    document.addEventListener("visibilitychange", updateModels);
+    return () => {
+      window.removeEventListener("focus", updateModels);
+      document.removeEventListener("visibilitychange", updateModels);
+    };
+  }, [refreshClassifierModels]);
   useEffect(() => {
     if (!job?.job_id) return;
     let stopped = false;
@@ -214,7 +233,7 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
       {node ? <fieldset disabled={busy || inspecting} className="fl-fields"><span className="fl-muted">{DESCRIPTIONS[node.type]}</span><label>Nombre visible<input value={node.config?.label || ""} placeholder={NODE_LABELS[node.type]} onChange={(event) => configure({ label: event.target.value })} /></label>
         {["statistical_focus", "contextual", "classifier"].includes(node.type) && <label className="fl-check"><input type="checkbox" checked={node.config?.enabled !== false} onChange={(event) => configure({ enabled: event.target.checked })} />Filtro activado</label>}
         <label>Uso de evidencias<select value={node.config?.evidence_policy || "legacy"} onChange={(event) => configure({ evidence_policy: event.target.value })}><option value="legacy">Comportamiento guardado</option><option value="independent">Evaluación propia</option><option value="combine_v1">Evaluación propia y combinada</option></select><span className="fl-hint">Recibe las evidencias de sus predecesores y conserva su procedencia.</span></label>{node.type === "statistical_focus" && <><label>Umbral para binarios y multivalor<input type="number" min="0.01" max="0.99" step="0.01" value={node.config?.suspicion_threshold ?? .6} onChange={(event) => configure({ suspicion_threshold: Number(event.target.value) })} /></label><p><strong>Continuos:</strong> FOCuS sobre residuos normalizados</p><span className="fl-hint">Combina FOCuS con canales puntual, energía y constancia. Un aviso puede originarse en cualquiera de ellos; no confirma un tipo de falla.</span></>}
-        {node.type === "classifier" && <label>Modelo<select aria-label="Modelo del clasificador" value={node.config?.model_id || ""} onChange={(event) => configure({ model_id: event.target.value || null })}>{node.config?.model_id && !classifierModels.some((item) => item.model_id === node.config.model_id) && <option value={node.config.model_id} disabled>Modelo retirado · selecciona GAT-LSTM v2</option>}<option value="">Modelo activo{activeClassifierModelId ? ` · ${activeClassifierModelId.slice(0, 8)}` : " · ninguno"}</option>{classifierModels.map((model) => <option key={model.model_id} value={model.model_id}>{model.architecture_version === "gat_lstm_v3_segments_multiscale" ? "GAT-LSTM segmentos" : "GAT-LSTM v2"} · {model.model_id.slice(0, 8)}{model.active ? " (activo)" : ""}</option>)}</select><span className="fl-hint">La elección queda guardada en este nodo. “Modelo activo” usa el seleccionado en Diagnóstico.</span></label>}
+        {node.type === "classifier" && <label>Modelo<select aria-label="Modelo del clasificador" value={node.config?.model_id || ""} onChange={(event) => configure({ model_id: event.target.value || null })}>{node.config?.model_id && !classifierModels.some((item) => item.model_id === node.config.model_id) && <option value={node.config.model_id} disabled>Versión no disponible · selecciona otro modelo</option>}<option value="">Modelo activo{activeClassifierModelId ? ` · ${activeClassifierModelId.slice(0, 12)}` : " · ninguno"}</option>{classifierModels.map((model) => <option key={model.model_id} value={model.model_id}>{model.architecture_version === "gat_lstm_v3_segments_multiscale" ? "GAT-LSTM segmentos" : "GAT-LSTM v2"} · {model.model_id.slice(0, 12)}{model.active ? " (activo)" : ""}</option>)}</select><span className="fl-hint">La elección queda guardada en este nodo. “Modelo activo” usa el seleccionado en Diagnóstico.</span></label>}
         {node.type === "merge" && <label>Señal de la unión<select value={node.config?.mode || "any"} onChange={(event) => configure({ mode: event.target.value })}><option value="any">Cualquiera positiva (O)</option><option value="all">Todas positivas (Y)</option></select><span className="fl-hint">La evidencia conserva su origen. Una rama no evaluada no cuenta como respaldo.</span></label>}
         {node.type === "decision" && <><Signals legend="Resultado verdadero cuando recibe" value={node.config?.accept || ["positive"]} onChange={(accept) => configure({ accept })} /><p className="fl-hint">Verdadero produce señal positiva; falso, sin señal. Una entrada no evaluable permanece desconocida salvo que la selecciones explícitamente.</p></>}
         {!["input", "output"].includes(node.type) && <button className="fl-danger" onClick={deleteSelection}><Trash2 size={15} />Eliminar nodo y conexiones</button>}

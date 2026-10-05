@@ -50,10 +50,10 @@ def _scale(values: list[float], floor: float) -> tuple[float, float, str]:
 
 def _focus():
     try:
-        from changepoint_online import Focus, Gaussian
+        from focus_cpt import Detector
     except Exception as exc:  # deliberately no EWMA fallback
-        raise RuntimeError("focus_dependency_unavailable: changepoint-online==1.2.1") from exc
-    return Focus(Gaussian(loc=0))
+        raise RuntimeError("focus_dependency_unavailable: focus-cpt==0.1.10") from exc
+    return Detector(type="univariate")
 
 
 @dataclass
@@ -67,8 +67,8 @@ class ResidualRuntime:
     def __getstate__(self):
         """Persist runtime state without the third-party Focus instance.
 
-        changepoint-online's Gaussian owns a local lambda and cannot be
-        pickled.  A prepared historical baseline always starts a fresh
+        The native detector is not included in the persisted baseline.
+        A prepared historical baseline always starts a fresh
         sequential detector, so the instance can be recreated lazily on its
         first update after loading the cache.
         """
@@ -165,9 +165,11 @@ def update_channels(runtime: ResidualRuntime, z: float, timestamp: Any, method: 
         raise ValueError("unknown_residual_method")
     if runtime.focus is None: runtime.focus = _focus()
     runtime.focus.update(z); runtime.focus_index += 1
-    focus_stat = float(runtime.focus.statistic())
-    point = runtime.focus.changepoint()
-    change_index = point.get("changepoint") if isinstance(point, dict) else None
+    # Known zero pre-change mean, matching the standardized residual baseline.
+    point = runtime.focus.get_statistics(family="gaussian", theta0=0.0)
+    focus_stat = float(point["stat"])
+    raw_index = point.get("changepoint")
+    change_index = int(raw_index) if raw_index is not None and math.isfinite(float(raw_index)) else None
     runtime.last_timestamp = timestamp
     return {"P": abs(z), "D": focus_stat, "N": math.sqrt(max(0.0, runtime.energy)), "alpha": alpha, "focus_changepoint_index": change_index}
 

@@ -12,11 +12,12 @@ from app.services.entrenamiento_paralelo import train_sensors
 
 from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_FOCUS_METHOD as CONTINUOUS_METHOD
 from app.modulos.estadistico.continuos_temporales import causal_features
+from app.modulos.estadistico.continuos_temporales import utc_timestamp
 from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_METHODS
 from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_FOCUS_METHOD
 from app.modulos.estadistico.residuos_secuenciales import update_channels
-from app.modulos.estadistico.estados_binarios import DETALLE_INDICADOR as DETALLE_BINARIO
-from app.modulos.estadistico.estados_binarios import INDICADORES_BINARIOS
+from app.modulos.estadistico.bernoulli import METHOD as BINARY_METHOD
+from app.modulos.estadistico.disponibilidad import availability_detections
 from app.modulos.estadistico.estados_multivalor import DETALLE_INDICADOR as DETALLE_MULTIVALOR
 from app.modulos.estadistico.estados_multivalor import INDICADORES_MULTIESTADO
 
@@ -110,37 +111,9 @@ class MotorReproduccionValidacion:
         baseline["continuous_model_manifest"] = temporal_models
 
         for entity_id, grupo in groups("binary", "baseline_binary", "Preparando sensores binarios", 70, 10):
-            serie = grupo.sort_values("timestamp_dt").copy()
-            if "is_valid_value" in serie.columns:
-                serie = serie[serie["is_valid_value"].astype(bool)].copy()
-            serie["value"] = (
-                pd.to_numeric(serie["value"], errors="coerce")
-                .fillna(0.0)
-                .clip(lower=0.0, upper=1.0)
-            )
-            serie = serie[serie["timestamp_dt"].notna()].copy()
-            if len(serie) < self.filtro.binarios.min_history_events:
-                continue
-            entidad = lookup.get(str(entity_id), {})
-            perfil = self.filtro.binarios._perfil_binario(
-                str(entity_id), str(entidad.get("device_class", ""))
-            )
-            features = self.filtro.binarios._extraer_features(serie, perfil)
-            if features.empty:
-                continue
-            ultima_fecha = serie["timestamp_dt"].max()
-            tail = serie[
-                serie["timestamp_dt"].ge(
-                    ultima_fecha - pd.Timedelta(seconds=perfil.window_seconds * 2)
-                )
-            ].copy()
-            baseline["binary"][str(entity_id)] = {
-                "perfil": perfil,
-                "base": self.filtro.binarios._construir_base_normalidad(
-                    features, perfil
-                ),
-                "runtime": {"tail": tail},
-            }
+            cached = self.filtro.binarios.prepare(grupo)
+            if cached:
+                baseline["binary"][str(entity_id)] = cached
 
         multivalor = self.filtro.multivalor
         for entity_id, grupo in groups("multistate", "baseline_multistate", "Preparando sensores multivalor", 80, 10):
@@ -229,6 +202,15 @@ class MotorReproduccionValidacion:
             baseline.get("context", {}),
             suspicion_threshold,
         )
+        disponibilidad = availability_detections(nuevos_eventos)
+        resultados_umbral.extend(disponibilidad)
+        observations = baseline.setdefault("last_observations", {})
+        for detection in disponibilidad:
+            observations[str(detection["source_raw_index"])] = {
+                "evaluable": True, "reason": None, "detected_before_suppression": True,
+                "observed_state": detection["observed_state"],
+                "detection_sources": detection["detection_sources"],
+            }
         detections = deepcopy(resultados_umbral)
         resultados = self._suprimir_repetidos(deepcopy(resultados_umbral), baseline)
         return self._resultado(
@@ -249,6 +231,7 @@ class MotorReproduccionValidacion:
         filtro = self.filtro.continuos
         work = nuevos[nuevos["sensor_kind"].eq("continuous")].copy()
         work["__order"] = range(len(work))
+        numeric_values = "value" in work and pd.api.types.is_numeric_dtype(work["value"].dtype)
         observations = baseline.setdefault("last_observations", {})
         observations.clear(); results: list[dict[str, Any]] = []
         for entity_id, rows in work.groupby("entity_id", sort=False):
@@ -258,12 +241,13 @@ class MotorReproduccionValidacion:
             runtime, predictor = cached["runtime"], cached["predictor"]
             ordered = rows.sort_values(["timestamp_dt", "__order"], kind="stable")
             for timestamp, simultaneous in ordered.groupby("timestamp_dt", sort=True):
-                timestamp = pd.to_datetime(timestamp, errors="coerce", utc=True)
+                timestamp = utc_timestamp(timestamp)
                 vector = causal_features(runtime.history, timestamp)
                 valid_rows, pending = [], []
                 for row in simultaneous.to_dict("records"):
                     raw = row.get("_raw_index"); key = str(raw) if raw is not None else f"{entity_id}:{timestamp.isoformat()}:{row['__order']}"
-                    number = pd.to_numeric(pd.Series([row.get("value")]), errors="coerce").iloc[0]
+                    number = (row.get("value") if numeric_values else
+                              pd.to_numeric(pd.Series([row.get("value")]), errors="coerce").iloc[0])
                     if pd.isna(timestamp) or not bool(row.get("is_valid_value", True)) or pd.isna(number) or not math.isfinite(float(number)):
                         observations[key] = {"evaluable": False, "reason": "invalid_state", "continuous_method": method}; continue
                     value = float(number); pending.append((timestamp, value))
@@ -329,90 +313,12 @@ class MotorReproduccionValidacion:
         baseline: dict[str, Any],
         suspicion_threshold: float,
     ) -> list[dict[str, Any]]:
-        filtro = self.filtro.binarios
-        trabajo = nuevos[nuevos["sensor_kind"].eq("binary")].copy()
-        if "is_valid_value" in trabajo.columns:
-            trabajo = trabajo[trabajo["is_valid_value"].astype(bool)].copy()
-        resultados: list[dict[str, Any]] = []
-        raw_threshold = filtro._probabilidad_a_evidencia(suspicion_threshold)
+        resultados = []
+        trabajo = nuevos[nuevos["sensor_kind"].eq("binary")]
         for entity_id, filas in trabajo.groupby("entity_id", sort=False):
             cached = baseline.get("binary", {}).get(str(entity_id))
-            if not cached:
-                continue
-            perfil = cached["perfil"]
-            runtime = cached["runtime"]
-            tail = runtime["tail"].assign(_replay_new=False)
-            actuales = filas.assign(_replay_new=True)
-            combinado = pd.concat([tail, actuales], ignore_index=True).sort_values("timestamp_dt")
-            combinado["value"] = (
-                pd.to_numeric(combinado["value"], errors="coerce")
-                .fillna(0.0)
-                .clip(lower=0.0, upper=1.0)
-            )
-            features = filtro._extraer_features(combinado, perfil)
-            timestamps_nuevos = set(
-                pd.to_datetime(
-                    actuales["timestamp_dt"], errors="coerce", utc=True
-                ).dropna()
-            )
-            features_nuevos = features[
-                features["timestamp_dt"].isin(timestamps_nuevos)
-            ]
-            for fila in features_nuevos.to_dict("records"):
-                raw, componentes, evidencia = filtro._puntuar_doble_horizonte(
-                    fila, cached["base"]
-                )
-                score = filtro._score_a_probabilidad(evidencia)
-                indicadores = filtro._indicadores_activados(componentes)
-                if not indicadores or evidencia < raw_threshold or score < suspicion_threshold:
-                    continue
-                principal = filtro._indicador_principal(componentes, indicadores)
-                patron = INDICADORES_BINARIOS[principal]
-                resultados.append(
-                    {
-                        "entity_id": str(entity_id),
-                        "source_raw_index": fila.get("_raw_index"),
-                        "timestamp": str(fila["timestamp"]),
-                        "window_start": str(fila["window_start"]),
-                        "window_end": str(fila["timestamp"]),
-                        "sensor_kind": "binary",
-                        "tipo_interno": "estado_binario",
-                        "observed_state": str(fila["state"]),
-                        "value": float(fila["value"]),
-                        "raw_score": filtro._raw_dominante(raw, principal),
-                        "evidence_score": round(evidencia, 6),
-                        "suspicion_score": round(score, 6),
-                        "is_suspicious": True,
-                        "pattern": patron,
-                        "suspected_pattern": patron,
-                        "pattern_detail": ", ".join(DETALLE_BINARIO[item] for item in indicadores),
-                        "filter": "statistical_temporal_validation_replay",
-                        "passed_to_contextual_filter": True,
-                        "triggered_indicators": indicadores,
-                        "reading": {
-                            "activations": int(fila["activations"]),
-                            "state_changes": int(fila["state_changes"]),
-                            "active_seconds": round(float(fila["active_seconds"]), 3),
-                            "inactive_seconds": round(float(fila["inactive_seconds"]), 3),
-                            "active_ratio": round(float(fila["active_ratio"]), 6),
-                            "gap_seconds": round(float(fila["gap_seconds"]), 3),
-                            "time_since_last_change_seconds": round(float(fila["time_since_last_change_seconds"]), 3),
-                            "report_gap_seconds": round(float(fila["report_gap_seconds"]), 3),
-                            "window_seconds": perfil.window_seconds,
-                            "components": componentes,
-                            "raw_components": raw,
-                        },
-                        "baseline_summary": filtro._resumen_base_para_salida(cached["base"]),
-                        "ground_truth_label": None,
-                        "severity": filtro._severidad(score),
-                    }
-                )
-            ultima_fecha = combinado["timestamp_dt"].max()
-            runtime["tail"] = combinado[
-                combinado["timestamp_dt"].ge(
-                    ultima_fecha - pd.Timedelta(seconds=perfil.window_seconds * 2)
-                )
-            ].drop(columns=["_replay_new"], errors="ignore")
+            if cached:
+                resultados.extend(self.filtro.binarios.evaluate(filas, cached, entity_id))
         return resultados
 
     def _analizar_multivalor(
@@ -433,9 +339,7 @@ class MotorReproduccionValidacion:
             runtime = cached["runtime"]
             base = cached["base"]
             for fila in filas.sort_values("timestamp_dt").to_dict("records"):
-                timestamp = pd.to_datetime(
-                    fila.get("timestamp_dt"), errors="coerce", utc=True
-                )
+                timestamp = utc_timestamp(fila.get("timestamp_dt"))
                 if pd.isna(timestamp):
                     continue
                 state = str(fila.get("state", "")).strip()
@@ -551,7 +455,9 @@ class MotorReproduccionValidacion:
                 enriquecido, context.get("repeated_continuous", {})
             )
             local = float(enriquecido.get("suspicion_score") or 0.0)
-            enriquecido["is_suspicious"] = bool(enriquecido.get("is_suspicious")) if enriquecido.get("continuous_method") == RESIDUAL_FOCUS_METHOD else local >= suspicion_threshold
+            calibrated = (enriquecido.get("continuous_method") == RESIDUAL_FOCUS_METHOD
+                          or enriquecido.get("binary_method") == BINARY_METHOD)
+            enriquecido["is_suspicious"] = bool(enriquecido.get("is_suspicious")) if calibrated else local >= suspicion_threshold
             enriquecido["time_window"] = (
                 "month_repetition"
                 if repeticion

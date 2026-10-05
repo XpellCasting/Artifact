@@ -7,7 +7,8 @@ import pandas as pd
 
 from app.modulos.estadistico.continuos import FiltroContinuoEstadistico
 from app.modulos.estadistico.continuos_temporales import FiltroContinuoTemporal
-from app.modulos.estadistico.estados_binarios import FiltroEstadoBinarioEstadistico
+from app.modulos.estadistico.bernoulli import FiltroBernoulli
+from app.modulos.estadistico.disponibilidad import availability_detections
 from app.modulos.estadistico.estados_multivalor import FiltroEstadoMultivalorEstadistico
 
 
@@ -21,7 +22,7 @@ class FiltroEstadistico:
     def __init__(self) -> None:
         self.continuos = FiltroContinuoEstadistico()
         self.continuos_temporales = FiltroContinuoTemporal()
-        self.binarios = FiltroEstadoBinarioEstadistico()
+        self.binarios = FiltroBernoulli()
         self.multivalor = FiltroEstadoMultivalorEstadistico()
         self.umbral_activacion_lapsos = 0.35
 
@@ -34,10 +35,11 @@ class FiltroEstadistico:
         from app.services.reproduccion import MotorReproduccionValidacion
         inicio = perf_counter()
         umbral_local = min(float(suspicion_threshold), self.umbral_activacion_lapsos)
-        discrete = self.binarios.analizar(eventos, entidades, umbral_local) + self.multivalor.analizar(eventos, entidades, umbral_local)
+        binary = self.binarios.analizar(eventos, entidades, suspicion_threshold)
+        discrete = self.multivalor.analizar(eventos, entidades, umbral_local)
         discrete = self._aplicar_lapsos_temporales(eventos, discrete, suspicion_threshold)
         continuous = eventos[eventos["sensor_kind"].eq("continuous")].copy()
-        results = list(discrete)
+        results = list(discrete) + binary + availability_detections(eventos)
         if not continuous.empty:
             continuous["timestamp_dt"] = pd.to_datetime(continuous["timestamp_dt"], errors="coerce", utc=True)
             times = continuous["timestamp_dt"].dropna().sort_values().unique()
@@ -47,11 +49,13 @@ class FiltroEstadistico:
                 validation = continuous[continuous["timestamp_dt"] >= boundary]
                 motor = MotorReproduccionValidacion(self)
                 baseline = motor.construir_baseline(development, entidades)
-                results.extend(motor.analizar_lote(validation, baseline, suspicion_threshold)["all_results"])
+                results.extend(item for item in motor.analizar_lote(validation, baseline, suspicion_threshold)["all_results"]
+                               if item.get("suspected_pattern") != "unavailable")
         results = sorted(results, key=self._clave_fecha_resultado, reverse=True)
         summary = {"results": len(results), "suspicious": len(results),
                    "by_kind": {kind: sum(item.get("sensor_kind") == kind for item in results) for kind in ("continuous", "binary", "multistate")},
                    "elapsed_ms": round((perf_counter()-inicio)*1000, 3), "top_results": results[:1000],
+                   "binary_method": "binary_focus_bernoulli_v1", "binary_evaluated_partition": "last_20_percent",
                    "continuous_method": "residual_focus_v1", "continuous_evaluated_partition": "last_20_percent",
                    "multistate_eligibility": self.multivalor.last_eligibility,
                    "continuous_score_specification": self.continuos.especificacion_puntaje(),

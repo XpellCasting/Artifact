@@ -15,11 +15,23 @@ ARCHITECTURE = "gat_lstm_v3_segments_multiscale"
 SCHEMA = "gat-lstm-segments-v1"
 MAX_SEGMENTS = 12
 MAX_POINTS = 24
-SCALES = ((3600, 60, (5, 10, 15)), (86400, 900, (4, 8, 12)), (259200, 3600, (6, 12, 24)))
+SCALES = ((3600, 60, (5, 10, 15)), (86400, 900, (8, 12)), (259200, 3600, (6, 12, 24)))
+DEFAULT_SEGMENT_STEPS = (10, 8, 12)
 BASE_NAMES = ["value", "mean", "min", "max", "std", "changes", "records", "age_seconds",
               "known_fraction", "invalid_fraction", "entropy", "transition_ratio",
               "dominant_fraction", "diversity", "hour_sin", "hour_cos", "hourly_record_rate", "hourly_invalid_rate", "profile_available"]
 FEATURE_NAMES = BASE_NAMES + [f"numeric_{i}" for i in range(MAX_POINTS)] + [f"valid_{i}" for i in range(MAX_POINTS)] + [f"category_{i}" for i in range(MAX_POINTS)] + [f"similarity_{i}" for i in range(MAX_SEGMENTS)]
+
+
+def _validate_segment_steps(horizon, resolution, steps):
+    """Reject incompatible saved specs before writing into fixed-size tensors."""
+    if type(steps) is not int or not 1 <= steps <= MAX_POINTS:
+        raise ValueError("Longitud de segmento inválida para el tensor de entrada")
+    count = (horizon // resolution) // steps
+    if not 2 <= count <= MAX_SEGMENTS:
+        raise ValueError(
+            f"La escala de {horizon} segundos genera {count} segmentos; "
+            f"se requieren entre 2 y {MAX_SEGMENTS}. Prepara nuevamente el dataset.")
 
 
 def categorical_dtw(left, right, fraction):
@@ -104,9 +116,12 @@ def fit_spec(events, preprocessor, config, fit_bounds):
                                   "invalid_rate": [invalid_counts[h]/max(1, days) for h in range(24)],
                                   "fit_start": start.isoformat(), "fit_end": end.isoformat()}
     lengths = []
-    for _, resolution, candidates in SCALES:
+    for scale, (horizon, resolution, candidates) in enumerate(SCALES):
+        for candidate in candidates:
+            _validate_segment_steps(horizon, resolution, candidate)
+        default = DEFAULT_SEGMENT_STEPS[scale]
         if not config.use_entropy:
-            lengths.append(candidates[1])
+            lengths.append(default)
             continue
         scores = {w: [] for w in candidates}
         for entity, rows in grouped.items():
@@ -135,7 +150,7 @@ def fit_spec(events, preprocessor, config, fit_bounds):
                 if entity_scores[w]:
                     scores[w].append(mean(entity_scores[w]))
         lengths.append(max(candidates, key=lambda w: (mean(scores[w]) if scores[w] else -1., w))
-                       if any(scores.values()) else candidates[1])
+                       if any(scores.values()) else default)
     nodes = len(preprocessor["entity_ids"])
     result = {"method": "within_entity_segment_dtw", "entity_ids": preprocessor["entity_ids"],
               "segment_steps": lengths, "threshold": config.segment_threshold,
@@ -148,6 +163,11 @@ def fit_spec(events, preprocessor, config, fit_bounds):
 
 
 def build_sample(provider, target, preprocessor, graph, config, labels=None):
+    lengths = graph["segment_steps"]
+    if len(lengths) != len(SCALES):
+        raise ValueError("Se requiere una longitud de segmento para cada escala")
+    for (horizon, resolution, _), steps in zip(SCALES, lengths):
+        _validate_segment_steps(horizon, resolution, steps)
     target = parse_utc(target) if isinstance(target, str) else target
     start = target-timedelta(seconds=SCALES[-1][0])
     entities = preprocessor["entity_ids"]

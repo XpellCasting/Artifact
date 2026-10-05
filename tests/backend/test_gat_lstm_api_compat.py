@@ -13,6 +13,25 @@ from app.api.diagnostico import crear_router_diagnostico
 
 
 class ApiCompatibilityTests(unittest.TestCase):
+    def test_flow_model_list_matches_diagnostic_versions_and_active_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workbench = DiagnosticWorkbench(Path(tmp))
+            identifier = "7732263585df42f49892a2a41b287840"
+            model = {"model_id": identifier, "method": "gat_lstm",
+                     "config": {"architecture_version": "gat_lstm_v3_segments_multiscale"},
+                     "created_at": "2026-10-02T14:11:49-03:00"}
+            model_dir = workbench.directory / "models"
+            model_dir.mkdir(exist_ok=True)
+            (model_dir / f"{identifier}.json").write_text(json.dumps(model), encoding="utf-8")
+            with patch.object(workbench, "_active", return_value=identifier):
+                diagnostic = workbench.status()
+                flows = workbench.classifier_models()
+            self.assertEqual(flows["active_model_id"], diagnostic["active_model_id"])
+            self.assertEqual([item["model_id"] for item in flows["models"]],
+                             [item["model_id"] for item in diagnostic["models"]])
+            self.assertTrue(flows["models"][0]["active"])
+            self.assertEqual(flows["models"][0]["architecture_version"], "gat_lstm_v3_segments_multiscale")
+
     def test_job_progress_preserves_training_epoch_and_timing_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             workbench = DiagnosticWorkbench(Path(tmp))

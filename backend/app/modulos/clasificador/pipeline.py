@@ -25,11 +25,9 @@ from app.modulos.clasificador.config import partition_bounds
 from app.modulos.clasificador.config import resolve_manifest_source
 from app.modulos.clasificador.dataset import index_labelled_targets
 from app.modulos.clasificador.features import fit_preprocessor
-from app.modulos.clasificador.graph import build_graph
 from app.modulos.clasificador.temporal import build_causal_sample
 from app.modulos.clasificador.storage import DiskPartition
 from app.modulos.clasificador.storage import PartitionWriter
-from app.services.tipos_entidad import infer_kind
 from app.services.csv_etiquetado import labelled_columns
 from app.services.csv_etiquetado import read_label
 from app.modulos.clasificador.catalogo import CATALOG
@@ -241,16 +239,13 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     entities = {}
     for entity in all_entities:
         domain = entity.split(".", 1)[0]
-        if config.architecture_version == "gat_lstm_v3_segments_multiscale":
-            from app.modulos.clasificador.features import _finite_number
-            from app.services.estados_validos import valid_state
-            values = [v for v in entities_train[entity] if valid_state(v)]
-            entities[entity] = "continuous" if values and all(_finite_number(v) for v in values) else "multistate"
-            mode = (config.entity_value_modes or {}).get(entity)
-            if mode:
-                entities[entity] = "continuous" if mode == "numeric" else "multistate"
-        else:
-            entities[entity] = infer_kind(entity, entities_train[entity], domain=domain)
+        from app.modulos.clasificador.features import _finite_number
+        from app.services.estados_validos import valid_state
+        values = [v for v in entities_train[entity] if valid_state(v)]
+        entities[entity] = "continuous" if values and all(_finite_number(v) for v in values) else "multistate"
+        mode = (config.entity_value_modes or {}).get(entity)
+        if mode:
+            entities[entity] = "continuous" if mode == "numeric" else "multistate"
     split_bounds = {"train_fit": bounds["train_fit"], "dev_tune": bounds["dev_tune"]}
     if not train_fit:
         raise ValueError("La fuente seleccionada no contiene eventos dentro de train_fit")
@@ -281,29 +276,16 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
         if source.get("labelled_import"):
             row_annotations.extend(_row_label_annotations(event_index, source, config))
     all_annotations = linked_annotations + row_annotations
-    train_ann = [a for a in all_annotations
-                 if actual_partition(parse_utc(a["start"]), bounds) == "train_fit"
-                 and actual_partition(parse_utc(a["end"]), bounds) == "train_fit"]
-    preprocessor = fit_preprocessor(train_fit, [] if config.architecture_version == "gat_lstm_v3_segments_multiscale" else train_ann, config, entities)
+    preprocessor = fit_preprocessor(train_fit, [], config, entities)
     for source in sources.values():
         if source.get("dataset_id"):
             source_dataset = review_store.dataset(source["dataset_id"])
             for entity in source_dataset.get("entities", []):
                 if entity["entity_id"] in preprocessor["entities"]:
                     preprocessor["entities"][entity["entity_id"]]["unit"] = entity.get("unit") or ""
-    shared_type_model = config.architecture_version == "gat_lstm_v2_shared_type"
-    if shared_type_model:
-        preprocessor["feature_names"].extend([
-            "state_transition_ratio", "dominant_state_fraction", "state_diversity_ratio"])
-        preprocessor["architecture_version"] = config.architecture_version
-    catalog = [{"entity_id": entity, "sensor_kind": kind, "domain": entity.split(".", 1)[0]}
-               for entity, kind in entities.items()]
-    if config.architecture_version == "gat_lstm_v3_segments_multiscale":
-        from app.modulos.clasificador.segments import fit_spec
-        preprocessor["architecture_version"] = config.architecture_version
-        graph = fit_spec(train_fit, preprocessor, config, bounds["train_fit"])
-    else:
-        graph = build_graph(train_fit, catalog, config)
+    from app.modulos.clasificador.segments import fit_spec
+    preprocessor["architecture_version"] = config.architecture_version
+    graph = fit_spec(train_fit, preprocessor, config, bounds["train_fit"])
 
     merged_index = defaultdict(list)
     for rows_by_entity in event_index.values():
@@ -334,8 +316,7 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
                 target_time = parse_utc(target.timestamp)
                 # Each sample supervises the annotated node only. Other nodes are context.
                 sample = build_causal_sample(provider, target_time, preprocessor, graph, config,
-                                             {target.entity_id: target.label},
-                                             portable_features=shared_type_model)
+                                             {target.entity_id: target.label})
                 original = annotations_by_id[target.annotation_id]
                 fault_type = original.get("fault_type")
                 if (target.label == LABELS.index("sensor_fault") and fault_type in fault_types):

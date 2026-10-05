@@ -14,6 +14,22 @@ from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_FOCUS_METHOD,
 from app.services.reproduccion import MotorReproduccionValidacion
 
 class FocusFilterTests(unittest.TestCase):
+    def test_channels_match_focus_cpt_known_zero_baseline(self):
+        from focus_cpt import Detector
+        from app.services.procedencia_normalidad import runtime_versions
+        direct = Detector(type="univariate")
+        runtime = new_runtime(deque(), RESIDUAL_FOCUS_METHOD)
+        start = pd.Timestamp('2026-01-01', tz='UTC')
+        values = [0., -.2, .1, .3, 2., 2., 2.]
+        for index, value in enumerate(values):
+            direct.update(value)
+            expected = direct.get_statistics(family="gaussian", theta0=0.0)
+            actual = update_channels(runtime, value, start + pd.Timedelta(minutes=index), RESIDUAL_FOCUS_METHOD, 1800)
+            self.assertAlmostEqual(actual['D'], float(expected['stat']))
+            self.assertEqual(actual['focus_changepoint_index'], int(expected['changepoint']))
+        self.assertEqual(runtime_versions()['focus_cpt'], '0.1.10')
+        self.assertNotIn('changepoint_online', runtime_versions())
+
     def test_library_focus_detects_mean_shift_and_baseline_state_can_be_cached(self):
         runtime = pickle.loads(pickle.dumps(new_runtime(deque(), RESIDUAL_FOCUS_METHOD)))
         start = pd.Timestamp('2026-01-01', tz='UTC')

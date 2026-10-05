@@ -9,6 +9,7 @@ from app.modulos.clasificador.features import INVALID
 from app.modulos.clasificador.features import OOV
 from app.modulos.clasificador.features import state_id
 from app.modulos.clasificador.temporal import build_causal_sample
+from app.modulos.clasificador.segments import fit_spec, FEATURE_NAMES
 
 
 class CausalDataTests(unittest.TestCase):
@@ -23,23 +24,25 @@ class CausalDataTests(unittest.TestCase):
         ]
         self.prep = fit_preprocessor(self.events, [], self.config,
                                      {"sensor.b": "multistate", "sensor.a": "continuous"})
-        self.graph = {"adjacency": [[True, False], [False, True]]}
+        self.graph = fit_spec(self.events, self.prep, self.config,
+            (datetime(2026, 1, 29, tzinfo=timezone.utc), datetime(2026, 2, 3, tzinfo=timezone.utc)))
 
     def provider(self, start, end, entities):
         # Deliberately return all rows, including future rows: constructor must filter.
         return self.events
 
     def test_future_invariant_and_invalid_presence(self):
-        target = "2026-02-02T00:01:00Z"
+        target = "2026-02-02T00:01:30Z"
         first = build_causal_sample(self.provider, target, self.prep, self.graph, self.config)
         self.events.append({"entity_id": "sensor.a", "state": "9999",
                             "timestamp": "2026-02-02T00:05:00Z", "source_row": 6})
         second = build_causal_sample(self.provider, target, self.prep, self.graph, self.config)
         self.assertEqual(first, second)
         self.assertEqual(first["metadata"]["entity_ids"], ["sensor.a", "sensor.b"])
-        self.assertTrue(first["node_present"][-1][0])
-        self.assertEqual(first["X"][-1][0][7], 0.0)  # invalid numeric value
-        self.assertEqual(first["X"][-1][0][9], 1.0)  # explicit invalid report
+        known = FEATURE_NAMES.index("known_fraction")
+        invalid = FEATURE_NAMES.index("invalid_fraction")
+        self.assertTrue(any(row[0][known] > 0 for row in first["X"]))
+        self.assertTrue(any(row[0][invalid] > 0 for row in first["X"]))
         self.assertFalse(any(first["label_mask"]))
 
     def test_vocab_and_none(self):
@@ -49,7 +52,7 @@ class CausalDataTests(unittest.TestCase):
         self.assertEqual(state_id("UNSEEN", info), OOV)
 
     def test_point_exact_and_interval_end_inclusive(self):
-        bounds = {"train_fit": (datetime(2026, 2, 1, tzinfo=timezone.utc),
+        bounds = {"train_fit": (datetime(2026, 1, 29, tzinfo=timezone.utc),
                                 datetime(2026, 2, 3, tzinfo=timezone.utc))}
         point = {"annotation_id": "p", "entity_id": "sensor.a", "label": "sensor_fault",
                  "status": "reviewed", "start": "2026-02-02T00:01:00.123Z",
@@ -70,7 +73,7 @@ class CausalDataTests(unittest.TestCase):
         self.assertLess(bounds["train_fit"][1], bounds["dev_tune"][1])
 
     def test_conflicts_never_reintroduced_and_order_independent(self):
-        bounds = {"train_fit": (datetime(2026, 2, 1, tzinfo=timezone.utc),
+        bounds = {"train_fit": (datetime(2026, 1, 29, tzinfo=timezone.utc),
                                 datetime(2026, 2, 3, tzinfo=timezone.utc))}
         annotations = []
         for identifier, label in (("a", "normal"), ("b", "sensor_fault"), ("c", "normal")):

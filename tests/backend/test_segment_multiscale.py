@@ -149,7 +149,7 @@ class SegmentTests(unittest.TestCase):
                 def annotation(self,key): return annotation
                 def dataset(self,key): return {"entities":[]}
             item = {"source_id":"source","path":str(source),"sha256":digest,"partition":"development", "filename":source.name}
-            with patch("app.modulos.clasificador.pipeline.development_sources",return_value=[item]), patch("app.modulos.clasificador.pipeline.build_graph",side_effect=AssertionError("F2 must not be called")):
+            with patch("app.modulos.clasificador.pipeline.development_sources",return_value=[item]), patch("app.modulos.clasificador.graph.build_graph",side_effect=AssertionError("F2 must not be called")):
                 dataset = build_sequence_dataset(Review(),["source"],["one"],config,root/"diagnostics",manifest)
             self.assertEqual(dataset["schema_version"],SCHEMA)
             self.assertEqual(dataset["context_seconds"],259200)

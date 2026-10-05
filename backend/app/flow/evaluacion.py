@@ -17,6 +17,8 @@ from app.flow.definitions import _time
 from app.flow.definitions import observation_valid
 from app.services.reproduccion import MotorReproduccionValidacion
 
+FLOW_PROGRESS_INTERVAL_SECONDS = 0.5
+
 
 class FlowResultSpool:
     """Per-job JSONL spool so completed node outputs do not accumulate in RAM."""
@@ -59,8 +61,8 @@ class FlowResultSpool:
         self.path.unlink(missing_ok=True)
 
 
-def labelled_report(results, truth):
-    expected = {int(row["raw_index"]): row for row in truth}
+def labelled_report(results, truth, *, truth_index=None):
+    expected = truth_index if truth_index is not None else {int(row["raw_index"]): row for row in truth}
     groups = {}
     for item in results:
         label = expected.get(int(item["source_raw_index"]))
@@ -84,8 +86,8 @@ def labelled_report(results, truth):
     return {"labelled": bool(truth), "groups": list(groups.values()), "matched_rows": sum(g["total"] for g in groups.values())}
 
 
-def statistical_labelled_report(results, truth, node_id):
-    expected = {int(row["raw_index"]): row for row in truth}
+def statistical_labelled_report(results, truth, node_id, *, truth_index=None):
+    expected = truth_index if truth_index is not None else {int(row["raw_index"]): row for row in truth}
     groups = {}
     seen = set()
     for item in results:
@@ -147,6 +149,8 @@ class CausalFlowRunner(FlowRunner):
             progress(0, len(future), "preparation", "Preparando modelos y estados causales")
         performance = {"version": "flow-performance-v2", "phases_ms": {}, "counts": {"future_rows": len(future)}, "included_in": {}}
         phase_started = perf_counter()
+        # Labels stay in reporting; reuse this run's lookup across groups and nodes.
+        truth_index = {int(row["raw_index"]): row for row in truth}
         diagnostic_snapshots = {}
         if hasattr(self.diagnostic, "_run_snapshot"):
             for node in flow["nodes"]:
@@ -259,17 +263,18 @@ class CausalFlowRunner(FlowRunner):
         statistical_preparation_ms = 0.0
         graph_execution_ms = 0.0
         started = perf_counter()
-        if progress:
-            progress(0, len(ordered), "evaluation", "Reproduciendo grupos temporales")
+        last_progress_at = None
         # Equal timestamps are simultaneous; no node can see a later timestamp.
         try:
             for _, batch in ordered.groupby("timestamp_dt", sort=True):
                 batch_started = perf_counter()
-                if progress:
+                if progress and (last_progress_at is None or
+                                 batch_started - last_progress_at >= FLOW_PROGRESS_INTERVAL_SECONDS):
                     progress(processed, len(ordered), "evaluation", "Procesando grupo temporal",
                              current_timestamp=_time(batch["timestamp_dt"].iloc[0]),
                              current_batch_rows=len(batch), groups_completed=groups_completed,
                              group_started_at=pd.Timestamp.now(tz="UTC").isoformat())
+                    last_progress_at = batch_started
                 if available is not None:
                     available = retain(pd.concat([available, batch], ignore_index=True), batch["timestamp_dt"].max())
                 for session in self.diagnostic_sessions.values():
@@ -296,10 +301,10 @@ class CausalFlowRunner(FlowRunner):
                     for node_id, items in batch_outputs.items():
                         outputs[node_id].extend(items)
                 else:
-                    block_report = labelled_report(batch_outputs.get("output", []), truth)
+                    block_report = labelled_report(batch_outputs.get("output", []), truth, truth_index=truth_index)
                     _merge_report_groups(streamed_report_groups, block_report)
                     for node_id in streamed_statistical_groups:
-                        block_stats = statistical_labelled_report(batch_outputs.get(node_id, []), truth, node_id)
+                        block_stats = statistical_labelled_report(batch_outputs.get(node_id, []), truth, node_id, truth_index=truth_index)
                         _merge_report_groups(streamed_statistical_groups[node_id], block_stats)
                     result_sink(batch_outputs)
                     streamed_node_counts.update({key: len(value) for key, value in batch_outputs.items()})
@@ -328,19 +333,24 @@ class CausalFlowRunner(FlowRunner):
                         },
                     })
                     next_checkpoint += 5000
-                if progress:
+                # Always publish the final count, even inside the half-second interval.
+                if progress and (processed == len(ordered) or
+                                 completed_at - last_progress_at >= FLOW_PROGRESS_INTERVAL_SECONDS):
                     progress(processed, len(ordered), "evaluation", "Reproduciendo grupos temporales",
                              current_timestamp=_time(batch["timestamp_dt"].iloc[0]),
                              current_batch_rows=len(batch), groups_completed=groups_completed,
                              last_batch_ms=round((completed_at - batch_started) * 1000, 3),
                              group_started_at=None)
+                    last_progress_at = completed_at
+            if progress and groups_completed == 0:
+                progress(0, len(ordered), "evaluation", "Reproduciendo grupos temporales")
         finally:
             for session in self.diagnostic_sessions.values():
                 session.flush()
         report_started = perf_counter()
         if result_sink is None:
-            report = labelled_report(outputs["output"], truth)
-            statistical_evaluation = {node_id: statistical_labelled_report(outputs.get(node_id, []), truth, node_id) for node_id in self.baselines}
+            report = labelled_report(outputs["output"], truth, truth_index=truth_index)
+            statistical_evaluation = {node_id: statistical_labelled_report(outputs.get(node_id, []), truth, node_id, truth_index=truth_index) for node_id in self.baselines}
             result_count = len(outputs["output"])
             node_counts = {key: len(value) for key, value in outputs.items()}
             final_decisions = dict(Counter(item["final_decision"] for item in outputs["output"]))
@@ -426,6 +436,8 @@ class CausalFlowRunner(FlowRunner):
             valid = observation_valid(item)
             reason = "invalid_state" if not valid else "missing_baseline" if not eligible else None
             evaluable = reason is None
+            if detection is not None and detection.get("suspected_pattern") == "unavailable":
+                evaluable, reason = True, None
             detected = detection is not None
             emitted = alert is not None
             temporal_observation = observations_by_raw.get(str(item.get("source_raw_index")), {})

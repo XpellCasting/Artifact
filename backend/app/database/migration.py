@@ -13,7 +13,6 @@ import shutil
 import socket
 import sqlite3
 
-V2 = "gat_lstm_v2_shared_type"
 VERSION = "artifact-layout-v2"
 
 
@@ -34,8 +33,8 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def is_v2(value):
-    return value.get("method", "gat_lstm") == "gat_lstm" and value.get("config", {}).get("architecture_version") in {V2, "gat_lstm_v3_segments_multiscale"}
+def is_supported(value):
+    return value.get("method", "gat_lstm") == "gat_lstm" and value.get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale"
 
 
 def safe(root, path):
@@ -60,9 +59,9 @@ def old_artifacts(directory):
     """Clasificar por manifiestos, nunca por coincidencias del nombre del archivo."""
     maps = {folder: {p.stem: read_json(p) for p in (directory / folder).glob("*.json")}
             for folder in ("models", "datasets", "configurations", "encoders")}
-    kept = {key: value for key, value in maps["models"].items() if is_v2(value)}
+    kept = {key: value for key, value in maps["models"].items() if is_supported(value)}
     retained_datasets = {m.get("dataset_id") for m in kept.values()}
-    removed = {folder: sorted(key for key, value in entries.items() if not is_v2(value))
+    removed = {folder: sorted(key for key, value in entries.items() if not is_supported(value))
                for folder, entries in maps.items()}
     removed["datasets"] = [key for key in removed["datasets"] if key not in retained_datasets]
     # Some historical metadata is absent; model-owned weights and references are
@@ -166,7 +165,7 @@ def purge_database(root, removed, report):
     path = root / "storage/database/diagnostics.sqlite3"
     if path.exists():
         with closing(sqlite3.connect(path, timeout=1)) as db, db:
-            runs = [(key, read) for key, raw in db.execute("SELECT run_id,payload FROM runs") if not is_v2((read := json.loads(raw)).get("model") or {})]
+            runs = [(key, read) for key, raw in db.execute("SELECT run_id,payload FROM runs") if not is_supported((read := json.loads(raw)).get("model") or {})]
             keys = [r[0] for r in runs]
             # The subquery avoids a parameter limit and removes orphaned old
             # diagnoses as well as snapshots created by the catalogue fallback.
@@ -259,7 +258,7 @@ def migrate(root, *, apply=False, offline=False, progress=print):
     models = root / "models/gat_lstm"
     for p in (root / "data/gat_lstm/datasets").glob("*.json"):
         item = read_json(p)
-        if is_v2(item):
+        if is_supported(item):
             sequences = root / "data/gat_lstm/sequences" / p.stem
             if not sequences.is_dir():
                 raise ValueError(f"Faltan secuencias retenidas: {p.stem}")

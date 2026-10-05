@@ -1,6 +1,8 @@
 export const DEFAULT_GAT_CONFIG = Object.freeze({
-  method: "gat_lstm", schema_version: "gat-lstm-entities-v1", task: "diagnostic_3class",
-  architecture_version: "gat_lstm_v2_shared_type",
+  method: "gat_lstm", schema_version: "gat-lstm-segments-v1", task: "diagnostic_3class",
+  architecture_version: "gat_lstm_v3_segments_multiscale",
+  segment_threshold: .5, local_timezone: "America/Santiago", entity_value_modes: null,
+  segment_encoder: "gat", active_scales: Object.freeze([true, true, true]),
   grid_seconds: 60, sequence_steps: 60, feature_window_seconds: 900,
   labelled_stride_seconds: 300, graph_top_k: 4, max_nodes: 32, entropy_bins: 16,
   dtw_reference_count: 3, dtw_band_fraction: .1, gat_heads: 4, gat_head_dim: 8,
@@ -11,10 +13,7 @@ export const DEFAULT_GAT_CONFIG = Object.freeze({
 
 export const GAT_LABELS = ["normal", "environmental_anomaly", "sensor_fault"];
 export const SEGMENT_ARCHITECTURE = "gat_lstm_v3_segments_multiscale";
-export const DEFAULT_SEGMENT_CONFIG = Object.freeze({ ...DEFAULT_GAT_CONFIG,
-  architecture_version: SEGMENT_ARCHITECTURE, schema_version: "gat-lstm-segments-v1",
-  segment_threshold: .5, local_timezone: "America/Santiago", entity_value_modes: null,
-  segment_encoder: "gat", active_scales: Object.freeze([true, true, true]) });
+export const DEFAULT_SEGMENT_CONFIG = DEFAULT_GAT_CONFIG;
 export const SEGMENT_SCALES = [
   { label: "Corta", hours: 1, resolutionMinutes: 1 },
   { label: "Diaria", hours: 24, resolutionMinutes: 15 },
@@ -23,13 +22,13 @@ export const SEGMENT_SCALES = [
 export const GAT_TRAIN_PARTITIONS = ["train_fit", "dev_tune"];
 
 export function isGatConfigValid(config) {
-  return ["gat_lstm_v2_shared_type", SEGMENT_ARCHITECTURE].includes(config.architecture_version) && !config.pretrain_enabled
-    && (config.architecture_version !== SEGMENT_ARCHITECTURE || (config.schema_version === "gat-lstm-segments-v1"
+  return config.architecture_version === SEGMENT_ARCHITECTURE && !config.pretrain_enabled
+    && (config.schema_version === "gat-lstm-segments-v1"
       && Number.isFinite(config.segment_threshold) && config.segment_threshold > 0 && config.segment_threshold < 1
       && ["gat", "lstm_only"].includes(config.segment_encoder || "gat")
       && (config.active_scales || [true,true,true]).length === 3
       && (config.active_scales || [true,true,true]).every(active => typeof active === "boolean")
-      && (config.active_scales || [true,true,true]).some(Boolean)))
+      && (config.active_scales || [true,true,true]).some(Boolean))
     && Number.isInteger(config.gat_heads) && Number.isInteger(config.gat_head_dim)
     && config.gat_heads * config.gat_head_dim === 32
     && Number.isInteger(config.sequence_steps) && config.sequence_steps >= 2
@@ -60,6 +59,5 @@ export function gatDataConfigCompatible(config, dataset) {
 }
 
 export function gatContextSeconds(config) {
-  if (config.architecture_version === SEGMENT_ARCHITECTURE) return 72 * 3600;
-  return (config.sequence_steps - 1) * config.grid_seconds + config.feature_window_seconds;
+  return config.architecture_version === SEGMENT_ARCHITECTURE ? 72 * 3600 : null;
 }

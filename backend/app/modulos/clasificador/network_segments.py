@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch_geometric.nn import GATConv
-from app.modulos.clasificador.network_v2 import FAULT_TYPES, KIND_TO_ID
+from app.modulos.clasificador.model_constants import FAULT_TYPES, KIND_TO_ID
 from app.modulos.clasificador.segments import ARCHITECTURE, MAX_SEGMENTS, MAX_POINTS, BASE_NAMES
 
 

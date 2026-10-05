@@ -408,8 +408,9 @@ export function ContextEdgeModal({ edge, mapVersion, onClose }) {
               { label: "Origen", value: contextEdgeSource(edge) },
               { label: "Destino", value: contextEdgeTarget(edge) },
               { label: "Familia", value: edge.relation_family || edge.relation_type || "-" },
+              { label: "Vista", value: edge.relation_view === "changes" ? "Cambios / transiciones" : edge.relation_view === "state" ? "Estado conocido" : "Anterior" },
               { label: "Metrica", value: edge.metric || edge.method || "-" },
-              { label: "Signo esperado", value: edge.expected_sign || edge.sign || edge.expected_response || "-" },
+              { label: "Signo esperado", value: formatContextValue(edge.expected_sign || edge.sign || edge.expected_response) },
               { label: "Desfase", value: formatSeconds(edge.lag_seconds ?? edge.lag) },
               { label: "Ventana", value: formatSeconds(edge.window_seconds) },
             ]} />
@@ -418,7 +419,7 @@ export function ContextEdgeModal({ edge, mapVersion, onClose }) {
             <h3>Regla de aceptacion</h3>
             <KeyValueGrid rows={[
               { label: "Observaciones", value: formatCount(contextNumber(edge.n_observations, edge.observations, edge.sample_size)) },
-              { label: "Cobertura", value: coverage === null ? "-" : formatContextPercent(coverage) },
+              { label: edge.pair_support ? "Cobertura comparable" : "Cobertura", value: coverage === null ? "-" : formatContextPercent(coverage) },
               { label: "Estabilidad temporal", value: stability === null ? "-" : formatContextPercent(stability) },
               { label: "Valor p", value: formatContextValue(edge.p_value) },
               { label: "Estado", value: accepted ? "aceptada" : "no aceptada" },
@@ -426,14 +427,41 @@ export function ContextEdgeModal({ edge, mapVersion, onClose }) {
             ]} />
           </article>
         </div>
+        {edge.pair_support && <article className="modal-block">
+          <h3>Respaldo temporal</h3>
+          <KeyValueGrid rows={[
+            { label: "Base de cobertura", value: edge.pair_support.basis === "known_state_overlap" ? "Estado conocido en el histórico compartido" : "Cambios comparables en el histórico compartido" },
+            { label: "Registros coincidentes", value: formatContextPercent(edge.pair_support.coincident_record_coverage) },
+            { label: "Estado conocido en el período completo", value: formatContextPercent(edge.pair_support.known_time_coverage) },
+            { label: "Frescura del estado comparable", value: formatContextPercent(edge.pair_support.fresh_time_coverage) },
+            { label: "Ventanas con registros o cambios de apoyo", value: formatCount(edge.pair_support.independent_observations) },
+            { label: "Días de apoyo (UTC)", value: formatCount(edge.pair_support.support_days_utc) },
+            { label: "Antigüedad máxima del origen", value: formatSeconds(edge.pair_support.source_max_age_seconds) },
+            { label: "Antigüedad máxima del destino", value: formatSeconds(edge.pair_support.target_max_age_seconds) },
+          ]} />
+          <p>Un estado conservado no es una medición reciente. Los días de apoyo no equivalen a episodios físicos independientes.</p>
+        </article>}
+        {edge.view_candidates?.length > 0 && <article className="modal-block">
+          <h3>Vistas evaluadas</h3>
+          {edge.view_candidates.map((candidate) => <div key={candidate.relation_view}>
+            <strong>{candidate.relation_view === "changes" ? "Cambios / transiciones" : "Estado conocido"}{candidate.relation_view === edge.relation_view ? " · seleccionada" : ""}</strong>
+            <KeyValueGrid rows={[
+              { label: "Asociación", value: formatContextValue(candidate.association_signed) },
+              { label: "Cobertura comparable", value: formatContextPercent(candidate.coverage_ratio) },
+              { label: "Ventanas de apoyo", value: formatCount(candidate.n_observations) },
+              { label: "Días de apoyo", value: formatCount(candidate.pair_support?.support_days_utc) },
+              { label: "Controles", value: candidate.threshold_eligible ? "cumple" : contextArray(candidate.rejection_reasons).join(", ") || "no informado" },
+            ]} />
+          </div>)}
+        </article>}
         <article className="modal-block">
           <h3>Estabilidad por periodos</h3>
           {contextArray(edge.stability_windows, edge.period_stability, edge.window_scores, edge.slice_associations).length ? (
             <div className="context-period-list">
               {contextArray(edge.stability_windows, edge.period_stability, edge.window_scores, edge.slice_associations).map((period, index) => (
                 <div key={`${formatContextValue(period?.start)}-${index}`}>
-                  <span>{typeof period === "object" ? `${shortDate(period.start || period.window_start)} → ${shortDate(period.end || period.window_end)}` : `Periodo ${index + 1}`}</span>
-                  <strong>{typeof period === "object" ? formatContextValue(period.association ?? period.score ?? period.stability) : formatContextValue(period)}</strong>
+                  <span>{period != null && typeof period === "object" ? `${shortDate(period.start || period.window_start)} → ${shortDate(period.end || period.window_end)}` : `Periodo ${index + 1}`}</span>
+                  <strong>{period == null ? "Sin datos suficientes" : typeof period === "object" ? formatContextValue(period.association ?? period.score ?? period.stability) : formatContextValue(period)}</strong>
                 </div>
               ))}
             </div>
@@ -452,7 +480,7 @@ export function ContextEdgeModal({ edge, mapVersion, onClose }) {
                   { label: "Cobertura", value: formatContextPercent(candidate.coverage_ratio) },
                   { label: "Asociacion", value: formatContextValue(candidate.association_signed) },
                   { label: "Desfase", value: formatSeconds(candidate.lag_seconds) },
-                  { label: "Controles", value: candidate.threshold_eligible ? "cumple" : candidate.rejection_reasons.join(", ") },
+                  { label: "Controles", value: candidate.threshold_eligible ? "cumple" : contextArray(candidate.rejection_reasons).join(", ") || "no informado" },
                 ]} />
               </div>
             ))}

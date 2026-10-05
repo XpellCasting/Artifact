@@ -4,7 +4,7 @@ import { DEFAULT_GAT_CONFIG, gatContextSeconds, gatDataConfigCompatible, gatSupp
 
 test("GAT defaults expose the planned causal CPU configuration", () => {
   assert.equal(isGatConfigValid(DEFAULT_GAT_CONFIG), true);
-  assert.equal(gatContextSeconds(DEFAULT_GAT_CONFIG), 4440);
+  assert.equal(gatContextSeconds(DEFAULT_GAT_CONFIG), 259200);
   assert.equal(DEFAULT_GAT_CONFIG.device, "cpu");
   assert.equal(DEFAULT_GAT_CONFIG.pretrain_enabled, false);
 });
@@ -29,4 +29,8 @@ test("temporal and graph changes require a newly prepared dataset", () => {
   assert.equal(gatDataConfigCompatible(DEFAULT_GAT_CONFIG, dataset), true);
   assert.equal(gatDataConfigCompatible({ ...DEFAULT_GAT_CONFIG, graph_top_k: 3 }, dataset), false);
   assert.equal(gatDataConfigCompatible({ ...DEFAULT_GAT_CONFIG, pretrain_enabled: true }, dataset), false);
+});
+
+test("retired sensor architecture is rejected", () => {
+  assert.equal(isGatConfigValid({ ...DEFAULT_GAT_CONFIG, architecture_version: "gat_lstm_v2_shared_type" }), false);
 });

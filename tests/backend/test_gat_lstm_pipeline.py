@@ -47,13 +47,13 @@ class PipelineTests(unittest.TestCase):
     def test_persists_causal_dataset_and_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            boundaries = [datetime(2026, 2, day, tzinfo=timezone.utc) for day in range(1, 5)]
+            boundaries = [datetime(2026, 2, day, tzinfo=timezone.utc) for day in (1, 21, 23, 25)]
             names = ["desarrollo", "validacion", "prueba", "reserva_agosto"]
             parts = {}
             dev_file = root / "development.csv"
             rows = []
             start = boundaries[0]
-            for minute in range(0, 24 * 60, 5):
+            for minute in range(0, 20 * 24 * 60, 5):
                 at = start + timedelta(minutes=minute)
                 rows.append({"entity_id": "sensor.a", "state": str(10 + minute / 100),
                              "last_changed": at.isoformat().replace("+00:00", "Z")})
@@ -68,7 +68,7 @@ class PipelineTests(unittest.TestCase):
             manifest = root / "manifest.json"
             manifest.write_text(json.dumps({"boundaries": [b.isoformat() for b in boundaries],
                                             "partitions": parts}), encoding="utf-8")
-            target_at = datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc)
+            target_at = datetime(2026, 2, 5, 10, 0, tzinfo=timezone.utc)
             target_row = next(i for i, row in enumerate(rows, 2)
                               if datetime.fromisoformat(row["last_changed"].replace("Z", "+00:00")) == target_at)
             annotation = {"annotation_id": "a1", "dataset_id": "fixture", "source_sha256": parts["desarrollo"]["sha256"],
@@ -78,7 +78,7 @@ class PipelineTests(unittest.TestCase):
                           "reference_origin": "historical_review", "parent_episode_id": "ep1"}
             graph = {"entity_ids": ["sensor.a"], "adjacency": [[True]], "edges": [],
                      "spatial_evidence": False, "graph_version": "fixture"}
-            with patch("app.modulos.clasificador.pipeline.build_graph", return_value=graph):
+            with patch("app.modulos.clasificador.segments.fit_spec", wraps=__import__("app.modulos.clasificador.segments", fromlist=["fit_spec"]).fit_spec):
                 dataset = build_sequence_dataset(ReviewFixture(annotation), ["canonical:desarrollo"], ["a1"],
                     Config(), root / "diagnostics", manifest)
             train = load_partition(dataset, "train_fit")
@@ -92,15 +92,15 @@ class PipelineTests(unittest.TestCase):
     def test_labeled_development_import_trains_directly_and_never_creates_holdout_arrays(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            bounds = [datetime(2026, 2, day, tzinfo=timezone.utc) for day in range(1, 5)]
+            bounds = [datetime(2026, 2, day, tzinfo=timezone.utc) for day in (1, 21, 23, 25)]
             csv_path = root / "development-labeled.csv"
             start = bounds[0]
             with csv_path.open("w", encoding="utf-8", newline="") as stream:
                 writer = csv.DictWriter(stream, fieldnames=["entity_id", "state", "last_changed",
                     "es_sintetica", "tipo", "tipo_falla"])
                 writer.writeheader()
-                for index in range(24 * 12):
-                    at = start + timedelta(minutes=5 * index)
+                for index in range(20 * 24):
+                    at = start + timedelta(hours=index)
                     label = ("normal", "anomalia", "Falla")[index % 3]
                     writer.writerow({"entity_id": "sensor.a", "state": str(10 + index % 20),
                         "last_changed": at.isoformat().replace("+00:00", "Z"),
@@ -109,7 +109,7 @@ class PipelineTests(unittest.TestCase):
             digest = hashlib.sha256(csv_path.read_bytes()).hexdigest()
             manifest = root / "manifest.json"
             manifest.write_text(json.dumps({"boundaries": [b.isoformat() for b in bounds],
-                "partitions": {"desarrollo": {"path": str(csv_path), "sha256": digest, "rows": 288},
+                "partitions": {"desarrollo": {"path": str(csv_path), "sha256": digest, "rows": 480},
                     "validacion": {"path": str(root / "validation.csv"), "sha256": "unused", "rows": 0},
                     "prueba": {"path": str(root / "test.csv"), "sha256": "unused", "rows": 0}}}),
                 encoding="utf-8")
@@ -117,14 +117,14 @@ class PipelineTests(unittest.TestCase):
             review.paths["labeled-dev"] = csv_path
             review.datasets = [{"dataset_id": "labeled-dev", "filename": csv_path.name,
                 "partition": "development", "labelled_import": True, "columns": ["entity_id", "state",
-                    "last_changed", "es_sintetica", "tipo", "tipo_falla"], "imported_labels": 288,
-                "imported_synthetic": 48, "rows": 288, "sha256": digest,
-                "start": start.isoformat(), "end": (start + timedelta(minutes=1435)).isoformat()}]
+                    "last_changed", "es_sintetica", "tipo", "tipo_falla"], "imported_labels": 480,
+                "imported_synthetic": 80, "rows": 480, "sha256": digest,
+                "start": start.isoformat(), "end": (start + timedelta(hours=479)).isoformat()}]
             sources = development_sources(manifest, review)
             self.assertEqual([item["source_id"] for item in sources], ["canonical:desarrollo", "review:labeled-dev"])
             graph = {"entity_ids": ["sensor.a"], "adjacency": [[True]], "edges": [],
                      "spatial_evidence": False, "graph_version": "fixture"}
-            with patch("app.modulos.clasificador.pipeline.build_graph", return_value=graph):
+            with patch("app.modulos.clasificador.segments.fit_spec", wraps=__import__("app.modulos.clasificador.segments", fromlist=["fit_spec"]).fit_spec):
                 dataset = build_sequence_dataset(review, ["review:labeled-dev"], [],
                     Config(sequence_steps=2, feature_window_seconds=60, labelled_stride_seconds=300,
                            max_nodes=32, graph_top_k=0, use_entropy=False, use_dtw=False),
@@ -145,7 +145,7 @@ class PipelineTests(unittest.TestCase):
     def test_validation_and_test_sources_are_rejected_before_their_files_are_opened(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            bounds = [datetime(2026, 2, day, tzinfo=timezone.utc) for day in range(1, 5)]
+            bounds = [datetime(2026, 2, day, tzinfo=timezone.utc) for day in (1, 21, 23, 25)]
             dev = root / "development.csv"
             dev.write_text("entity_id,state,last_changed\nsensor.a,1,2026-02-01T00:00:00Z\n", encoding="utf-8")
             manifest = root / "manifest.json"

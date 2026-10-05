@@ -143,6 +143,8 @@ def calibrate_relation(filtro, edge, partitions, prepared, report=None):
     if report:
         report(.95, 'ajustando modelos y umbrales')
     models = {name: filtro._ajustar_modelo_temporal(name, fit[name], tolerance[name]) for name in FAMILIES}
+    if edge.get('relation_view') == 'changes':
+        models['level'] = {'status': 'excluded', 'reason': 'change_relation_does_not_support_level'}
     return {'partitioning': partitions, 'models': models,
             'sample_counts': {name: {'fit': len(fit[name]), 'tolerance': len(tolerance[name])} for name in models}}
 

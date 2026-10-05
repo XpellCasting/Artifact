@@ -34,6 +34,7 @@ IMPLEMENTATION_FILES = (
     "modulos/estadistico/residuos_secuenciales.py",
     "services/entrenamiento_paralelo.py",
     "modulos/estadistico/estados_binarios.py",
+    "modulos/estadistico/bernoulli.py",
     "modulos/estadistico/estados_multivalor.py",
 )
 
@@ -120,7 +121,7 @@ def implementation_sha256(app_dir: Path | None = None) -> str:
 
 
 def runtime_versions() -> dict[str, str]:
-    return {"python": platform.python_version(), "pandas": pd.__version__, "numpy": np.__version__, "scikit_learn": sklearn.__version__, "changepoint_online": package_version("changepoint-online")}
+    return {"python": platform.python_version(), "pandas": pd.__version__, "numpy": np.__version__, "scikit_learn": sklearn.__version__, "focus_cpt": package_version("focus-cpt")}
 
 
 def build_identity(events: pd.DataFrame, entities: pd.DataFrame, manual_overrides: dict[str, Any], *, implementation_hash: str | None = None, runtime: dict[str, str] | None = None) -> dict[str, Any]:

@@ -89,50 +89,44 @@ def class_weights_from_episodes(samples, device="cpu"):
 
 def train_classifier(train_samples, dev_samples, config, category_sizes, entity_kinds,
                      progress=None, encoder=None, batch_progress=None):
-    if config.architecture_version not in {"gat_lstm_v2_shared_type", "gat_lstm_v3_segments_multiscale"} or encoder is not None:
-        raise ValueError("Solo se admite GAT-LSTM v2 sin encoder predictivo externo")
-    if config.architecture_version == "gat_lstm_v3_segments_multiscale":
-        from dataclasses import replace
-        trials = []
-        best = None
-        for trial, threshold in enumerate((.3, .5, .7) if config.segment_encoder == "gat" else (.5,)):
-            notify = (lambda row: progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if progress else None
-            notify_batch = (lambda row: batch_progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if batch_progress else None
-            candidate, scores = _train_shared_type_classifier(train_samples, dev_samples,
-                replace(config, segment_threshold=threshold), entity_kinds, notify, notify_batch)
-            rank = (scores.get("dev_macro_f1") or 0., threshold)
-            trials.append({"threshold": threshold, "macro_f1": rank[0]})
-            if best is None or rank > best[0]:
-                best = (rank, candidate, scores)
-        _, model, scores = best
-        scores["segment_threshold_search"] = trials
-        scores["selected_segment_threshold"] = model.threshold
-        return model, scores
-    return _train_shared_type_classifier(train_samples, dev_samples, config, entity_kinds,
-                                         progress, batch_progress)
+    if config.architecture_version not in {"gat_lstm_v3_segments_multiscale"} or encoder is not None:
+        raise ValueError("Solo se admite GAT-LSTM por segmentos sin encoder predictivo externo")
+    from dataclasses import replace
+    trials = []
+    best = None
+    for trial, threshold in enumerate((.3, .5, .7) if config.segment_encoder == "gat" else (.5,)):
+        notify = (lambda row: progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if progress else None
+        notify_batch = (lambda row: batch_progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if batch_progress else None
+        candidate, scores = _train_segment_classifier(train_samples, dev_samples,
+            replace(config, segment_threshold=threshold), entity_kinds, notify, notify_batch)
+        rank = (scores.get("dev_macro_f1") or 0., threshold)
+        trials.append({"threshold": threshold, "macro_f1": rank[0]})
+        if best is None or rank > best[0]:
+            best = (rank, candidate, scores)
+    _, model, scores = best
+    scores["segment_threshold_search"] = trials
+    scores["selected_segment_threshold"] = model.threshold
+    return model, scores
 
 
-def _train_shared_type_classifier(train_samples, dev_samples, config, entity_kinds,
+
+def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
                                   progress=None, batch_progress=None):
-    from app.modulos.clasificador.network_v2 import FAULT_TYPES
-    from app.modulos.clasificador.network_v2 import SharedSensorGATLSTM
+    from app.modulos.clasificador.model_constants import FAULT_TYPES
 
     if not train_samples or not dev_samples:
         raise ValueError("insufficient_labels: faltan ejemplos de ajuste o dev_tune")
     if config.device != "cpu":
-        raise ValueError("GAT-LSTM v2 requiere CPU en esta versión")
+        raise ValueError("GAT-LSTM por segmentos requiere CPU en esta versión")
     torch.manual_seed(config.seed)
     device = torch.device("cpu")
     weights, support = class_weights_from_episodes(train_samples, device)
     _, dev_support = class_weights_from_episodes(dev_samples, device)
     feature_dim = len(train_samples[0]["X"][0][0])
     if len(entity_kinds) != len(train_samples[0]["X"][0]):
-        raise ValueError("Tipos de sensor incompletos para GAT-LSTM v2")
-    if config.architecture_version == "gat_lstm_v3_segments_multiscale":
-        from app.modulos.clasificador.network_segments import SegmentGATLSTM
-        model = SegmentGATLSTM(feature_dim, entity_kinds, config).to(device)
-    else:
-        model = SharedSensorGATLSTM(feature_dim, entity_kinds, config).to(device)
+        raise ValueError("Tipos de sensor incompletos para GAT-LSTM por segmentos")
+    from app.modulos.clasificador.network_segments import SegmentGATLSTM
+    model = SegmentGATLSTM(feature_dim, entity_kinds, config).to(device)
     episode_key = lambda meta, i: meta.get("parent_episode_id", meta.get("sample_id", str(i)))
     episode_counts = Counter(episode_key(row["metadata"], i)
                              for i, row in enumerate(sample_summaries(train_samples)))
@@ -362,7 +356,7 @@ def load_candidate(identifier: str, directory: Path):
     if hashlib.sha256(weights.read_bytes()).hexdigest() != manifest["weights_sha256"]:
         raise ValueError("Hash de pesos incompatible")
     from app.modulos.clasificador.config import Config
-    if manifest.get("config", {}).get("architecture_version") not in {"gat_lstm_v2_shared_type", "gat_lstm_v3_segments_multiscale"}:
+    if manifest.get("config", {}).get("architecture_version") not in {"gat_lstm_v3_segments_multiscale"}:
         raise ValueError("Arquitectura retirada o no declarada")
     config = Config(**manifest["config"])
     architecture = manifest.get("architecture_version", config.architecture_version)
@@ -371,14 +365,10 @@ def load_candidate(identifier: str, directory: Path):
     preprocessor = json.loads((directory / "preprocessors" / f"{identifier}.json").read_text(encoding="utf-8"))
     graph = json.loads((directory / "graphs" / f"{identifier}.json").read_text(encoding="utf-8"))
     kinds = [preprocessor["entities"][e]["kind"] for e in preprocessor["entity_ids"]]
-    if architecture not in {"gat_lstm_v2_shared_type", "gat_lstm_v3_segments_multiscale"}:
-        raise ValueError("El modelo requiere GAT-LSTM v2 explícito")
-    from app.modulos.clasificador.network_v2 import SharedSensorGATLSTM
-    if architecture == "gat_lstm_v3_segments_multiscale":
-        from app.modulos.clasificador.network_segments import SegmentGATLSTM
-        model = SegmentGATLSTM(len(preprocessor["feature_names"]), kinds, config)
-    else:
-        model = SharedSensorGATLSTM(len(preprocessor["feature_names"]), kinds, config)
+    if architecture not in {"gat_lstm_v3_segments_multiscale"}:
+        raise ValueError("El modelo requiere GAT-LSTM por segmentos explícito")
+    from app.modulos.clasificador.network_segments import SegmentGATLSTM
+    model = SegmentGATLSTM(len(preprocessor["feature_names"]), kinds, config)
     model.load_state_dict(torch.load(weights, map_location="cpu", weights_only=True))
     model.eval()
     return model, preprocessor, graph, manifest

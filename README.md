@@ -1,9 +1,11 @@
-# Artifact: filtros y diagnóstico GAT-LSTM v2
+# Artifact: filtros y diagnóstico GAT-LSTM por segmentos
 
 Aplicación local de la tesis: revisión de históricos, filtros estadístico y contextual,
-diagnóstico GAT-LSTM v2 y evaluación de flujos causales. La reorganización conserva
-las reglas de sensores binarios y multivalor. Los sensores continuos usan únicamente
-FOCuS sobre residuos mediante `changepoint-online==1.2.1`; se retiraron los detectores
+diagnóstico GAT-LSTM por segmentos y evaluación de flujos causales. Los sensores binarios
+usan FOCuS Bernoulli sobre lecturas 0/1, con estimación basal y calibración separadas
+temporalmente. Multiestados conserva sus reglas mientras se revisa su alternativa categórica.
+Los sensores continuos usan únicamente
+FOCuS sobre residuos mediante `focus-cpt==0.1.10`; se retiraron los detectores
 antiguos Hampel/CUSUM/DSPOT, la detección por intervalos y la alternativa EWMA.
 
 ## Organización
@@ -22,7 +24,7 @@ backend/app/
   flow/                 # Definición, validación, ejecución y evaluación del grafo
   nodos/                # Comportamiento de los nodos
   modulos/
-    estadistico/        # FOCuS para continuos y reglas de binarios/multivalor
+    estadistico/        # FOCuS continuo/Bernoulli binario; reglas multivalor
     contextual/         # Filtro contextual y calibración
     clasificador/       # Red, atención, características, entrenamiento e inferencia v2
   database/             # Repositorios SQLite y migración de almacenamiento
@@ -50,6 +52,31 @@ artifacts/gat_lstm/      # Paquete publicado en Git LFS, conservado
 Cada funcionalidad conserva su propia base SQLite. Los datos locales, pesos y bases
 no se versionan. `artifacts/gat_lstm/` sigue siendo el paquete compartible mediante
 Git LFS; `models/` contiene los modelos de la instalación.
+
+## Históricos del experimento actual
+
+Las fuentes para los filtros están en `data/history/en_uso/`: `2mesesDesarrollo.csv`
+(abril-mayo de 2026), `4mesesDesarrollo.csv` (febrero-mayo) y
+`EvaluacionJunioAgosto.csv` (junio hasta la última lectura disponible del 25 de
+agosto). Se unen todas las entidades de los seis originales conservados en
+`../HistoricoPuro/SebaDatos6meses/`, sin selección de sensores. Ambos ajustes usan
+la misma Evaluación futura. Los estados de revisión empiezan el 13 de mayo;
+por eso el conjunto de 2 meses usa los dos últimos meses de Desarrollo.
+
+`data/history/en_uso/ground_truth.csv` contiene 163.596 lecturas de los 14 sensores
+seleccionados, de junio al 25 de agosto, etiquetadas por reglas y revisiones
+compatibles. Tiene un mínimo de dos tipos de falla por sensor; las intervenciones
+controladas se marcan con `es_sintetica=true`. Las etiquetas sobre datos reales
+son estimaciones. `etiquetado_14_sensores/METODOLOGIA.md` y su resumen por sensor
+documentan las etapas y los estados originales. Su `LEEME.md` detalla el protocolo;
+`manifiesto.json` conserva hashes, cobertura y verificaciones, y `limpieza.json`
+registra las particiones y exportaciones antiguas retiradas. Las fuentes internas
+de anotaciones y modelos se conservan en `data/review`.
+
+La aplicación carga el Desarrollo elegido en `data/history/cargados/history.csv`
+y las lecturas futuras en `data/history/cargados/historico_validacion.csv`.
+Estas son copias operativas; los dos CSV de Desarrollo de `en_uso` se conservan
+para poder alternar entre experimentos sin sobrescribirlos.
 
 ## Migrar una instalación anterior
 
@@ -114,17 +141,17 @@ principal crea un espacio aislado, útil para pruebas.
 
 ## Contrato del clasificador
 
-- Único método: `gat_lstm`; única arquitectura: `gat_lstm_v2_shared_type`.
-- Se conserva `schema_version="gat-lstm-entities-v1"`: identifica el esquema de
+- Único método: `gat_lstm`; única arquitectura: `gat_lstm_v3_segments_multiscale`.
+- Se usa `schema_version="gat-lstm-segments-v1"`: identifica el esquema de
   datos, no la arquitectura retirada.
 - Conserva clases Normal, anomalía ambiental y falla del sensor, más la cabeza de
-  tipo de falla y la política de abstención de v2.
-- Los artefactos deben declarar v2 explícitamente. Los modelos sin arquitectura
-  declarada no se reinterpretan como v2.
-- Sin modelo v2 utilizable, la salida es indeterminada con
+  tipo de falla y la política de abstención.
+- Los artefactos deben declarar la arquitectura de segmentos explícitamente. Los modelos sin arquitectura
+  declarada no se reinterpretan como modelos de segmentos.
+- Sin modelo de segmentos utilizable, la salida es indeterminada con
   `diagnosis_mode="unavailable"`; no hay fallback a patrones.
 - Se retiraron `/diagnostics/pretrain` y su script. `pretrain_enabled=false` y los
-  campos históricos de configuración se aceptan para cargar artefactos v2 existentes;
+  campos históricos de configuración se aceptan por compatibilidad del formato de configuración;
   activar preentrenamiento se rechaza.
 - Se mantienen las rutas de las funcionalidades conservadas. Entrenar requiere
   Desarrollo y el soporte supervisado existente, incluido el tipo de falla. La política
