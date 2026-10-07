@@ -22,6 +22,7 @@ LEGACY_FEATURE_SCHEMA_VERSION = "continuous-temporal-causal-v1"
 HISTORY_SIZE = 12
 FEATURE_WIDTH = HISTORY_SIZE * 2 + 6 + 16
 QUANTILES = (0.05, 0.50, 0.95)
+PREDICTION_MODE = "recent_median_increment_v1"
 MIN_TRAINING_SAMPLES = 500
 MODEL_PARAMETERS = {
     "loss": "quantile", "learning_rate": 0.05, "max_iter": 100,
@@ -75,6 +76,25 @@ def causal_features(history: Iterable[tuple[Any, float]], at: Any, *, feature_sc
                          math.log1p(min(constant_age, seconds)), math.log1p(float(durations.max()))])
     return np.concatenate([base, temporal])
 
+
+def increment_features(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Anchor value features to the median of past readings; keep time and spread.
+
+    The target is also an increment. A constant shift of the entire past then
+    shifts the forecast by the same amount, including beyond the training range.
+    Accept both feature schemas used by the comparison script.
+    """
+    vectors = np.asarray(features, dtype=float)
+    anchor = vectors[..., 2 * HISTORY_SIZE].copy()
+    relative = vectors.copy()
+    value_indices = [*range(HISTORY_SIZE), 2 * HISTORY_SIZE,
+                     2 * HISTORY_SIZE + 2, 2 * HISTORY_SIZE + 3]
+    if vectors.shape[-1] == FEATURE_WIDTH:
+        value_indices.extend(2 * HISTORY_SIZE + 7 + 5 * i for i in range(3))
+    relative[..., value_indices] -= np.expand_dims(anchor, -1)
+    return relative, anchor
+
+
 @dataclass(frozen=True)
 class TemporalSensorModel:
     models: tuple[Any, Any, Any]
@@ -82,13 +102,23 @@ class TemporalSensorModel:
     training_value_floor: float
     metadata: dict[str, Any]
 
+    def _inputs(self, features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self.metadata.get("prediction_mode") == PREDICTION_MODE:
+            return increment_features(features)
+        return features, np.zeros(np.asarray(features).shape[:-1])
+
+    def predict_medians(self, features: np.ndarray) -> np.ndarray:
+        inputs, anchor = self._inputs(features)
+        return self.models[1].predict(inputs) + anchor
+
     def predict_median(self, features: np.ndarray) -> float:
-        return float(self.models[1].predict(features.reshape(1, -1))[0])
+        return float(self.predict_medians(features.reshape(1, -1))[0])
 
     def predict_raw(self, features: np.ndarray) -> tuple[float, float, float]:
         # Preserve quantile identities even when predictions cross: residuals
         # must always use the q=.50 estimator at position 1.
-        predicted = [float(model.predict(features.reshape(1, -1))[0]) for model in self.models]
+        inputs, anchor = self._inputs(features.reshape(1, -1))
+        predicted = [float(model.predict(inputs)[0] + anchor[0]) for model in self.models]
         return predicted[0], predicted[1], predicted[2]
 
 class FiltroContinuoTemporal:

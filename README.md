@@ -8,6 +8,24 @@ Los sensores continuos usan únicamente
 FOCuS sobre residuos mediante `focus-cpt==0.1.10`; se retiraron los detectores
 antiguos Hampel/CUSUM/DSPOT, la detección por intervalos y la alternativa EWMA.
 
+El predictor continuo aprende el cambio respecto de la mediana de las doce
+lecturas anteriores. Las características de nivel se expresan respecto de esa
+misma mediana y el pronóstico se devuelve en unidades originales. Esto evita
+que el predictor quede limitado al rango absoluto de temperaturas visto en
+Desarrollo; una lectura actual o futura nunca entra en su referencia. Los
+residuos de normalización, calibración y evaluación usan el mismo pronóstico.
+La nueva implementación invalida las referencias y cachés anteriores.
+
+La decisión contextual continua calibra cada combinación de familias de
+evidencia por cantidad de vecinos evaluables en cada familia. Una cobertura
+sin suficientes muestras históricas queda sin conclusión; no se reutiliza el
+umbral de otra cantidad de vecinos. Los mapas anteriores se reconstruyen.
+
+La evaluación del flujo cuenta falsos positivos por lectura, incluidas las
+repeticiones cuya alerta se suprime. El detalle estadístico por entidad muestra
+por separado esos errores y las alertas emitidas sobre lecturas normales.
+Las ejecuciones guardadas conservan sus resultados originales.
+
 La referencia continua separa entrenamiento, normalización y calibración por
 bloques temporales de 24 horas desde el primer evento de cada entidad, con unos
 70/15/15 % del tiempo y al menos siete días en cada reserva. El fragmento final
@@ -62,6 +80,13 @@ Para repetir la comprobación sobre un histórico y etiquetas existentes, usar
 `PYTHONPATH=backend python scripts/verify_daily_coverage.py --development <csv>
 --evaluation <csv> --truth-database <sqlite> --output <directorio>`. Este comando
 guarda referencias y un informe nuevos sin modificar la base de etiquetas.
+
+Para verificar únicamente un sensor, ejecutar `PYTHONPATH=backend python
+scripts/verify_false_positive_corrections.py --development <csv> --evaluation
+<csv> --truth-database <sqlite> --entity sensor.weatherstation_inside_temp_2
+--output <informe.json>`. El informe conserva el modelo de referencia, los
+falsos positivos por lectura y por alerta emitida, y las detecciones de fallas
+etiquetadas. No ajusta umbrales usando las etiquetas ni cambia ejecuciones.
 
 ## Procesamiento contextual
 

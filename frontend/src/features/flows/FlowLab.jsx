@@ -275,11 +275,29 @@ export default function FlowLab(props) { return <ReactFlowProvider><FlowLabConte
 const EVALUATION_LABELS = { detectado: "Detectado", no_detectado: "No detectado", falso_positivo: "Falso positivo", normal_correcto: "Normal correcto", no_evaluable: "No evaluable", sin_etiqueta: "Sin etiqueta" };
 export function FlowLabelReport({ report }) {
   if (!report?.labelled) return <p className="fl-muted">Esta ejecución no tiene etiquetas de referencia para medir detecciones y errores.</p>;
-  return <section aria-label="Detección de datos etiquetados"><h3>Qué identifica este flujo</h3><p>Se cuenta como detección una sospecha, una falla compatible o una anomalía ambiental en la salida final. Identificar el tipo exige que el diagnóstico coincida con tipo_falla; una sospecha sola no identifica el tipo.</p><div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Etiqueta</th><th>Origen</th><th>Tipo esperado</th><th>Detectadas / total</th><th>Evaluadas sin sospecha</th><th>Tipo identificado</th><th>Falsos positivos</th><th>Sin evaluación / sin conclusión</th></tr></thead><tbody>{report.groups.map((row, i) => <tr key={i}><td>{row.entity_id}</td><td>{row.expected}</td><td>{row.synthetic ? "Inyectado" : "No inyectado"}</td><td>{row.fault_type || "—"}</td><td>{["Falla", "anomalia"].includes(row.expected) ? `${row.detected} / ${row.total}` : `— / ${row.total}`}</td><td>{["Falla", "anomalia"].includes(row.expected) ? (row.missed_evaluable ?? Math.max(0, row.missed - row.indeterminate)) : "—"}</td><td>{row.fault_type ? row.type_identified : "—"}</td><td>{row.false_positives}</td><td>{row.indeterminate}</td></tr>)}</tbody></table></div><p className="fl-hint">Las lecturas sin etiqueta no cuentan como normales. Los casos sin evaluación o sin conclusión se muestran aparte de las lecturas evaluadas sin sospecha. Consulta la Salida final para revisar el motivo.</p></section>;
+  return <section aria-label="Detección de datos etiquetados"><h3>Qué identifica este flujo</h3><p>Se cuenta como detección una sospecha, una falla compatible o una anomalía ambiental en la salida final. Identificar el tipo exige que el diagnóstico coincida con tipo_falla; una sospecha sola no identifica el tipo.</p><div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Etiqueta</th><th>Origen</th><th>Tipo esperado</th><th>Detectadas / total</th><th>Evaluadas sin sospecha</th><th>Tipo identificado</th><th>Falsos positivos (lecturas)</th><th>Sin evaluación / sin conclusión</th></tr></thead><tbody>{report.groups.map((row, i) => <tr key={i}><td>{row.entity_id}</td><td>{row.expected}</td><td>{row.synthetic ? "Inyectado" : "No inyectado"}</td><td>{row.fault_type || "—"}</td><td>{["Falla", "anomalia"].includes(row.expected) ? `${row.detected} / ${row.total}` : `— / ${row.total}`}</td><td>{["Falla", "anomalia"].includes(row.expected) ? (row.missed_evaluable ?? Math.max(0, row.missed - row.indeterminate)) : "—"}</td><td>{row.fault_type ? row.type_identified : "—"}</td><td>{row.false_positives}</td><td>{row.indeterminate}</td></tr>)}</tbody></table></div><p className="fl-hint">Los falsos positivos cuentan lecturas, incluidas las repeticiones con alerta suprimida. El detalle estadístico separa las alertas emitidas. Las lecturas sin etiqueta no cuentan como normales. Los casos sin evaluación o sin conclusión se muestran aparte de las lecturas evaluadas sin sospecha. Consulta la Salida final para revisar el motivo.</p></section>;
 }
-function StatisticalLabelReport({ reports, version }) {
+export function StatisticalLabelReport({ reports, version }) {
   if (version !== "pre_suppression_v1") return <p className="fl-muted">Evaluación anterior: conteo basado en alertas emitidas. La métrica previa a supresión no está disponible.</p>;
-  return <section aria-label="Detección estadística por lectura"><h3>Detección estadística por lectura, antes de suprimir alertas</h3><p>Evaluación de lecturas recibidas por el nodo. Una lectura no evaluable no confirma normalidad ni se cuenta como falla detectada.</p>{Object.entries(reports || {}).map(([nodeId, report]) => { const groups = report.groups || []; const sum = field => groups.reduce((total, row) => total + (row[field] || 0), 0); return <div key={nodeId}><h4>{nodeId}</h4><div className="fl-metrics"><span><strong>{sum("detected")}</strong>Detecciones</span><span><strong>{sum("alerted_rows")}</strong>Alertas emitidas</span><span><strong>{sum("suppressed_rows")}</strong>Lecturas suprimidas</span><span><strong>{sum("non_evaluable")}</strong>No evaluables</span></div></div>; })}</section>;
+  return <section aria-label="Detección estadística por lectura">
+    <h3>Detección estadística por lectura, antes de suprimir alertas</h3>
+    <p>Cada lectura sospechosa cuenta, aunque su alerta se suprima por repetición. Los falsos positivos por lectura y las alertas emitidas sobre lecturas normales se muestran por separado. Una lectura no evaluable no confirma normalidad.</p>
+    {Object.entries(reports || {}).map(([nodeId, report]) => {
+      const groups = report.groups || [];
+      const sum = field => groups.reduce((total, row) => total + (row[field] || 0), 0);
+      return <div key={nodeId}><h4>{nodeId}</h4>
+        <div className="fl-metrics"><span><strong>{sum("detected")}</strong>Detecciones</span><span><strong>{sum("alerted_rows")}</strong>Alertas emitidas</span><span><strong>{sum("suppressed_rows")}</strong>Lecturas suprimidas</span><span><strong>{sum("non_evaluable")}</strong>No evaluables</span></div>
+        <div className="fl-table-scroll"><table><thead><tr>
+          <th>Entidad</th><th>Etiqueta / tipo</th><th>Origen</th><th>Evaluadas / recibidas</th><th>Falsos positivos: lecturas</th><th>Falsos positivos: alertas emitidas</th><th>Alertas emitidas</th><th>Lecturas suprimidas</th>
+        </tr></thead><tbody>{groups.map((row, i) => <tr key={i}>
+          <td>{row.entity_id}</td><td>{row.expected}{row.fault_type ? ` / ${row.fault_type}` : ""}</td><td>{row.synthetic ? "Inyectado" : "No inyectado"}</td>
+          <td>{row.evaluable} / {row.total}</td><td>{row.false_positives}</td>
+          <td>{row.expected === "normal" ? (row.false_positive_alerts ?? row.alerted_rows ?? "—") : "—"}</td>
+          <td>{row.alerted_rows ?? "—"}</td><td>{row.suppressed_rows ?? "—"}</td>
+        </tr>)}</tbody></table></div>
+      </div>;
+    })}
+  </section>;
 }
 
 const CALIBRATION_REASONS = {

@@ -112,4 +112,5 @@ class FocusCalibrationTests(unittest.TestCase):
             flow, development, future, entities, {}, baseline, truth)
         actual = evaluate_statistical_batches(FiltroEstadistico(), baseline, future, entities, truth, chunk_size=2)
         self.assertEqual(expected["evaluation"], actual["evaluation"])
+        self.assertEqual(expected["statistical_evaluation"], actual["statistical_evaluation"])
         self.assertEqual(expected["by_final_decision"], actual["by_final_decision"])

@@ -90,7 +90,7 @@ class ContextualViewsTests(unittest.TestCase):
         filtro=FiltroContextualEspacioTemporal(ConfiguracionContextual(window_candidates_seconds=(3600,),max_lag_windows=0,
                                                temporal_model_min_observations=5,temporal_decision_min_observations=5))
         result=filtro.construir_mapa(events,entities)
-        self.assertEqual(result['map_version'],'contextual-spatiotemporal-v7')
+        self.assertEqual(result['map_version'], filtro.MAP_VERSION)
         self.assertTrue(result['edges'])
         self.assertIn('pair_support',result['edges'][0])
         json.dumps(result,allow_nan=False)

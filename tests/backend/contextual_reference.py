@@ -1,4 +1,4 @@
-"""Oráculo escalar previo a la optimización, solo para pruebas."""
+"""Oráculo escalar de características; agregación de calibración compartida."""
 from typing import Any
 import pandas as pd
 from app.modulos.contextual.contextual import FiltroContextualEspacioTemporal
@@ -62,17 +62,9 @@ class ReferenceContext(FiltroContextualEspacioTemporal):
                     families = scores["available_families"]
                     if families:
                         key = "+".join(families)
-                        groups.setdefault(key, []).append({"score": scores["decision_score"], "neighbors": scores["evaluable_neighbors"]})
-            calibrated = {}
-            for key, values in groups.items():
-                if len(values) < self.config.temporal_decision_min_observations:
-                    calibrated[key] = {"status": "insufficient_calibration", "samples": len(values)}
-                    continue
-                series = pd.Series([item["score"] for item in values])
-                calibrated[key] = {"status": "available", "samples": len(values),
-                                   "threshold": float(series.quantile(self.config.residual_quantile, interpolation="higher")),
-                                   "neighbor_counts": sorted({int(item["neighbors"]) for item in values}),
-                                   "partition": "decision", "quantile": self.config.residual_quantile}
+                        groups.setdefault(key, []).append({"score": scores["decision_score"],
+                            "neighbor_counts": self._conteos_vecinos_decision(scores)})
+            calibrated = self._calibrar_grupos_decision(groups)
             results[source] = {"partition": bounds, "combinations": calibrated}
         return results
 

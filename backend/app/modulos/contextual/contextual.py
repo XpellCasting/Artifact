@@ -226,10 +226,9 @@ class FiltroContextualEspacioTemporal:
     observaciones futuras para explicar una sospecha.
     """
 
-    # v4 replaces the contradictory sign heuristic for continuous pairs with
-    # conditional level residuals.  Maps from earlier implementations stay
-    # intact and are rebuilt through the existing version check.
-    MAP_VERSION = "contextual-spatiotemporal-v7"
+    # v8 conditions decision thresholds on the available neighbors per family.
+    # Earlier maps are rebuilt through the existing version/hash checks.
+    MAP_VERSION = "contextual-spatiotemporal-v8-neighbor-calibration"
 
     def __init__(self, config: ConfiguracionContextual | None = None) -> None:
         self.config = config or ConfiguracionContextual()
@@ -966,19 +965,46 @@ class FiltroContextualEspacioTemporal:
                     families = scores["available_families"]
                     if families:
                         key = "+".join(families)
-                        groups.setdefault(key, []).append({"score": scores["decision_score"], "neighbors": scores["evaluable_neighbors"]})
-            calibrated = {}
-            for key, values in groups.items():
-                if len(values) < self.config.temporal_decision_min_observations:
-                    calibrated[key] = {"status": "insufficient_calibration", "samples": len(values)}
-                    continue
-                series = pd.Series([item["score"] for item in values])
-                calibrated[key] = {"status": "available", "samples": len(values),
-                                   "threshold": float(series.quantile(self.config.residual_quantile, interpolation="higher")),
-                                   "neighbor_counts": sorted({int(item["neighbors"]) for item in values}),
-                                   "partition": "decision", "quantile": self.config.residual_quantile}
+                        groups.setdefault(key, []).append({"score": scores["decision_score"],
+                            "neighbor_counts": self._conteos_vecinos_decision(scores)})
+            calibrated = self._calibrar_grupos_decision(groups)
             results[source] = {"partition": bounds, "combinations": calibrated}
         return results
+
+    @staticmethod
+    def _conteos_vecinos_decision(scores):
+        return {family: int(scores["family_scores"][family]["evaluable_neighbors"])
+                for family in scores["available_families"]}
+
+    @staticmethod
+    def _clave_conteos_vecinos(counts):
+        return "+".join(f"{family}={count}" for family, count in sorted(counts.items()))
+
+    def _calibrar_grupos_decision(self, groups):
+        """Calibrate each family combination at the observed neighbor counts.
+
+        Pooling one and five neighbors changes the distribution of the weighted
+        score. Never borrow another count's threshold, even if the pooled sample
+        would be sufficient. Each stratum must have its own historical support.
+        """
+        calibrated = {}
+        for combination, values in groups.items():
+            strata = {}
+            for item in values:
+                key = self._clave_conteos_vecinos(item["neighbor_counts"])
+                strata.setdefault(key, []).append(item)
+            thresholds = {}
+            for key, rows in strata.items():
+                entry = {"samples": len(rows), "neighbor_counts": rows[0]["neighbor_counts"],
+                         "partition": "decision", "quantile": self.config.residual_quantile}
+                if len(rows) < self.config.temporal_decision_min_observations:
+                    entry["status"] = "insufficient_calibration"
+                else:
+                    entry.update(status="available", threshold=float(pd.Series(
+                        [row["score"] for row in rows]).quantile(self.config.residual_quantile, interpolation="higher")))
+                thresholds[key] = entry
+            calibrated[combination] = {"samples": len(values), "by_neighbor_counts": thresholds}
+        return calibrated
 
     def _calibrar_respuesta(self, pair: pd.DataFrame) -> dict[str, Any] | None:
         """Recta contextual, no clasificador de fallas; residuos fuera del ajuste.
@@ -1435,7 +1461,7 @@ class FiltroContextualEspacioTemporal:
         continuous_observations=None, decision_calibrations=None, feature_provider=None,
     ) -> dict[str, Any]:
         continuous_edges = [edge for edge in edges if edge.get("relation_family") == "continuous_continuous"]
-        if map_quality.get("version") in {self.MAP_VERSION, "contextual-spatiotemporal-v5", "contextual-spatiotemporal-v6"} and continuous_edges and continuous_observations is not None:
+        if map_quality.get("version") in {self.MAP_VERSION, "contextual-spatiotemporal-v5", "contextual-spatiotemporal-v6", "contextual-spatiotemporal-v7"} and continuous_edges and continuous_observations is not None:
             return self._evaluar_sospecha_v5(
                 sospecha=sospecha, signals=signals, stats=stats, edges=edges, map_quality=map_quality,
                 concurrent_entities=concurrent_entities, continuous_observations=continuous_observations,
@@ -1467,7 +1493,13 @@ class FiltroContextualEspacioTemporal:
                                          feature_provider=feature_provider)
         families = scores["available_families"]
         combination = "+".join(families)
-        calibration = (decision_calibrations.get(source, {}).get("combinations", {}).get(combination) if combination else None)
+        counts = self._conteos_vecinos_decision(scores)
+        count_key = self._clave_conteos_vecinos(counts)
+        combination_calibration = decision_calibrations.get(source, {}).get("combinations", {}).get(combination, {})
+        calibration = combination_calibration.get("by_neighbor_counts", {}).get(count_key)
+        if families and calibration is None:
+            calibration = {"status": "unavailable", "reason": "uncalibrated_neighbor_counts",
+                           "neighbor_counts": counts}
         exclusions = []
         for item in scores["neighbors"].values():
             for family in ("level", "innovation", "trend"):

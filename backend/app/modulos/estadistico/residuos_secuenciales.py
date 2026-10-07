@@ -21,11 +21,12 @@ from app.modulos.estadistico.continuos_temporales import MIN_TRAINING_SAMPLES
 from app.modulos.estadistico.continuos_temporales import MODEL_PARAMETERS
 from app.modulos.estadistico.continuos_temporales import QUANTILES
 from app.modulos.estadistico.continuos_temporales import TemporalSensorModel
+from app.modulos.estadistico.continuos_temporales import PREDICTION_MODE, increment_features
 from app.modulos.estadistico.cobertura import coverage, daily_partitions, reporting_policy
 
 RESIDUAL_FOCUS_METHOD = "residual_focus_v1"
 RESIDUAL_METHODS = {RESIDUAL_FOCUS_METHOD}
-IMPLEMENTATION_VERSION = "residual-sequential-v4-alert-reset"
+IMPLEMENTATION_VERSION = "residual-sequential-v5-increment-predictor"
 MAX_CALIBRATION_ROW_RATE = .01
 MAX_CALIBRATION_EPISODES_PER_DAY = 1.
 CHANNELS = ("P", "D", "N")
@@ -101,7 +102,7 @@ def new_runtime(history: deque, method: str) -> ResidualRuntime:
 
 
 def prepare_sensor(temporal, frame: pd.DataFrame, entity_id: str, method: str, *, half_life_seconds: float = DEFAULT_HALF_LIFE_SECONDS) -> dict[str, Any]:
-    """Fit the existing q=.50 predictor and calibrate residual channels.
+    """Fit causal increments with q=.50 and calibrate residual channels.
 
     Chronological 24-hour blocks separate fit, normalization and calibration.
     The final partial block remains in calibration, with its actual exposure.
@@ -116,6 +117,7 @@ def prepare_sensor(temporal, frame: pd.DataFrame, entity_id: str, method: str, *
     latest = ordered.iloc[-1] if len(ordered) else None
     metadata = {"entity_id": str(entity_id), "continuous_method": method,
                 "implementation_version": IMPLEMENTATION_VERSION, "reporting_policy": policy,
+                "prediction_mode": PREDICTION_MODE,
                 "samples": int(len(y)),
                 "last_observation_at": latest["timestamp_dt"].isoformat() if latest is not None else None,
                 "last_observed_value": str(latest.get("state", latest.get("value"))) if latest is not None else None}
@@ -136,16 +138,20 @@ def prepare_sensor(temporal, frame: pd.DataFrame, entity_id: str, method: str, *
         return {**metadata, "eligible": False, "reason": "insufficient_residual_partition"}
     if days + 1e-9 < MIN_THRESHOLD_DAYS:
         return {**metadata, "eligible": False, "reason": "insufficient_threshold_days", "threshold_days": days}
+    inputs, anchors = increment_features(x)
+    increments = y - anchors
     models = []
     for quantile in QUANTILES:
         model = HistGradientBoostingRegressor(**MODEL_PARAMETERS, quantile=quantile)
-        model.fit(x[:split], y[:split]); models.append(model)
+        model.fit(inputs[:split], increments[:split]); models.append(model)
     train_values = y[:split]
     value_floor = max(float(np.finfo(float).eps), float(np.ptp(train_values)) * 1e-9, 1e-12)
-    predictor = TemporalSensorModel(tuple(models), 0.0, value_floor, {"predictor": "temporal_quantile_q50", "feature_schema_version": getattr(temporal, "feature_schema_version", FEATURE_SCHEMA_VERSION)})
+    predictor = TemporalSensorModel(tuple(models), 0.0, value_floor,
+        {"predictor": "temporal_quantile_q50", "prediction_mode": PREDICTION_MODE,
+         "feature_schema_version": getattr(temporal, "feature_schema_version", FEATURE_SCHEMA_VERSION)})
     # Calibration uses only q=.50. Batch prediction is identical and avoids
     # invoking three estimators separately for every historical observation.
-    residuals = (y[split:] - models[1].predict(x[split:])).astype(float).tolist()
+    residuals = (y[split:] - predictor.predict_medians(x[split:])).astype(float).tolist()
     normal_residuals = residuals[: midpoint - split]
     threshold_residuals = residuals[midpoint - split :]
     centre, scale, scale_source = _scale(normal_residuals, value_floor)

@@ -49,3 +49,20 @@ test("flow report separates unassessed readings and displays the partial block's
     for (const value of ["Por cambios", "9.50", "12.00", "2026-01-31T18:30:00+00:00", "Último valor recibido", "0.50 %", "0.20", "Marcadas en calibración", "FOCuS reinicia su acumulación"]) assert.ok(coverage.includes(value), value);
   } finally { await server.close(); }
 });
+
+test("statistical report separates false positive readings and emitted alerts for each sensor, including saved runs", async () => {
+  const server = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
+  try {
+    const { StatisticalLabelReport } = await server.ssrLoadModule("/src/features/flows/FlowLab.jsx");
+    const row = { entity_id: "sensor.weatherstation_inside_temp_2", expected: "normal", synthetic: false,
+      total: 54285, evaluable: 54285, false_positives: 4410, alerted_rows: 626, suppressed_rows: 3784 };
+    for (const group of [row, { ...row, false_positive_alerts: 626, suppressed_false_positives: 3784 }]) {
+      const html = renderToStaticMarkup(React.createElement(StatisticalLabelReport, {
+        version: "pre_suppression_v1", reports: { statistical: { groups: [group] } },
+      }));
+      for (const text of ["Falsos positivos: lecturas", "Falsos positivos: alertas emitidas", row.entity_id,
+        "4410", "626", "3784", "54285 / 54285"]) assert.ok(html.includes(text), text);
+      assert.match(html, /aunque su alerta se suprima por repetición/);
+    }
+  } finally { await server.close(); }
+});

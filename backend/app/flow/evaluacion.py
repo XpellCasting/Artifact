@@ -108,7 +108,7 @@ def statistical_labelled_report(results, truth, node_id, *, truth_index=None):
             continue
         observation = entry["data"]["statistical_observation"]
         key = (label["entity"], label["tipo"], label["synthetic"], label.get("fault_type"))
-        group = groups.setdefault(key, {"entity_id": key[0], "expected": key[1], "synthetic": key[2] == "true", "fault_type": key[3], "total": 0, "processed": 0, "evaluable": 0, "non_evaluable": 0, "detected": 0, "missed_evaluable": 0, "false_positives": 0, "alerted_rows": 0, "suppressed_rows": 0})
+        group = groups.setdefault(key, {"entity_id": key[0], "expected": key[1], "synthetic": key[2] == "true", "fault_type": key[3], "total": 0, "processed": 0, "evaluable": 0, "non_evaluable": 0, "detected": 0, "missed_evaluable": 0, "false_positives": 0, "false_positive_alerts": 0, "suppressed_false_positives": 0, "alerted_rows": 0, "suppressed_rows": 0})
         evaluable = bool(observation["evaluable"])
         detected = bool(observation["detected_before_suppression"])
         alerted = bool(observation["alert_emitted"])
@@ -120,6 +120,8 @@ def statistical_labelled_report(results, truth, node_id, *, truth_index=None):
         group["detected"] += int(abnormal and detected)
         group["missed_evaluable"] += int(abnormal and evaluable and not detected)
         group["false_positives"] += int(label["tipo"] == "normal" and detected)
+        group["false_positive_alerts"] += int(label["tipo"] == "normal" and alerted)
+        group["suppressed_false_positives"] += int(label["tipo"] == "normal" and detected and not alerted)
         group["alerted_rows"] += int(alerted)
         group["suppressed_rows"] += int(detected and not alerted)
     return {"labelled": bool(truth), "scope": "received_by_node", "groups": list(groups.values()), "matched_rows": sum(g["total"] for g in groups.values())}

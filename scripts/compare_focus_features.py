@@ -11,7 +11,7 @@ import pandas as pd
 from threadpoolctl import threadpool_limits
 
 from app.flow.definitions import observation_valid
-from app.flow.evaluacion import CausalFlowRunner, labelled_report, _merge_report_groups
+from app.flow.evaluacion import CausalFlowRunner, labelled_report, statistical_labelled_report, _merge_report_groups
 from app.modulos.estadistico.continuos_temporales import (
     FiltroContinuoTemporal, FEATURE_SCHEMA_VERSION, LEGACY_FEATURE_SCHEMA_VERSION)
 from app.modulos.estadistico.filtro import FiltroEstadistico
@@ -39,7 +39,7 @@ def evaluate_statistical_batches(filtro, baseline, events, entities, truth, *, c
     runner._evidence_nodes = {name: {"type": kind, "config": {"evidence_policy": "combine_v1"}}
         for name, kind in [("statistical_focus", "statistical_focus"), ("output", "output")]}
     truth_index = {int(row["raw_index"]): row for row in truth}
-    groups, decisions, start = {}, Counter(), 0
+    groups, statistical_groups, decisions, start = {}, {}, Counter(), 0
     while start < len(ordered):
         end = min(start + chunk_size, len(ordered))
         while end < len(ordered) and ordered.iloc[end].timestamp_dt == ordered.iloc[end - 1].timestamp_dt:
@@ -52,6 +52,8 @@ def evaluate_statistical_batches(filtro, baseline, events, entities, truth, *, c
             "is_valid_value": observation_valid(row), "signal": "unknown", "evidence": []}
             for row in batch.to_dict("records")]
         output = runner._statistical("statistical_focus", incoming, batch, entities, {})
+        _merge_report_groups(statistical_groups,
+            statistical_labelled_report(output, truth, "statistical_focus", truth_index=truth_index))
         output = runner._merge("output", output, {"mode": "output"})
         for item in output:
             item["final_decision"] = runner._final_decision(item)
@@ -62,6 +64,8 @@ def evaluate_statistical_batches(filtro, baseline, events, entities, truth, *, c
         if progress:
             progress(start, len(ordered))
     return {"candidate_count": len(ordered), "by_final_decision": dict(decisions),
+        "statistical_evaluation": {"statistical_focus": {"labelled": bool(truth), "scope": "received_by_node",
+            "groups": list(statistical_groups.values()), "matched_rows": sum(g["total"] for g in statistical_groups.values())}},
         "evaluation": {"version": "separate_non_evaluable_v2", "labelled": bool(truth),
             "groups": list(groups.values()), "matched_rows": sum(g["total"] for g in groups.values())}}
 
