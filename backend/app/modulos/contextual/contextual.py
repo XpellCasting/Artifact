@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -131,11 +132,41 @@ class PreparedCausalEvents:
         prepared = filtro._preparar_eventos(eventos)
         self.catalog = filtro._catalogo(entidades, prepared)
         self.observations = filtro._indexar_observaciones(prepared, self.catalog)
+        self._prune_heap = []
+        self._prune_due = {}
+        self._features = {}
+        self.map_reference = None
+        for entity_id in self.observations:
+            self._schedule_prune(entity_id)
 
-    def advance(self, events: pd.DataFrame, cutoff: pd.Timestamp) -> None:
+    def _schedule_prune(self, entity_id):
+        frame = self.observations[entity_id]
+        due = frame.index[1] if len(frame) > 1 else None
+        if due is None:
+            self._prune_due.pop(entity_id, None)
+        elif self._prune_due.get(entity_id) != due:
+            self._prune_due[entity_id] = due
+            heapq.heappush(self._prune_heap, (due, entity_id))
+
+    def bind_map(self, mapa):
+        """Compile an immutable map for this replay; no per-event edge scans."""
+        graph = self.filtro.grafo_contextual(mapa)
+        self.map_reference = mapa
+        self.edges_by_source = {entity_id: [data["evidence"] for _, _, data in graph.out_edges(entity_id, data=True)]
+                                for entity_id in graph}
+        self.map_stats = self.filtro._estadisticas_mapa(mapa)
+
+    def continuous_features(self, events, reference, entity_id, **options):
+        key = (entity_id, reference, tuple(sorted(options.items())))
+        if key not in self._features:
+            self._features[key] = self.filtro._caracteristicas_continuas(events, reference, entity_id, **options)
+        return self._features[key]
+
+    def advance(self, events: pd.DataFrame, cutoff: pd.Timestamp, *, events_prepared=False) -> None:
         if not isinstance(events, pd.DataFrame) or events.empty:
             return
-        prepared = self.filtro._preparar_eventos(events)
+        self._features.clear()
+        prepared = events if events_prepared else self.filtro._preparar_eventos(events)
         for entity_id, rows in prepared.groupby("entity_id", sort=False):
             entity_id = str(entity_id)
             if entity_id not in self.catalog:
@@ -153,14 +184,34 @@ class PreparedCausalEvents:
             if current is None:
                 current = incoming
             elif not incoming.empty:
-                current = pd.concat([current, incoming]).sort_index(kind="stable")
+                monotonic = current.empty or incoming.index[0] >= current.index[-1]
+                current = pd.concat([current, incoming])
+                if not monotonic:
+                    current = current.sort_index(kind="stable")
             self.observations[entity_id] = current
-        for entity_id, current in self.observations.items():
+            self._schedule_prune(entity_id)
+        while self._prune_heap and self._prune_heap[0][0] < cutoff:
+            due, entity_id = heapq.heappop(self._prune_heap)
+            if self._prune_due.get(entity_id) != due:
+                continue
+            self._prune_due.pop(entity_id, None)
+            current = self.observations[entity_id]
             boundary = int(current.index.searchsorted(cutoff, side="left"))
-            if boundary:
-                self.observations[entity_id] = pd.concat(
-                    [current.iloc[boundary - 1:boundary], current.iloc[boundary:]]
-                )
+            if boundary > 1:
+                self.observations[entity_id] = current.iloc[boundary - 1:].copy()
+            self._schedule_prune(entity_id)
+
+    def advance_normalized(self, events, cutoff):
+        required = {"entity_id", "timestamp_dt", "state", "sensor_kind", "is_valid_value"}
+        normalized = (required.issubset(events.columns)
+                      and isinstance(events["timestamp_dt"].dtype, pd.DatetimeTZDtype)
+                      and str(events["timestamp_dt"].dt.tz) == "UTC"
+                      and events["timestamp_dt"].notna().all()
+                      and events["timestamp_dt"].is_monotonic_increasing
+                      and events["is_valid_value"].dtype == bool
+                      and all(isinstance(value, str) for value in events["entity_id"].array)
+                      and all(isinstance(value, str) for value in events["state"].array))
+        self.advance(events, cutoff, events_prepared=normalized)
 
     @property
     def buffered_event_rows(self) -> int:
@@ -459,15 +510,15 @@ class FiltroContextualEspacioTemporal:
     ) -> dict[str, Any]:
         """Evalua cada sospecha usando solo observaciones con fecha no futura."""
         inicio = perf_counter()
+        if not sospechas:
+            return self._resultado_causal([], mapa, inicio)
         if prepared_state is None:
-            trabajo = self._preparar_eventos(eventos_disponibles)
-            catalogo = self._catalogo(entidades, trabajo)
-            observaciones = self._indexar_observaciones(trabajo, catalogo)
-        else:
-            catalogo = prepared_state.catalog
-            observaciones = prepared_state.observations
-        graph = self.grafo_contextual(mapa)
-        stats_mapa = self._estadisticas_mapa(mapa)
+            prepared_state = self.preparar_eventos_causales(entidades, eventos_disponibles)
+            prepared_state.bind_map(mapa)
+        observaciones = prepared_state.observations
+        compiled_map = prepared_state is not None and prepared_state.map_reference is mapa
+        graph = None if compiled_map else self.grafo_contextual(mapa)
+        stats_mapa = prepared_state.map_stats if compiled_map else self._estadisticas_mapa(mapa)
         concurrence_state = {} if concurrence_state is None else concurrence_state
         candidatas = sorted(
             (
@@ -486,7 +537,10 @@ class FiltroContextualEspacioTemporal:
                 sospecha.get("timestamp"), errors="coerce", utc=True
             )
             entity_id = str(sospecha.get("entity_id", ""))
-            edges = [data["evidence"] for _, _, data in graph.out_edges(entity_id, data=True)] if entity_id in graph else []
+            if compiled_map:
+                edges = prepared_state.edges_by_source.get(entity_id, [])
+            else:
+                edges = [data["evidence"] for _, _, data in graph.out_edges(entity_id, data=True)] if entity_id in graph else []
             signals = {}
             stats = stats_mapa
             concurrentes = self._concurrencia_relacionada(sospecha, edges, concurrence_state)
@@ -502,6 +556,7 @@ class FiltroContextualEspacioTemporal:
                 concurrent_entities=concurrentes,
                 continuous_observations=observaciones,
                 decision_calibrations=mapa.get("decision_calibrations", {}),
+                feature_provider=prepared_state.continuous_features if prepared_state is not None else None,
             )
             resultado["causal_runtime"] = {
                 "causal": True,
@@ -513,6 +568,9 @@ class FiltroContextualEspacioTemporal:
             }
             resultados.append(resultado)
 
+        return self._resultado_causal(resultados, mapa, inicio)
+
+    def _resultado_causal(self, resultados, mapa, inicio):
         outcomes: dict[str, int] = {}
         for item in resultados:
             outcome = str(item["context_outcome"])
@@ -1374,7 +1432,7 @@ class FiltroContextualEspacioTemporal:
 
     def _evaluar_sospecha(
         self, *, sospecha, signals, stats, edges, map_quality, concurrent_entities,
-        continuous_observations=None, decision_calibrations=None,
+        continuous_observations=None, decision_calibrations=None, feature_provider=None,
     ) -> dict[str, Any]:
         continuous_edges = [edge for edge in edges if edge.get("relation_family") == "continuous_continuous"]
         if map_quality.get("version") in {self.MAP_VERSION, "contextual-spatiotemporal-v5", "contextual-spatiotemporal-v6"} and continuous_edges and continuous_observations is not None:
@@ -1382,6 +1440,7 @@ class FiltroContextualEspacioTemporal:
                 sospecha=sospecha, signals=signals, stats=stats, edges=edges, map_quality=map_quality,
                 concurrent_entities=concurrent_entities, continuous_observations=continuous_observations,
                 decision_calibrations=decision_calibrations or {},
+                feature_provider=feature_provider,
             )
         return self._evaluar_sospecha_v4(
             sospecha=sospecha, signals=signals, stats=stats, edges=edges, map_quality=map_quality,
@@ -1390,7 +1449,7 @@ class FiltroContextualEspacioTemporal:
 
     def _evaluar_sospecha_v5(
         self, *, sospecha, signals, stats, edges, map_quality, concurrent_entities,
-        continuous_observations, decision_calibrations,
+        continuous_observations, decision_calibrations, feature_provider=None,
     ) -> dict[str, Any]:
         # Se reutiliza el envoltorio y las protecciones de enrutamiento v4;
         # sus votos continuos se sustituyen completamente por la decision v5.
@@ -1404,7 +1463,8 @@ class FiltroContextualEspacioTemporal:
         if current is None and source in continuous_observations and not pd.isna(timestamp):
             current, _ = self._observacion_continua(continuous_observations[source], timestamp, source)
         continuous_edges = [edge for edge in edges if edge.get("relation_family") == "continuous_continuous"]
-        scores = self._puntajes_familiares(source, timestamp, current, continuous_edges, continuous_observations)
+        scores = self._puntajes_familiares(source, timestamp, current, continuous_edges, continuous_observations,
+                                         feature_provider=feature_provider)
         families = scores["available_families"]
         combination = "+".join(families)
         calibration = (decision_calibrations.get(source, {}).get("combinations", {}).get(combination) if combination else None)

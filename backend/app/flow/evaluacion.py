@@ -70,20 +70,25 @@ def labelled_report(results, truth, *, truth_index=None):
             continue
         decision = item.get("final_decision")
         detected = decision in {"fault_compatible", "suspicion", "environmental"}
+        unassessed = decision in {"indeterminate", "not_routed"}
         diagnoses = {entry.get("data", {}).get("fault_type") for entry in item.get("evidence", []) if entry.get("status") == "compatible"}
         correct_type = bool(label.get("fault_type") and decision == "fault_compatible" and diagnoses == {label["fault_type"]})
         outcome = "sin_etiqueta" if label["tipo"] == "NULL" else "falso_positivo" if label["tipo"] == "normal" and detected else "normal_correcto" if label["tipo"] == "normal" and decision in {"normal", "no_alert"} else "no_evaluable" if label["tipo"] == "normal" else "detectado" if detected else "no_detectado"
+        if label["tipo"] in {"Falla", "anomalia"} and unassessed:
+            outcome = "no_evaluable"
         # This annotation is attached only AFTER all filters finish.
         item["evaluation"] = {"expected": label["tipo"], "fault_type": label.get("fault_type"), "synthetic": label["synthetic"] == "true", "outcome": outcome, "type_identified": correct_type}
         key = (label["entity"], label["tipo"], label["synthetic"], label.get("fault_type"))
-        group = groups.setdefault(key, {"entity_id": key[0], "expected": key[1], "synthetic": key[2] == "true", "fault_type": key[3], "total": 0, "detected": 0, "missed": 0, "false_positives": 0, "type_identified": 0, "indeterminate": 0})
+        group = groups.setdefault(key, {"entity_id": key[0], "expected": key[1], "synthetic": key[2] == "true", "fault_type": key[3], "total": 0, "detected": 0, "missed": 0, "missed_evaluable": 0, "non_evaluable": 0, "false_positives": 0, "type_identified": 0, "indeterminate": 0})
         group["total"] += 1
         group["detected"] += int(detected and label["tipo"] in {"Falla", "anomalia"})
         group["missed"] += int(not detected and label["tipo"] in {"Falla", "anomalia"})
+        group["missed_evaluable"] += int(not detected and not unassessed and label["tipo"] in {"Falla", "anomalia"})
+        group["non_evaluable"] += int(unassessed)
         group["false_positives"] += int(outcome == "falso_positivo")
         group["type_identified"] += int(correct_type)
         group["indeterminate"] += int(decision in {"indeterminate", "not_routed"})
-    return {"labelled": bool(truth), "groups": list(groups.values()), "matched_rows": sum(g["total"] for g in groups.values())}
+    return {"version": "separate_non_evaluable_v2", "labelled": bool(truth), "groups": list(groups.values()), "matched_rows": sum(g["total"] for g in groups.values())}
 
 
 def statistical_labelled_report(results, truth, node_id, *, truth_index=None):
@@ -236,6 +241,8 @@ class CausalFlowRunner(FlowRunner):
                     self.diagnostic_sessions[node["id"]] = session
         if contextual_nodes:
             prepared_context = self.contextual.preparar_eventos_causales(entities, available)
+            if hasattr(prepared_context, "bind_map"):
+                prepared_context.bind_map(context_map)
             self.context_sessions = {node["id"]: prepared_context for node in contextual_nodes}
         else:
             prepared_context = None
@@ -281,7 +288,8 @@ class CausalFlowRunner(FlowRunner):
                     session.add_events(batch, events_sorted=True)
                 if prepared_context is not None:
                     context_started = perf_counter()
-                    prepared_context.advance(
+                    advance = getattr(prepared_context, "advance_normalized", prepared_context.advance)
+                    advance(
                         batch,
                         batch["timestamp_dt"].max() - pd.Timedelta(seconds=horizon),
                     )
@@ -355,7 +363,7 @@ class CausalFlowRunner(FlowRunner):
             node_counts = {key: len(value) for key, value in outputs.items()}
             final_decisions = dict(Counter(item["final_decision"] for item in outputs["output"]))
         else:
-            report = {"labelled": bool(truth), "groups": list(streamed_report_groups.values()),
+            report = {"version": "separate_non_evaluable_v2", "labelled": bool(truth), "groups": list(streamed_report_groups.values()),
                       "matched_rows": sum(group["total"] for group in streamed_report_groups.values())}
             statistical_evaluation = {
                 node_id: {"labelled": bool(truth), "scope": "received_by_node",
@@ -435,6 +443,9 @@ class CausalFlowRunner(FlowRunner):
             eligible = item["entity_id"] in self.baselines[node_id].get(item.get("sensor_kind"), {})
             valid = observation_valid(item)
             reason = "invalid_state" if not valid else "missing_baseline" if not eligible else None
+            calibration = self.baselines[node_id].get("continuous_model_manifest", {}).get(item["entity_id"], {})
+            if reason == "missing_baseline" and calibration.get("reason"):
+                reason = calibration["reason"]
             evaluable = reason is None
             if detection is not None and detection.get("suspected_pattern") == "unavailable":
                 evaluable, reason = True, None
@@ -453,6 +464,8 @@ class CausalFlowRunner(FlowRunner):
             if temporal_observation:
                 data.update({key: value for key, value in temporal_observation.items() if key not in {"evaluable", "reason", "detected_before_suppression"}})
             data["statistical_observation"] = observation
+            if calibration and not evaluable:
+                data["calibration"] = deepcopy(calibration)
             output.append(self._with_evidence(item, node_id, signal, status, data))
         return output
 

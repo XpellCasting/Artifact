@@ -29,10 +29,12 @@ def separate_csv(content):
     columns = labelled_columns(headers)
     if columns is None or not all(h in headers for h in ("entity_id", "state", "last_changed")):
         raise ValueError("Se requieren entity_id,state,last_changed,es_sintetica,tipo,tipo_falla.")
-    positions = [headers.index(h) for h in ("entity_id", "state", "last_changed")]
+    observation_columns = ["entity_id", "state", "last_changed"] + [
+        name for name in ("reporting_mode", "max_report_gap_seconds") if name in headers]
+    positions = [headers.index(h) for h in observation_columns]
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["entity_id", "state", "last_changed"])
+    writer.writerow(observation_columns)
     labels = []
     for index, raw in enumerate(reader):
         try:

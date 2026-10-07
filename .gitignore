@@ -66,6 +66,7 @@ Thumbs.db
 /tmp/
 
 # Snapshot reutilizable GAT-LSTM: artefactos publicados mediante Git LFS.
+/artifacts/daily_coverage/
 /artifacts/gat_lstm/*
 !/artifacts/gat_lstm/manifest.json
 !/artifacts/gat_lstm/README.md

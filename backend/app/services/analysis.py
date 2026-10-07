@@ -366,6 +366,7 @@ class ServicesAnalysisMixin:
                 if self.future_baseline_template is None
                 else self.future_baseline_template.get("summary", {})
             ),
+            "continuous_models": (self.future_baseline_template or {}).get("continuous_model_manifest", {}),
             "baseline_id": (self.future_baseline_template or {}).get("provenance", {}).get("baseline_id"),
         }
     def _reset_analysis(self) -> None:

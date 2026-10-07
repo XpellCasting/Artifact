@@ -20,8 +20,8 @@ import sklearn
 
 
 SCHEMA_VERSION = "normality_provenance_v1"
-EVENT_COLUMNS = ("entity_id", "timestamp_dt", "state", "value", "is_valid_value", "sensor_kind")
-ENTITY_COLUMNS = ("entity_id", "sensor_kind", "tipo_interno", "domain", "device_class", "unit_of_measurement")
+EVENT_COLUMNS = ("entity_id", "timestamp_dt", "state", "value", "is_valid_value", "sensor_kind", "reporting_mode", "max_report_gap_seconds")
+ENTITY_COLUMNS = ("entity_id", "sensor_kind", "tipo_interno", "domain", "device_class", "unit_of_measurement", "reporting_mode", "max_report_gap_seconds")
 IMPLEMENTATION_FILES = (
     "services/procedencia_normalidad.py",
     "services/historial/cargar_historial.py",
@@ -32,6 +32,8 @@ IMPLEMENTATION_FILES = (
     "modulos/estadistico/continuos.py",
     "modulos/estadistico/continuos_temporales.py",
     "modulos/estadistico/residuos_secuenciales.py",
+    "modulos/estadistico/cobertura.py",
+    "modulos/estadistico/persistencia.py",
     "services/entrenamiento_paralelo.py",
     "modulos/estadistico/estados_binarios.py",
     "modulos/estadistico/bernoulli.py",
@@ -149,6 +151,8 @@ def effective_parameters(baseline: dict[str, Any]) -> dict[str, Any]:
                 # nunca objetos de scikit-learn ni su representación textual.
                 cached.pop("model", None)
                 cached.pop("predictor", None)
+                if "persistence_reference" in cached:
+                    cached["persistence_reference"].pop("runtime", None)
     return _normalize(result)
 
 

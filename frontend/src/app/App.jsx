@@ -606,7 +606,7 @@ export function App() {
       </nav>
 
       {activeModule === "flujos" ? (
-        <FlowLab apiBaseUrl={API_BASE_URL} historyReady={Boolean(historyStatus?.exists && historyStatus?.future_evaluation_ready)} replay={validationReplay} upload={validationUpload} uploadBusy={Boolean(busy)} onUpload={uploadValidationHistory} onLabelledUpload={uploadLabelledEvaluation} />
+        <FlowLab continuousModels={historyStatus?.continuous_models} apiBaseUrl={API_BASE_URL} historyReady={Boolean(historyStatus?.exists && historyStatus?.future_evaluation_ready)} replay={validationReplay} upload={validationUpload} uploadBusy={Boolean(busy)} onUpload={uploadValidationHistory} onLabelledUpload={uploadLabelledEvaluation} />
       ) : activeModule === "estadistico" ? (
         <>
           <section className="metric-grid">

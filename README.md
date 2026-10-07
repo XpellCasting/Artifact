@@ -8,6 +8,79 @@ Los sensores continuos usan únicamente
 FOCuS sobre residuos mediante `focus-cpt==0.1.10`; se retiraron los detectores
 antiguos Hampel/CUSUM/DSPOT, la detección por intervalos y la alternativa EWMA.
 
+La referencia continua separa entrenamiento, normalización y calibración por
+bloques temporales de 24 horas desde el primer evento de cada entidad, con unos
+70/15/15 % del tiempo y al menos siete días en cada reserva. El fragmento final
+se conserva con su duración real, el último valor y su fecha. La cobertura
+excluye estados explícitamente inválidos; un silencio no prueba desconexión.
+Los CSV de `last_changed` se interpretan como reportes por cambios. Las columnas
+opcionales `reporting_mode` (`on_change`, `periodic`, `unknown`) y
+`max_report_gap_seconds` permiten declarar otra política; los reportes periódicos
+requieren un intervalo máximo para medir cobertura. La continuidad por cambios
+supone un registro completo y no confirma conectividad.
+
+La persistencia se compara con duraciones históricas por valor y hora UTC, tanto
+en continuos como en binarios, y se comprueba al recibir una lectura. La interfaz
+muestra la preparación y los motivos de exclusión antes de evaluar; distingue
+lecturas evaluadas sin sospecha de resultados sin evaluación o sin conclusión.
+La reconstrucción cambia la identidad de las referencias y sus cachés.
+
+FOCuS reinicia la acumulación de los canales residuales tras detectar una
+desviación, conservando las lecturas del predictor temporal. El reinicio ocurre
+después del grupo completo de lecturas simultáneas. Guardar, restaurar o copiar
+una ejecución activa reproduce los residuos posteriores al último reinicio.
+Un estado inválido o una brecha superior al intervalo periódico declarado
+abre una nueva secuencia. Calibración y evaluación comparten esas reglas y
+agrupan de la misma manera las lecturas simultáneas. Los umbrales candidatos se
+revalidan reproduciendo la calibración con reinicios tras las detecciones; si
+un canal supera su presupuesto, se aumenta su umbral y se repite el recorrido.
+
+Los canales puntual (`P`), cambio acumulado (`D`) y ruido (`N`) tienen umbrales
+separados, con un presupuesto conjunto máximo de 1 % de lecturas marcadas y
+un episodio por día en la partición de calibración. Cada canal recibe un tercio
+de ambos límites. Los umbrales normalizados parten de 1, evitando rebajar la
+referencia del percentil 99 a la mitad. Estos límites históricos no garantizan
+la misma tasa en datos futuros. La tabla de cobertura muestra las tasas
+alcanzadas durante la calibración.
+
+`scripts/compare_focus_features.py` compara las características originales y
+las que incluyen duraciones sobre las mismas entidades, observaciones y
+particiones de 24 horas. Usa los mismos argumentos de archivos que el comando
+de verificación siguiente, con `--output` apuntando a un archivo JSON. Las
+etiquetas de evaluación se consultan después de decidir y no ajustan umbrales.
+
+El experimento anterior del histórico disponible sobre los cinco sensores revisados,
+con FOCuS sin reinicio tras alertas y los nuevos presupuestos por canal, produjo
+64.874 falsos positivos con las características originales y 64.853 con las
+características de duración. Estas últimas detectaron 20/20 lecturas `bias`,
+4/5 `spike` y 2/3 `noise`. El límite de calibración no se sostuvo en la
+evaluación futura. Se restauró por ello el reinicio tras detecciones; los
+resultados anteriores no miden esta nueva configuración. El informe del
+experimento sin reinicios está en `artifacts/daily_coverage/feature_comparison.json`.
+
+Para repetir la comprobación sobre un histórico y etiquetas existentes, usar
+`PYTHONPATH=backend python scripts/verify_daily_coverage.py --development <csv>
+--evaluation <csv> --truth-database <sqlite> --output <directorio>`. Este comando
+guarda referencias y un informe nuevos sin modificar la base de etiquetas.
+
+## Procesamiento contextual
+
+El recorrido contextual de eventos futuros compila las relaciones aceptadas
+una vez por ejecución. Sus índices conservan el último reporte anterior a la
+ventana y recortan únicamente los sensores cuyo historial vence, sin concatenar
+todos los sensores en cada grupo temporal. Las lecturas ya normalizadas evitan
+otra conversión y ordenación; las características continuas se reutilizan dentro
+del grupo y su caché se descarta al avanzar. Las ejecuciones sin candidatas
+contextuales omiten la preparación de sus observaciones.
+
+`PYTHONPATH=backend python scripts/profile_contextual_replay.py --rows 1000
+--output <archivo.json>` mide un flujo contextual independiente con el mapa
+guardado y los primeros eventos del CSV de validación. No modifica etiquetas
+ni ejecuciones guardadas. En la muestra disponible, el recorrido instrumentado
+pasó de 223,9 a 30,5 segundos; los conteos de decisiones coincidieron. Estos
+tiempos incluyen la sobrecarga del perfilador y no son una medición del CSV
+completo. El script también guarda las funciones que consumieron más tiempo.
+
 ## Organización
 
 ```text

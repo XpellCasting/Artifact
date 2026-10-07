@@ -27,3 +27,25 @@ test("evaluation table presents per-sensor numerators, denominators, false posit
     assert.match(html, /NULL no se consideran normales/);
   } finally { await server.close(); }
 });
+
+test("flow report separates unassessed readings and displays the partial block's last value", async () => {
+  const server = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
+  try {
+    const { FlowLabelReport, CalibrationReport } = await server.ssrLoadModule("/src/features/flows/FlowLab.jsx");
+    const html = renderToStaticMarkup(React.createElement(FlowLabelReport, { report: { labelled: true,
+      groups: [{ entity_id: "sensor.uv", expected: "Falla", synthetic: true, fault_type: "bias",
+        total: 5, detected: 1, missed: 4, missed_evaluable: 1, non_evaluable: 3, indeterminate: 3,
+        false_positives: 0, type_identified: 0 }] } }));
+    assert.match(html, /Evaluadas sin sospecha/);
+    assert.match(html, /Sin evaluación \/ sin conclusión/);
+    assert.match(html, /1 \/ 5/);
+    const coverage = renderToStaticMarkup(React.createElement(CalibrationReport, { models: {
+      "sensor.uv": { eligible: true, reporting_policy: { mode: "on_change" },
+        coverage: { calendar_days: 9.5, exposure_days: 9.5 },
+        joint_calibration: { flagged_row_rate: .005, episodes_per_day: .2 },
+        partitions: { final_partial_block_hours: 12 },
+        last_observed_value: "0", last_observation_at: "2026-01-31T18:30:00+00:00" },
+    } }));
+    for (const value of ["Por cambios", "9.50", "12.00", "2026-01-31T18:30:00+00:00", "Último valor recibido", "0.50 %", "0.20", "Marcadas en calibración", "FOCuS reinicia su acumulación"]) assert.ok(coverage.includes(value), value);
+  } finally { await server.close(); }
+});

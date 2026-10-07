@@ -94,8 +94,9 @@ class ParallelTrainingTests(unittest.TestCase):
             self.assertIsInstance(actual['predictor'], TemporalSensorModel)
             self.assertEqual(list(actual['runtime'].history), list(expected['runtime'].history))
             with threadpool_limits(limits=1):
-                np.testing.assert_array_equal(actual['predictor'].predict_raw(np.zeros(30)),
-                                               expected['predictor'].predict_raw(np.zeros(30)))
+                width = actual['predictor'].models[0].n_features_in_
+                np.testing.assert_array_equal(actual['predictor'].predict_raw(np.zeros(width)),
+                                               expected['predictor'].predict_raw(np.zeros(width)))
         self.assertEqual([p for _, p, _ in reports], sorted(p for _, p, _ in reports))
 
     def test_residual_ineligible_results_match(self):
@@ -124,4 +125,3 @@ class ParallelTrainingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

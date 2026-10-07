@@ -108,7 +108,7 @@ class FiltroBernoulli:
             ratio = stat/cached['threshold']
             # Bounded display strength, explicitly NOT an anomaly probability.
             score = ratio/(1+ratio)
-            summary = {key: value for key, value in cached.items() if key != 'runtime'}
+            summary = {key: value for key, value in cached.items() if key not in {'runtime', 'persistence_reference'}}
             results.append({"entity_id": str(entity_id), "source_raw_index": row.get('_raw_index'),
                 "timestamp": at.isoformat(), "window_start": start.isoformat(), "window_end": at.isoformat(),
                 "sensor_kind": "binary", "tipo_interno": "estado_binario", "value": float(row['value']),

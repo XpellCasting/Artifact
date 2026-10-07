@@ -18,6 +18,7 @@ from app.modulos.estadistico.residuos_secuenciales import RESIDUAL_FOCUS_METHOD
 from app.modulos.estadistico.residuos_secuenciales import update_channels
 from app.modulos.estadistico.bernoulli import METHOD as BINARY_METHOD
 from app.modulos.estadistico.disponibilidad import availability_detections
+from app.modulos.estadistico.persistencia import prepare_persistence, evaluate_persistence
 from app.modulos.estadistico.estados_multivalor import DETALLE_INDICADOR as DETALLE_MULTIVALOR
 from app.modulos.estadistico.estados_multivalor import INDICADORES_MULTIESTADO
 
@@ -30,7 +31,7 @@ class MotorReproduccionValidacion:
     futuras del mismo archivo.
     """
 
-    VERSION = "validation-focus-replay-v2"
+    VERSION = "validation-focus-replay-v3-daily"
 
     def __init__(self, filtro_estadistico: Any) -> None:
         self.filtro = filtro_estadistico
@@ -102,8 +103,10 @@ class MotorReproduccionValidacion:
                 learned["constant_base"] = self.filtro.continuos._construir_base_normalidad(
                     serie, str(entity_id), persistir_perfil_calculado=False,
                 )
+                learned["persistence_reference"] = prepare_persistence(
+                    trabajo[trabajo["entity_id"].astype(str).eq(str(entity_id))])
                 temporal_entries[str(entity_id)] = learned
-            temporal_models[str(entity_id)] = {key: value for key, value in learned.items() if key not in {"predictor", "runtime", "constant_base"}}
+            temporal_models[str(entity_id)] = {key: value for key, value in learned.items() if key not in {"predictor", "runtime", "constant_base", "persistence_reference"}}
         # El orden de finalización de los procesos no cambia el orden del baseline.
         temporal_entries = dict(sorted(temporal_entries.items()))
         temporal_models = dict(sorted(temporal_models.items()))
@@ -113,6 +116,7 @@ class MotorReproduccionValidacion:
         for entity_id, grupo in groups("binary", "baseline_binary", "Preparando sensores binarios", 70, 10):
             cached = self.filtro.binarios.prepare(grupo)
             if cached:
+                cached["persistence_reference"] = prepare_persistence(grupo)
                 baseline["binary"][str(entity_id)] = cached
 
         multivalor = self.filtro.multivalor
@@ -242,41 +246,50 @@ class MotorReproduccionValidacion:
             ordered = rows.sort_values(["timestamp_dt", "__order"], kind="stable")
             for timestamp, simultaneous in ordered.groupby("timestamp_dt", sort=True):
                 timestamp = utc_timestamp(timestamp)
-                vector = causal_features(runtime.history, timestamp)
+                policy = cached.get("reporting_policy", {})
+                if runtime.history and policy.get("mode") == "periodic":
+                    limit = policy.get("max_report_gap_seconds")
+                    if limit is None or (timestamp - runtime.history[-1][0]).total_seconds() > limit:
+                        runtime.history.clear()
+                        runtime.reset_sequential(method)
+                        runtime.last_timestamp = None
+                schema = getattr(predictor, "metadata", {}).get("feature_schema_version")
+                vector = causal_features(runtime.history, timestamp, **({"feature_schema_version": schema} if schema else {}))
                 valid_rows, pending = [], []
                 for row in simultaneous.to_dict("records"):
                     raw = row.get("_raw_index"); key = str(raw) if raw is not None else f"{entity_id}:{timestamp.isoformat()}:{row['__order']}"
                     number = (row.get("value") if numeric_values else
                               pd.to_numeric(pd.Series([row.get("value")]), errors="coerce").iloc[0])
                     if pd.isna(timestamp) or not bool(row.get("is_valid_value", True)) or pd.isna(number) or not math.isfinite(float(number)):
+                        runtime.history.clear()
+                        runtime.reset_sequential(method)
+                        runtime.last_timestamp = None
+                        if cached.get("persistence_reference"):
+                            evaluate_persistence(cached["persistence_reference"], row)
                         observations[key] = {"evaluable": False, "reason": "invalid_state", "continuous_method": method}; continue
                     value = float(number); pending.append((timestamp, value))
                     if vector is None:
                         observations[key] = {"evaluable": False, "reason": "insufficient_history", "continuous_method": method}; continue
-                    expected = predictor.predict_raw(vector)[1]
+                    expected = predictor.predict_median(vector) if hasattr(predictor, "predict_median") else predictor.predict_raw(vector)[1]
                     valid_rows.append((row, key, value, expected, (value - expected - cached["centre"]) / cached["scale"]))
                 if valid_rows:
+                    reset_after_group = False
                     # One sequential update per simultaneous group, while P stays per reading.
                     mean_z = sum(row[4] for row in valid_rows) / len(valid_rows)
-                    previous_timestamp = runtime.last_timestamp
                     channels = update_channels(runtime, mean_z, timestamp, method, cached["half_life_seconds"])
                     for row, key, value, expected, z in valid_rows:
                         p = abs(z); d, n = channels["D"], channels["N"]
                         qs = cached["channel_q99"]
                         ratios = {"P": p / qs["P"], "D": d / qs["D"], "N": n / qs["N"]}
-                        score = max(ratios.values()); dominant = max(ratios, key=ratios.get)
+                        limits = cached.get("channel_thresholds")
+                        channel_scores = {key: ratios[key] / limits[key] for key in ratios} if limits else ratios
+                        score = max(channel_scores.values()); dominant = max(channel_scores, key=channel_scores.get)
                         detected_numeric = score >= cached["threshold"]
+                        reset_after_group |= detected_numeric
                         constant_score = 0.0
-                        # Preserve the established independent constancy check.
-                        constant_base = cached.get("constant_base")
-                        if constant_base:
-                            base_row = filtro._base_horaria(constant_base, {**row, "timestamp_dt": timestamp})
-                            previous = previous_timestamp
-                            gap = 0.0 if previous is None else max(0.0, (timestamp - previous).total_seconds())
-                            state, _ = filtro._actualizar_estado_constancia(runtime.__dict__.setdefault("constant_state", filtro._estado_constancia_vacio()), value, gap, base_row["epsilon_const"], base_row["gap_alert_seconds"])
-                            runtime.constant_state = state
-                            _, constant_score = filtro._score_persistencia_constante(float(state["duration_seconds"]), base_row)
-                        constant_detected = constant_score >= .6
+                        persistence = evaluate_persistence(cached["persistence_reference"], row) if cached.get("persistence_reference") else {}
+                        constant_detected = bool(persistence.get("detected"))
+                        constant_score = float(constant_detected)
                         sources = (["residual_sequential"] if detected_numeric else []) + (["constant_persistence"] if constant_detected else [])
                         detected = bool(sources)
                         change = channels.get("focus_changepoint_index")
@@ -286,6 +299,8 @@ class MotorReproduccionValidacion:
                             "channels": {"P": p, "D": d, "N": n}, "dominant_channel": dominant,
                             "joint_score": score, "threshold": cached["threshold"], "detection_sources": sources,
                             "channel_q99": cached["channel_q99"], "constant_score": constant_score,
+                            "channel_thresholds": limits, "channel_scores": channel_scores,
+                            "persistence": persistence,
                             "focus_statistic": d if method == RESIDUAL_FOCUS_METHOD else None,
                             "focus_changepoint_index": change,
                         }
@@ -302,7 +317,8 @@ class MotorReproduccionValidacion:
                                 "triggered_indicators": sources, "filter": method, "passed_to_contextual_filter": True,
                                 "reading": observation, "focus_changepoint_index": change,
                             })
-                            runtime.reset_sequential(method)
+                    if reset_after_group:
+                        runtime.reset_sequential(method)
                 for item in pending:
                     runtime.history.append(item)
         return results
@@ -318,7 +334,28 @@ class MotorReproduccionValidacion:
         for entity_id, filas in trabajo.groupby("entity_id", sort=False):
             cached = baseline.get("binary", {}).get(str(entity_id))
             if cached:
-                resultados.extend(self.filtro.binarios.evaluate(filas, cached, entity_id))
+                numeric = self.filtro.binarios.evaluate(filas, cached, entity_id)
+                by_raw = {str(item.get("source_raw_index")): item for item in numeric}
+                reference = cached.get("persistence_reference")
+                if reference:
+                    for row in filas.sort_values("timestamp_dt", kind="stable").to_dict("records"):
+                        persistence = evaluate_persistence(reference, row)
+                        key = str(row.get("_raw_index"))
+                        detected = bool(persistence["detected"] or key in by_raw)
+                        baseline.setdefault("last_observations", {})[key] = {
+                            "evaluable": bool(row.get("is_valid_value", True)) and pd.notna(row.get("value")),
+                            "reason": None if bool(row.get("is_valid_value", True)) and pd.notna(row.get("value")) else "invalid_state",
+                            "detected_before_suppression": detected, "persistence": persistence}
+                        if persistence["detected"] and key not in by_raw:
+                            numeric.append({"entity_id": str(entity_id), "source_raw_index": row.get("_raw_index"),
+                                "timestamp": row["timestamp_dt"].isoformat(), "window_start": persistence["started_at"],
+                                "window_end": row["timestamp_dt"].isoformat(), "sensor_kind": "binary", "tipo_interno": "estado_binario",
+                                "observed_state": str(row.get("state")), "value": float(row["value"]),
+                                "binary_method": BINARY_METHOD, "is_suspicious": True, "suspicion_score": 1.,
+                                "pattern": "state_persistence", "suspected_pattern": "stuck_value",
+                                "detection_sources": ["state_and_hour_persistence"], "triggered_indicators": ["state_duration"],
+                                "reading": persistence, "filter": "state_and_hour_persistence_v1", "passed_to_contextual_filter": True})
+                resultados.extend(numeric)
         return resultados
 
     def _analizar_multivalor(

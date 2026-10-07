@@ -45,7 +45,8 @@ class TimestampReuseTests(unittest.TestCase):
         with patch("app.modulos.estadistico.continuos_temporales.pd.to_datetime") as parse:
             actual = causal_features(history, at)
         parse.assert_not_called()
-        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(actual[:len(expected)], expected)
+        self.assertEqual(len(actual), 46)
         text_history = [(stamp.isoformat(), value) for stamp, value in history]
         np.testing.assert_array_equal(causal_features(text_history, at.isoformat()), actual)
         offset_history = [(stamp.tz_convert("America/Santiago"), value) for stamp, value in history]
@@ -125,8 +126,8 @@ class NormalizedReplayTests(unittest.TestCase):
         self.assertTrue(normalized[0])
         for raw_index in (2, 3, 4, 8):
             self.assertEqual(normalized[1][str(raw_index)]["reason"], "invalid_state")
-        self.assertTrue(normalized[1]["5"]["evaluable"])
-        self.assertTrue(normalized[1]["6"]["evaluable"])
+        self.assertEqual(normalized[1]["5"]["reason"], "insufficient_history")
+        self.assertEqual(normalized[1]["6"]["reason"], "insufficient_history")
         pd.testing.assert_frame_equal(frame, original_frame)
 
     def test_text_values_and_dates_still_match_normalized_readings(self):
@@ -140,7 +141,7 @@ class NormalizedReplayTests(unittest.TestCase):
         frame = self.continuous_frame().drop(columns=["value"])
         _, observations, history, _, _ = self.run_continuous(frame)
         self.assertTrue(all(item["reason"] == "invalid_state" for item in observations.values()))
-        self.assertEqual(len(history), HISTORY_SIZE)
+        self.assertEqual(len(history), 0)
 
     def test_nullable_and_large_integer_values_match_scalar_conversion(self):
         for values in (pd.Series([1., pd.NA, 3.], dtype="Float64"),

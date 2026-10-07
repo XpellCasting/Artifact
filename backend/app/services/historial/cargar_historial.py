@@ -8,6 +8,7 @@ import pandas as pd
 from app.services.tipos_entidad import infer_kind
 from app.services.tipos_entidad import KINDS
 from app.services.estados_validos import valid_state
+from app.modulos.estadistico.cobertura import reporting_policy
 
 
 ESTADOS_INVALIDOS = {"", "unknown", "unavailable", "none", "null", "nan"}
@@ -79,6 +80,12 @@ class CargadorHistorial:
             entidades = pd.read_csv(entidades_path, dtype=str, keep_default_na=False).fillna("")
             if "entity_id" in entidades.columns:
                 resultado.entidades = self._mezclar_entidades(resultado.entidades, entidades)
+                for column in ("reporting_mode", "max_report_gap_seconds"):
+                    if column in resultado.entidades:
+                        values = resultado.entidades.set_index("entity_id")[column]
+                        resultado.eventos[column] = resultado.eventos["entity_id"].map(values)
+                for _, group in resultado.eventos.groupby("entity_id", sort=False):
+                    reporting_policy(group)
         if metadata_path.exists():
             metadata = pd.read_csv(metadata_path, dtype=str, keep_default_na=False).fillna("")
             if not metadata.empty:
@@ -200,6 +207,17 @@ class CargadorHistorial:
             f"{len(trabajo):,} filas con entidad y fecha validas",
         )
         trabajo["is_valid_value"] = trabajo["state"].map(valid_state)
+        # last_changed histories represent changes. Canonical streams must
+        # declare their semantics; event spacing cannot establish a heartbeat.
+        default_mode = "on_change" if origen == "real" else "unknown"
+        if "reporting_mode" not in trabajo:
+            trabajo["reporting_mode"] = default_mode
+        else:
+            trabajo["reporting_mode"] = trabajo["reporting_mode"].replace("", default_mode)
+        if "max_report_gap_seconds" not in trabajo:
+            trabajo["max_report_gap_seconds"] = ""
+        for _, group in trabajo.groupby("entity_id", sort=False):
+            reporting_policy(group)
         # La fecha serializada tambien es una clave y un corte causal: no truncar.
         trabajo["timestamp"] = trabajo["timestamp_dt"].map(
             lambda value: value.isoformat().replace("+00:00", "Z")
@@ -364,7 +382,7 @@ class CargadorHistorial:
         return ""
 
     def _construir_entidades(self, eventos: pd.DataFrame) -> pd.DataFrame:
-        columnas = ["entity_id", "unit_of_measurement", "device_class", "domain", "tipo_interno", "sensor_kind"]
+        columnas = ["entity_id", "unit_of_measurement", "device_class", "domain", "tipo_interno", "sensor_kind", "reporting_mode", "max_report_gap_seconds"]
         if eventos.empty:
             return pd.DataFrame(columns=columnas)
         entidades = eventos.groupby("entity_id", as_index=False).first()[columnas]

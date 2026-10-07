@@ -70,7 +70,7 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
   </section>;
 }
 
-function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, onUpload, onLabelledUpload }) {
+function FlowLabContent({ apiBaseUrl, historyReady, continuousModels, replay, upload, uploadBusy, onUpload, onLabelledUpload }) {
   const [draft, setDraft] = useState(() => restoreFlowDraft().draft);
   const [savedKey, setSavedKey] = useState(() => restoreFlowDraft().savedKey);
   const [flows, setFlows] = useState([]);
@@ -247,6 +247,7 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
         {replay?.loaded && <p><strong>{replay.filename}</strong> · {replay.rows} eventos · {replay.labelled ? "Con etiquetas" : "Sin etiquetas"}</p>}
         {upload && <p role="status">{upload.message}</p>}
         {!historyReady && <p className="fl-required">Carga un histórico desde Evaluación y espera a que se prepare el detector.</p>}
+        <CalibrationReport models={continuousModels} />
         {job && <FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} />}
       </div><button className="fl-primary" disabled={busy || uploadBusy || !loaded || !historyReady || !replay?.loaded || !!errors.length} onClick={execute}><Play size={16} />{busy ? "Evaluando…" : dirty || !draft.flow_id ? "Guardar y evaluar" : "Evaluar flujo"}</button></section>
     </>}
@@ -258,6 +259,7 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
     <section className="fl-results" aria-label="Resultados de flujos"><div className="fl-results-toolbar"><h3>Ejecuciones</h3><label>Consultar<select aria-label="Ejecución guardada" value={activeRun?.run_id || ""} disabled={busy} onChange={(event) => { const run = runs.find((item) => item.run_id === event.target.value); if (run) { setActiveRun(run); setInspecting(true); setResultNode("output"); setSelection(null); setError(""); setMessage(""); setLayoutRevision((value) => value + 1); } }}><option value="">Seleccionar ejecución…</option>{runs.map((run) => <option key={run.run_id} value={run.run_id}>{run.snapshot?.flow?.name} · {run.snapshot.source?.filename || "Histórico"} · {new Date(run.created_at).toLocaleString()}</option>)}</select></label><button disabled={busy} aria-label="Actualizar ejecuciones" onClick={() => refresh().catch((e) => setError(e.message))}><RotateCcw size={16} /></button></div>
       {!activeRun ? <div className="fl-empty"><GitBranch size={28} /><strong>Tu primera ejecución aparecerá aquí</strong><p>Guarda un flujo y ejecútalo para revisar el recorrido y la evidencia.</p></div> : <>
         <p><strong>{activeRun.snapshot.source?.filename || "Ejecución anterior"}</strong> · {activeRun.snapshot.execution_mode === "causal_future" ? "Eventos futuros · evaluación causal" : "Análisis retrospectivo anterior"} · {activeRun.snapshot.baseline_id ? `Base ${activeRun.snapshot.baseline_id.slice(0, 16)}` : "Base sin procedencia registrada"}</p>
+        <CalibrationReport models={Object.assign({}, ...Object.values(activeRun.snapshot.baseline_provenance?.continuous_models || {}))} />
         {activeRun.snapshot.baseline_provenance?.continuous_models && <p className="fl-muted">Entrenamiento completado · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => model.eligible).length} sensores preparados · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => !model.eligible).length} no evaluables</p>}
         <div className="fl-metrics"><span><strong>{activeRun.summary.candidate_count}</strong>Lecturas de entrada</span><span><strong>{activeRun.summary.output_count}</strong>Resultados finales</span><span><strong>{Number(activeRun.summary.elapsed_ms).toLocaleString()} ms</strong>Tiempo total</span>{Object.entries(activeRun.summary.by_final_decision || {}).map(([key, value]) => <span key={key}><strong>{value}</strong>{DECISIONS[key] || key}</span>)}</div>
         <FlowLabelReport report={activeRun.summary.evaluation} />
@@ -271,11 +273,29 @@ function FlowLabContent({ apiBaseUrl, historyReady, replay, upload, uploadBusy, 
 }
 export default function FlowLab(props) { return <ReactFlowProvider><FlowLabContent {...props} /></ReactFlowProvider>; }
 const EVALUATION_LABELS = { detectado: "Detectado", no_detectado: "No detectado", falso_positivo: "Falso positivo", normal_correcto: "Normal correcto", no_evaluable: "No evaluable", sin_etiqueta: "Sin etiqueta" };
-function FlowLabelReport({ report }) {
+export function FlowLabelReport({ report }) {
   if (!report?.labelled) return <p className="fl-muted">Esta ejecución no tiene etiquetas de referencia para medir detecciones y errores.</p>;
-  return <section aria-label="Detección de datos etiquetados"><h3>Qué identifica este flujo</h3><p>Se cuenta como detección una sospecha, una falla compatible o una anomalía ambiental en la salida final. Identificar el tipo exige que el diagnóstico coincida con tipo_falla; una sospecha sola no identifica el tipo.</p><div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Etiqueta</th><th>Origen</th><th>Tipo esperado</th><th>Detectadas / total</th><th>No detectadas</th><th>Tipo identificado</th><th>Falsos positivos</th><th>Indeterminadas / sin ruta</th></tr></thead><tbody>{report.groups.map((row, i) => <tr key={i}><td>{row.entity_id}</td><td>{row.expected}</td><td>{row.synthetic ? "Inyectado" : "No inyectado"}</td><td>{row.fault_type || "—"}</td><td>{["Falla", "anomalia"].includes(row.expected) ? `${row.detected} / ${row.total}` : `— / ${row.total}`}</td><td>{["Falla", "anomalia"].includes(row.expected) ? row.missed : "—"}</td><td>{row.fault_type ? row.type_identified : "—"}</td><td>{row.false_positives}</td><td>{row.indeterminate}</td></tr>)}</tbody></table></div><p className="fl-hint">Las lecturas sin etiqueta no cuentan como normales. Consulta las filas de Salida final para localizar las detectadas y las omitidas.</p></section>;
+  return <section aria-label="Detección de datos etiquetados"><h3>Qué identifica este flujo</h3><p>Se cuenta como detección una sospecha, una falla compatible o una anomalía ambiental en la salida final. Identificar el tipo exige que el diagnóstico coincida con tipo_falla; una sospecha sola no identifica el tipo.</p><div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Etiqueta</th><th>Origen</th><th>Tipo esperado</th><th>Detectadas / total</th><th>Evaluadas sin sospecha</th><th>Tipo identificado</th><th>Falsos positivos</th><th>Sin evaluación / sin conclusión</th></tr></thead><tbody>{report.groups.map((row, i) => <tr key={i}><td>{row.entity_id}</td><td>{row.expected}</td><td>{row.synthetic ? "Inyectado" : "No inyectado"}</td><td>{row.fault_type || "—"}</td><td>{["Falla", "anomalia"].includes(row.expected) ? `${row.detected} / ${row.total}` : `— / ${row.total}`}</td><td>{["Falla", "anomalia"].includes(row.expected) ? (row.missed_evaluable ?? Math.max(0, row.missed - row.indeterminate)) : "—"}</td><td>{row.fault_type ? row.type_identified : "—"}</td><td>{row.false_positives}</td><td>{row.indeterminate}</td></tr>)}</tbody></table></div><p className="fl-hint">Las lecturas sin etiqueta no cuentan como normales. Los casos sin evaluación o sin conclusión se muestran aparte de las lecturas evaluadas sin sospecha. Consulta la Salida final para revisar el motivo.</p></section>;
 }
 function StatisticalLabelReport({ reports, version }) {
   if (version !== "pre_suppression_v1") return <p className="fl-muted">Evaluación anterior: conteo basado en alertas emitidas. La métrica previa a supresión no está disponible.</p>;
   return <section aria-label="Detección estadística por lectura"><h3>Detección estadística por lectura, antes de suprimir alertas</h3><p>Evaluación de lecturas recibidas por el nodo. Una lectura no evaluable no confirma normalidad ni se cuenta como falla detectada.</p>{Object.entries(reports || {}).map(([nodeId, report]) => { const groups = report.groups || []; const sum = field => groups.reduce((total, row) => total + (row[field] || 0), 0); return <div key={nodeId}><h4>{nodeId}</h4><div className="fl-metrics"><span><strong>{sum("detected")}</strong>Detecciones</span><span><strong>{sum("alerted_rows")}</strong>Alertas emitidas</span><span><strong>{sum("suppressed_rows")}</strong>Lecturas suprimidas</span><span><strong>{sum("non_evaluable")}</strong>No evaluables</span></div></div>; })}</section>;
+}
+
+const CALIBRATION_REASONS = {
+  insufficient_training_data: "Lecturas insuficientes para entrenar",
+  insufficient_calendar_blocks: "Período insuficiente para separar entrenamiento y calibración",
+  insufficient_residual_partition: "Lecturas insuficientes en una partición",
+  insufficient_threshold_days: "Cobertura insuficiente para calibrar el umbral",
+  calibration_budget_unmet: "No se pudo calibrar el límite de alertas",
+};
+export function CalibrationReport({ models }) {
+  const entries = Object.entries(models || {});
+  if (!entries.length) return null;
+  const number = value => Number.isFinite(value) ? value.toFixed(2) : "—";
+  return <details className="fl-calibration"><summary>Cobertura del detector · {entries.filter(([, model]) => model.eligible).length} de {entries.length} sensores continuos preparados</summary>
+    <p>Particiones por bloques de 24 horas desde el inicio de cada serie. El fragmento final se conserva con su duración real y la fecha del último valor. El silencio de un sensor que reporta cambios no demuestra desconexión.</p>
+    <div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Estado</th><th>Reporte</th><th>Días de calibración</th><th>Días de cobertura</th><th>Fragmento final (h)</th><th>Marcadas en calibración</th><th>Episodios/día en calibración</th><th>Último valor recibido</th></tr></thead><tbody>{entries.map(([entity, model]) => <tr key={entity}><td>{entity}</td><td>{model.eligible ? "Preparado" : CALIBRATION_REASONS[model.reason] || model.reason || "Sin referencia"}</td><td>{{ on_change: "Por cambios", periodic: "Periódico", unknown: "Sin declarar" }[model.reporting_policy?.mode] || "Sin declarar"}</td><td>{number(model.coverage?.calendar_days ?? model.partitions?.threshold_calendar_days)}</td><td>{number(model.coverage?.exposure_days ?? model.partitions?.threshold_days)}</td><td>{number(model.partitions?.final_partial_block_hours)}</td><td>{model.joint_calibration ? `${number(model.joint_calibration.flagged_row_rate * 100)} %` : "—"}</td><td>{number(model.joint_calibration?.episodes_per_day)}</td><td>{model.last_observed_value ?? "—"} · {model.last_observation_at || "Fecha sin registrar"}</td></tr>)}</tbody></table></div>
+    <p>FOCuS reinicia su acumulación tras una detección de los canales residuales. La calibración utiliza el mismo reinicio y límites conjuntos de lecturas marcadas y episodios por día. La cobertura por cambios supone que el registro está completo; no confirma la conectividad. Los reportes periódicos requieren un intervalo máximo declarado.</p>
+  </details>;
 }

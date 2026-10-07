@@ -82,7 +82,9 @@ class NodeHandlers:
             if evidence.get("map_quality", {}).get("stale") is not False:
                 signal = "unknown"
             if not requests_by_id[item["observation_id"]].get("_flow_has_statistical"):
-                evidence = deepcopy(evidence)
+                # Only top-level presentation fields change here. The evidence
+                # envelope below still makes its own isolated deep copy.
+                evidence = dict(evidence)
                 evidence["contextual_class"] = None
                 evidence["alert"] = None
                 evidence["statistical_score"] = None
