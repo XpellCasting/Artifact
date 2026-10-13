@@ -11,3 +11,7 @@ data/static_history/*.csv
 !data/static_history/.gitkeep
 data/cache/*.json
 !data/cache/.gitkeep
+*.md
+*.MD
+!README.md
+!README.MD
