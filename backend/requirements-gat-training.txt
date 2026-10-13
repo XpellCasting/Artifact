@@ -1,0 +1,5 @@
+# Minimal standalone training/transfer dependencies; no API server or F1 engine.
+# Install PyTorch separately for the selected CPU/CUDA platform, then
+# requirements-gat-cuda.txt (CUDA) or requirements-gat.txt (CPU).
+pandas==3.0.1
+pydantic==2.10.4

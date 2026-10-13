@@ -32,6 +32,9 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # Action-only catalog metadata is optional for a custom repository.
+          # Do not assign a project license as part of installing this adapter.
+          ignore: description topics license
   hassfest:
     runs-on: ubuntu-latest
     steps:

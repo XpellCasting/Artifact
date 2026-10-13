@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .vite/
 .venv/
+.venv-cuda/
 venv/
 node_modules/
 dist/

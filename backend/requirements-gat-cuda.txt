@@ -1,0 +1,5 @@
+# Install a compatible NVIDIA CUDA PyTorch wheel first; see training/README.md.
+# Intentionally omit torch to preserve the selected CUDA build and wheel index.
+# Project reference: torch==2.14.0 (also checked by scripts/gat_lstm_check.py).
+torch-geometric==2.8.0.post1
+tzdata==2025.2

@@ -46,6 +46,9 @@ Para verificar la integración en un entorno de desarrollo Linux con Python 3.12
 `pip install homeassistant==2024.12.5 pytest==8.3.4 pytest-asyncio==0.24.0`,
 seguido de `python -m pytest tests/home_assistant -q`. El workflow de HACS
 comprueba además el manifiesto y la estructura del repositorio.
+La validación está orientada a un repositorio personalizado: los requisitos
+adicionales del catálogo oficial sobre descripción, temas y licencia quedan
+fuera de este workflow. La licencia del proyecto debe decidirla su autor.
 
 Aplicación local de la tesis: revisión de históricos, filtros estadístico y contextual,
 diagnóstico GAT-LSTM por segmentos y evaluación de flujos causales. Los sensores binarios
@@ -303,6 +306,13 @@ principal crea un espacio aislado, útil para pruebas.
   previa que reserva Validación/Prueba para eventos futuros permanece.
 
 ## Verificación
+
+Para entrenar en otro ordenador con NVIDIA, consulta la [guía de entrenamiento
+CUDA](training/README.md): instalación mínima, comprobación de GPU, entrenamiento
+desde consola, checkpoints por época y transferencia verificada de datasets y
+candidatos. Se reutiliza la arquitectura del backend y los modelos se recargan en
+CPU. El snapshot histórico de Git LFS usa una arquitectura anterior; para este
+entrenamiento hay que preparar un dataset nuevo por segmentos.
 
 ```powershell
 backend/.venv/Scripts/python.exe scripts/run_tests.py

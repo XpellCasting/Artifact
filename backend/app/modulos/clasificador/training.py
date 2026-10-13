@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 import os
+import random
+import re
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
@@ -21,6 +23,24 @@ from app.modulos.clasificador import LABELS
 from app.modulos.clasificador.evaluation import choose_rejection_policy
 from app.modulos.clasificador.storage import iter_partition_batches
 from app.modulos.clasificador.storage import sample_summaries
+from app.modulos.clasificador.checkpoints import (TrainingRun, cpu_state, provenance,
+    random_state, restore_random_state, sample_identity)
+
+
+def resolve_device(requested):
+    """CUDA explícito falla con un diagnóstico útil; auto permite CPU."""
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cpu":
+        return torch.device("cpu")
+    if not isinstance(requested, str) or not re.fullmatch(r"cuda(?::[0-9]+)?", requested):
+        raise ValueError("Dispositivo inválido; usa auto, cpu, cuda o cuda:N")
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA no está disponible en PyTorch. Revisa el controlador NVIDIA y la instalación de PyTorch con CUDA; ejecuta scripts/gat_lstm_check.py --device cuda")
+    index = int(requested.split(":")[1]) if ":" in requested else torch.cuda.current_device()
+    if index >= torch.cuda.device_count():
+        raise ValueError(f"GPU cuda:{index} inexistente; hay {torch.cuda.device_count()} dispositivos CUDA")
+    return torch.device(f"cuda:{index}")
 
 
 def _tensor_batch(samples, device):
@@ -88,9 +108,32 @@ def class_weights_from_episodes(samples, device="cpu"):
 
 
 def train_classifier(train_samples, dev_samples, config, category_sizes, entity_kinds,
-                     progress=None, encoder=None, batch_progress=None):
+                     progress=None, encoder=None, batch_progress=None,
+                     checkpoint_dir=None, resume=False, checkpoint_identity=None):
     if config.architecture_version not in {"gat_lstm_v3_segments_multiscale"} or encoder is not None:
         raise ValueError("Solo se admite GAT-LSTM por segmentos sin encoder predictivo externo")
+    from dataclasses import replace
+    device = resolve_device(config.device)
+    environment = provenance()
+    if resume and checkpoint_dir is None:
+        raise ValueError("Reanudar requiere un directorio de checkpoints")
+    identity = {**(checkpoint_identity if checkpoint_identity is not None
+                   else sample_identity(train_samples, dev_samples)),
+                "entity_kinds": list(entity_kinds)} if checkpoint_dir is not None else None
+    run = TrainingRun(checkpoint_dir, config, identity,
+                      resume, environment) if checkpoint_dir is not None else None
+    try:
+        model, scores = _train_trials(train_samples, dev_samples, replace(config, device=str(device)),
+                                     entity_kinds, progress, batch_progress, run, environment)
+        scores["runtime_parameters"]["requested_device"] = config.device
+        return model, scores
+    finally:
+        if run is not None:
+            run.close()
+
+
+def _train_trials(train_samples, dev_samples, config, entity_kinds, progress,
+                  batch_progress, run, environment):
     from dataclasses import replace
     trials = []
     best = None
@@ -98,7 +141,8 @@ def train_classifier(train_samples, dev_samples, config, category_sizes, entity_
         notify = (lambda row: progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if progress else None
         notify_batch = (lambda row: batch_progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if batch_progress else None
         candidate, scores = _train_segment_classifier(train_samples, dev_samples,
-            replace(config, segment_threshold=threshold), entity_kinds, notify, notify_batch)
+            replace(config, segment_threshold=threshold), entity_kinds, notify, notify_batch,
+            run=run, trial=trial+1)
         rank = (scores.get("dev_macro_f1") or 0., threshold)
         trials.append({"threshold": threshold, "macro_f1": rank[0]})
         if best is None or rank > best[0]:
@@ -106,20 +150,23 @@ def train_classifier(train_samples, dev_samples, config, category_sizes, entity_
     _, model, scores = best
     scores["segment_threshold_search"] = trials
     scores["selected_segment_threshold"] = model.threshold
+    scores["provenance"] = environment
+    scores["checkpoint"] = {"enabled": run is not None, "resumed": bool(run and run.resume),
+                            "interval": "epoch", "threshold_trials": len(trials)}
     return model, scores
 
 
 
 def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
-                                  progress=None, batch_progress=None):
+                                  progress=None, batch_progress=None, run=None, trial=1):
     from app.modulos.clasificador.model_constants import FAULT_TYPES
 
     if not train_samples or not dev_samples:
         raise ValueError("insufficient_labels: faltan ejemplos de ajuste o dev_tune")
-    if config.device != "cpu":
-        raise ValueError("GAT-LSTM por segmentos requiere CPU en esta versión")
+    random.seed(config.seed)
+    np.random.seed(config.seed)
     torch.manual_seed(config.seed)
-    device = torch.device("cpu")
+    device = resolve_device(config.device)
     weights, support = class_weights_from_episodes(train_samples, device)
     _, dev_support = class_weights_from_episodes(dev_samples, device)
     feature_dim = len(train_samples[0]["X"][0][0])
@@ -144,7 +191,7 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
         raise ValueError("insufficient_fault_types: Desarrollo no contiene fallas con tipo conocido")
     type_weights = torch.tensor([
         min(5.0, max(type_support.values()) / max(1, type_support[fault]))
-        if type_support[fault] else 0.0 for fault in FAULT_TYPES], dtype=torch.float32)
+        if type_support[fault] else 0.0 for fault in FAULT_TYPES], dtype=torch.float32, device=device)
     present_weights = type_weights[type_weights > 0]
     type_weights = type_weights / present_weights.mean()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -175,7 +222,19 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
 
     best, best_loss, stale, history = None, float("inf"), 0, []
     best_dev_records, best_type_records = [], []
-    for epoch in range(config.max_epochs):
+    next_epoch = 0
+    checkpoint = run.load(trial) if run is not None else None
+    if checkpoint is not None:
+        next_epoch = checkpoint["next_epoch"]
+        if config.max_epochs < next_epoch:
+            raise ValueError("max_epochs no puede ser menor que las épocas ya completadas")
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        best, best_loss, stale = checkpoint["best_model"], checkpoint["best_loss"], checkpoint["stale"]
+        history, runtime = checkpoint["history"], checkpoint["runtime"]
+        best_dev_records, best_type_records = checkpoint["best_dev_records"], checkpoint["best_type_records"]
+        restore_random_state(checkpoint["random_state"], device)
+    for epoch in range(next_epoch, config.max_epochs) if stale < config.patience else ():
         epoch_started, epoch_waiting = monotonic(), 0.0
         model.train()
         train_total = train_count = type_total = type_count = 0
@@ -270,13 +329,19 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
                "duration_seconds": duration, "data_wait_seconds": epoch_waiting}
         history.append(row); runtime["epoch_durations_seconds"].append(duration)
         runtime["batches_per_second"].append(batches_per_epoch / max(duration, 1e-9))
-        if progress: progress(row)
         if dev_loss < best_loss:
-            best_loss, best, stale = dev_loss, deepcopy(model.state_dict()), 0
+            best_loss, best, stale = dev_loss, cpu_state(model.state_dict()), 0
             best_dev_records, best_type_records = deepcopy(dev_records), deepcopy(type_records)
         else:
             stale += 1
-            if stale >= config.patience: break
+        if run is not None:
+            run.save(trial, {"next_epoch": epoch + 1, "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(), "best_model": best, "best_loss": best_loss,
+                "stale": stale, "history": history, "runtime": runtime,
+                "best_dev_records": best_dev_records, "best_type_records": best_type_records,
+                "random_state": random_state(device), "max_epochs": config.max_epochs})
+        if progress: progress(row)
+        if stale >= config.patience: break
     model.load_state_dict(best); model.eval()
     type_correct = sum(max(range(len(row["scores"])), key=row["scores"].__getitem__) == row["true_type"]
                        for row in best_type_records)
@@ -301,7 +366,9 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
             "independent_episodes_by_type": type_validation_episodes,
             "recall_by_type": type_validation_recall},
         "runtime": runtime,
-        "runtime_parameters": {"device": "cpu", "batch_size": config.batch_size,
+        "runtime_parameters": {"device": str(device), "requested_device": config.device,
+            "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+            "cuda_runtime": torch.version.cuda, "batch_size": config.batch_size,
             "omp_num_threads": setting('OMP_NUM_THREADS'),
             "mkl_num_threads": setting('MKL_NUM_THREADS'),
             "torch_num_threads": torch.get_num_threads()}}

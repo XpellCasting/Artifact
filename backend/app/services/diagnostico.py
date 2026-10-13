@@ -472,7 +472,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
 
     def train_gat(self, dataset_id, encoder_id=None, gat_config=None,
-                  progress=lambda *_: None):
+                  progress=lambda *_: None, *, checkpoint_dir=None, resume=False):
         if importlib.util.find_spec("torch") is None:
             raise ReviewError("GAT-LSTM no está disponible: falta PyTorch.", 503)
         dataset = self._read("datasets", dataset_id)
@@ -502,10 +502,12 @@ class DiagnosticWorkbench(DiagnosticRepository):
             else:
                 progress(4, f"Dataset preparado desde {storage['source']}", phase="loading", **storage)
             return self._train_gat_candidate(dataset_id, encoder_id, dataset, config,
-                train_samples, dev_samples, storage, progress)
+                train_samples, dev_samples, storage, progress,
+                checkpoint_dir=checkpoint_dir, resume=resume)
 
     def _train_gat_candidate(self, dataset_id, encoder_id, dataset, config,
-                             train_samples, dev_samples, storage, progress):
+                             train_samples, dev_samples, storage, progress, *,
+                             checkpoint_dir=None, resume=False):
         if encoder_id:
             raise ReviewError("SegmentGATLSTM usa su encoder de segmentos; no admite encoders predictivos v1.")
         support = {part: dataset.get("label_counts", {}).get(part, {})
@@ -548,9 +550,16 @@ class DiagnosticWorkbench(DiagnosticRepository):
                 percent = 5+80*((row["threshold_trial"]-1)+row["completed_batches"]/row["total_batches"])/(3 if config.segment_encoder == "gat" else 1)
             message = f"{stage} · época {row['epoch']} de {row['max_epochs']} · lote {row['batch']} de {row['batches']}"
             progress(percent, message, phase="training", **row)
+        checkpoint_identity = None
+        if checkpoint_dir is not None:
+            from app.modulos.clasificador.checkpoints import dataset_identity
+            progress(5, "Verificando identidad del dataset para checkpoints", phase="checkpoint_preparation")
+            checkpoint_identity = dataset_identity(dataset)
         model, metrics = train_classifier(train_samples, dev_samples, config,
                                           category_sizes, entity_kinds, training_progress, encoder,
-                                          batch_progress=training_batch_progress)
+                                          batch_progress=training_batch_progress,
+                                          checkpoint_dir=checkpoint_dir, resume=resume,
+                                          checkpoint_identity=checkpoint_identity)
         metrics["storage"] = storage
         progress(90, "Guardando pesos, grafo, preprocesador y política de rechazo", phase="saving")
         candidate = save_candidate(model, preprocessor, graph, config, self.directory, metrics)
