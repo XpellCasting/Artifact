@@ -1,0 +1,13 @@
+{
+  "method": "gat_lstm",
+  "schema_version": "gat-lstm-segments-v1",
+  "architecture_version": "gat_lstm_v3_segments_multiscale",
+  "task": "diagnostic_3class",
+  "segment_encoder": "gat",
+  "active_scales": [true, true, true],
+  "segment_threshold": 0.5,
+  "local_timezone": "America/Santiago",
+  "entity_value_modes": null,
+  "device": "cpu",
+  "seed": 42
+}

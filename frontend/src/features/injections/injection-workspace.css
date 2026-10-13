@@ -1,0 +1,65 @@
+.injection-workspace { min-width: 0; }
+.injection-intro { margin: -3px 0 18px; max-width: 960px; }
+.injection-feedback { margin: 13px 0; }
+.injection-empty { border: 1px dashed #34413a; border-radius: 8px; margin: 15px 0; }
+.injection-empty span { display: block; max-width: 760px; margin: 0 auto; }
+.injection-base-label { margin: 18px 0 12px; }
+.injection-baseline-note { display: grid; gap: 5px; padding: 13px 15px; margin-bottom: 18px; border: 1px solid #4a422c; border-radius: 8px; background: #1b1810; color: #cbbb97; font-size: 12px; line-height: 1.65; }
+.injection-baseline-note strong { color: #e2c68b; }
+.injection-baseline-note small { color: #a49a83; overflow-wrap: anywhere; }
+.injection-baseline-verified { border-color: #26473d; background: #0c1a15; color: #afcabe; }
+.injection-baseline-verified strong { color: #a1dfc3; }
+.injection-baseline-verified small { color: #8aaa9a; }
+.injection-fields { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 15px; }
+.injection-time-label { grid-column: span 1; }
+.injection-time-label input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace !important; font-size: 11px !important; }
+.injection-action-note { font-size: 11px; color: #8ea59b; line-height: 1.6; }
+.injection-result { margin-top: 25px; padding: 18px; border: 1px solid #386357; border-radius: 10px; background: #080f0c; }
+.injection-result-heading { display: flex; justify-content: space-between; align-items: center; gap: 15px; }
+.injection-workspace h4 { color: #d8e7e0; margin: 0; font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
+.injection-result-heading h4 { margin: 6px 0 3px; }
+.injection-result-heading small { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; color: #88a195; overflow-wrap: anywhere; }
+.injection-result-heading > button { flex-shrink: 0; }
+.injection-stats { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 10px; margin-top: 18px; }
+.injection-stats > div { display: grid; align-content: start; gap: 5px; padding: 12px; background: #111c16; border: 1px solid #26392d; border-radius: 7px; }
+.injection-stats span { font-size: 10px; line-height: 1.5; color: #8ca493; }
+.injection-stats strong { color: #c9e2d2; font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+.injection-warnings { padding-left: 19px; color: #c9b584; font-size: 11px; line-height: 1.7; margin: 13px 0; }
+.injection-warnings li + li { margin-top: 5px; }
+.injection-comparison { margin-top: 21px; padding-top: 15px; border-top: 1px solid #253e30; }
+.injection-comparison-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 11px; margin-bottom: 6px; }
+.injection-comparison svg { display: block; width: 100%; height: auto; min-height: 150px; }
+.injection-legend { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; font-size: 10px; color: #9caf9f; }
+.injection-legend span { display: inline-flex; gap: 6px; align-items: center; }
+.injection-legend i { width: 14px; height: 3px; display: inline-block; }
+.injection-original-swatch { background: #86a3bc; }
+.injection-altered-swatch { background: #48dbad; }
+.injection-legend .injection-invalid-swatch { border-radius: 50%; width: 6px; height: 6px; background: #edab6c; }
+.injection-original-line { fill: none; stroke: #86a3bc; stroke-width: 1.9; stroke-dasharray: 5 3; }
+.injection-altered-line { fill: none; stroke: #48dbad; stroke-width: 1.7; }
+.injection-original-point { fill: #86a3bc; opacity: .65; }
+.injection-altered-point { fill: #48dbad; opacity: .75; }
+.injection-invalid-point { fill: #edab6c; }
+.injection-axis { fill: #8fa699; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
+.injection-grid-line { stroke: #283b30; stroke-width: 1; }
+.injection-window { fill: #dfb667; opacity: .075; }
+.injection-preview-table { border-top: 1px solid #253e30; padding-top: 8px; margin-top: 15px; }
+.review-workspace .injection-checkbox { display: inline-flex; align-items: center; gap: 8px; margin: 7px 0; }
+.injection-changed-row { background: #13231a; }
+.injection-changed-row td:nth-child(4) { color: #97e7ba; }
+.injection-saved-heading { display: flex; justify-content: space-between; align-items: center; gap: 14px; margin: 25px 0 13px; padding-top: 18px; border-top: 1px solid var(--review-line); }
+.injection-refresh { min-height: 34px; padding: 6px 10px; flex-shrink: 0; }
+.injection-run-list { display: grid; gap: 9px; }
+.injection-run { display: flex; justify-content: space-between; align-items: center; gap: 16px; border: 1px solid #28382f; border-radius: 8px; padding: 14px; background: #0b120e; }
+.injection-run-active { border-color: #437b61; background: #0d1c13; }
+.injection-run strong { font-size: 12px; color: #bcd7c7; overflow-wrap: anywhere; }
+.injection-run p { margin: 6px 0; color: #97ad9d; font-size: 11px; line-height: 1.65; overflow-wrap: anywhere; }
+.injection-run small { color: #809686; font-size: 10px; line-height: 1.6; }
+.injection-run .review-actions { margin: 0; flex-shrink: 0; }
+@media (max-width: 1100px) { .injection-fields { grid-template-columns: repeat(2,minmax(0,1fr)); } .injection-stats { grid-template-columns: repeat(3,minmax(0,1fr)); } }
+@media (max-width: 760px) { .injection-result { padding: 13px; } .injection-result-heading { align-items: flex-start; flex-direction: column; } .injection-run { align-items: flex-start; flex-direction: column; } .injection-comparison svg { min-height: 120px; } }
+@media (max-width: 520px) { .injection-fields { grid-template-columns: minmax(0,1fr); } .injection-stats { grid-template-columns: repeat(2,minmax(0,1fr)); } .injection-saved-heading { align-items: flex-start; flex-direction: column; } .injection-result-heading > button { width: 100%; } }
+.injection-fragment-picker { margin: 18px 0; padding: 16px; border: 1px solid #386357; border-radius: 8px; }
+.injection-fragment-picker circle[role="button"] { cursor: crosshair; stroke: transparent; stroke-width: 6px; }
+.injection-fragment-picker circle[role="button"]:hover, .injection-fragment-picker circle[role="button"]:focus { stroke: #e4f3eb; stroke-width: 2px; outline: none; }
+.injection-fragment-picker .review-button[aria-pressed="true"] { border-color: #66c6b2; background: #163d32; }

@@ -1,17 +1,43 @@
 services:
   api:
+    mem_limit: 10g
+    memswap_limit: 10g
     build:
       context: ./backend
+      args:
+        INSTALL_GAT: "1"
     environment:
+      ARTIFACT_ROOT: /app
+      DATABASE_DIR: /app/storage/database
+      MODELS_DIR: /app/models/gat_lstm
       MULTISTATE_FIXTURE_DIR: /app/fixtures
+      HISTORY_TRAINING_WORKERS: ${HISTORY_TRAINING_WORKERS:-4}
+      CONTEXT_CALIBRATION_WORKERS: ${CONTEXT_CALIBRATION_WORKERS:-4}
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      GAT_SEQUENCE_CACHE_DIR: /app/gat_sequence_cache
       STATIC_HISTORY_DIR: /app/data/static_history
-      REAL_HISTORY_PATH: /app/data/datosreales/history.csv
+      REAL_HISTORY_PATH: /app/data/history/cargados/history.csv
+      VALIDATION_HISTORY_PATH: /app/data/history/cargados/historico_validacion.csv
+      ANALYSIS_CACHE_PATH: /app/storage/cache/real_history_analysis.json
+      CONTINUOUS_CONF_PATH: /app/storage/cache/conf.txt
+      CONTEXT_MAP_CACHE_PATH: /app/storage/cache/contextual_map.json
+      REVIEW_DATA_DIR: /app/data/review
+      HISTORICAL_DATA_DIR: /app/data/history
+      FLOW_LAB_DB_PATH: /app/storage/database/flow_lab.sqlite3
+      VALIDATION_REPLAY_MEMORY_RESULTS: "500"
+      VALIDATION_REPLAY_STATUS_RESULTS: "25"
+      CONTEXT_CONTINUOUS_MAX_AGE_SECONDS: "3600"
+      CONTEXT_CONTINUOUS_MAX_AGE_BY_ENTITY: "{}"
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     volumes:
       - ./data/fixtures:/app/fixtures:ro
-      - ./data/static_history:/app/data/static_history
-      - ./data/datosreales:/app/data/datosreales:ro
-      - ./data/cache:/app/data/cache
+      - ./data:/app/data
+      - ./storage:/app/storage
+      - ./models:/app/models
+      - gat_sequence_cache:/app/gat_sequence_cache
+      - ./artifacts/gat_lstm:/app/artifacts/gat_lstm:ro
+    command: ["python", "-m", "app.bootstrap_gat", "--bundle", "/app/artifacts/gat_lstm", "--serve"]
     ports:
       - "8000:8000"
 
@@ -24,3 +50,6 @@ services:
       - "5173:5173"
     depends_on:
       - api
+
+volumes:
+  gat_sequence_cache:
