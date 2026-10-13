@@ -14,7 +14,7 @@ except ImportError:
     import voluptuous as schema
 
 from .api import ArtifactClient, InvalidArtifactResponse, normalize_url
-from .const import CONF_WEB_URL, DOMAIN
+from .const import CONF_WEB_URL, DEFAULT_API_URL, DEFAULT_WEB_URL, DOMAIN
 
 STEP_SCHEMA = schema.Schema(
     {
@@ -68,7 +68,13 @@ class ArtifactConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id=step_id,
             data_schema=self.add_suggested_values_to_schema(
-                STEP_SCHEMA, user_input or (entry.data if entry else None)
+                STEP_SCHEMA,
+                user_input or (
+                    entry.data if entry else {
+                        CONF_URL: DEFAULT_API_URL,
+                        CONF_WEB_URL: DEFAULT_WEB_URL,
+                    }
+                ),
             ),
             errors=errors,
         )

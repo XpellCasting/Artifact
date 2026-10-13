@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Conectar Artifact",
-        "description": "Artifact debe estar ejecutándose en Docker. Introduce direcciones accesibles desde Home Assistant y tu navegador, por ejemplo http://192.168.1.50:8000 y http://192.168.1.50:5173.",
+        "description": "Artifact debe estar ejecutándose en Docker. Las direcciones sugeridas usan la IP Tailscale del notebook: http://100.72.168.116:8000 y http://100.72.168.116:5173. Home Assistant, el notebook y el dispositivo donde abres el navegador necesitan acceso a la misma red Tailscale. Puedes cambiar estas direcciones para otra instalación.",
         "data": {
           "url": "URL de la API",
           "web_url": "URL de la interfaz web"
@@ -16,7 +16,7 @@
       },
       "reconfigure": {
         "title": "Reconfigurar Artifact",
-        "description": "Cambia las direcciones de la API y de la interfaz de Artifact.",
+        "description": "Cambia las direcciones de la API y de la interfaz de Artifact. Para Tailscale, usa la IP Tailscale del notebook con los puertos 8000 y 5173.",
         "data": {
           "url": "URL de la API",
           "web_url": "URL de la interfaz web"

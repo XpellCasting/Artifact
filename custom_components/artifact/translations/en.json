@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Connect Artifact",
-        "description": "Artifact must already be running in Docker. Enter addresses reachable from Home Assistant and your browser, for example http://192.168.1.50:8000 and http://192.168.1.50:5173.",
+        "description": "Artifact must already be running in Docker. Enter the API and web interface addresses reachable from Home Assistant and your browser.",
         "data": {
           "url": "API URL",
           "web_url": "Web interface URL"

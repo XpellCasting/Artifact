@@ -9,16 +9,18 @@ modelos, históricos, frontend ni backend dentro de Home Assistant.
 
 1. En el equipo que ejecutará Artifact, iniciar `docker compose up -d --build`.
 2. Comprobar desde otro equipo de la red las direcciones
-   `http://IP_DEL_EQUIPO:8000/health` y `http://IP_DEL_EQUIPO:5173`.
+   `http://100.72.168.116:8000/health` y `http://100.72.168.116:5173`
+   mediante Tailscale.
    La primera debe devolver el estado de la API y la segunda abrir Artifact.
 3. En HACS, abrir **⋮ → Repositorios personalizados**, añadir
    `https://github.com/XpellCasting/Artifact` con el tipo **Integración**,
    buscar **Artifact** y descargarlo desde `main`.
 4. Reiniciar Home Assistant. En **Configuración → Dispositivos y servicios →
    Añadir integración**, buscar **Artifact**.
-5. Introducir la URL de la API (`http://IP_DEL_EQUIPO:8000`) y la URL de la
-   interfaz (`http://IP_DEL_EQUIPO:5173`). Usar una dirección que Home Assistant
-   y el navegador puedan alcanzar, no el `localhost` de otro equipo.
+5. Confirmar la URL de la API (`http://100.72.168.116:8000`) y la URL de la
+   interfaz (`http://100.72.168.116:5173`), sugeridas para este notebook.
+   Ambas direcciones deben ser accesibles desde Home Assistant y el navegador.
+   Para otra instalación, introducir las direcciones de su equipo de Artifact.
 6. Abrir el dispositivo **Artifact** y pulsar **Visitar** (o el enlace web
    equivalente de Home Assistant) para abrir la aplicación en el navegador.
 
@@ -27,6 +29,33 @@ cuando la API no responde. No carga históricos ni inicia análisis al consultar
 Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
 Esta versión requiere Home Assistant 2024.12 o posterior y no crea un panel
 embebido, importa históricos ni controla simulaciones.
+
+### Acceso mediante Tailscale
+
+Esta instalación utiliza las siguientes direcciones:
+
+| Equipo o servicio | Dirección |
+| --- | --- |
+| Home Assistant | `100.70.236.99` |
+| Notebook que ejecuta Artifact | `100.72.168.116` |
+| API de Artifact | `http://100.72.168.116:8000` |
+| Interfaz de Artifact | `http://100.72.168.116:5173` |
+
+Tailscale debe estar activo en ambos equipos y en el dispositivo desde el que
+se abre la interfaz, con acceso a la misma red Tailscale. Las conexiones de
+Home Assistant hacia Artifact usan la IP del notebook. El notebook debe estar
+encendido y con los servicios de Docker ejecutándose para que Artifact responda.
+
+Para cambiar una integración ya instalada, abrir **Configuración → Dispositivos
+y servicios → Artifact → ⋮ → Reconfigurar** e introducir las dos URL de Artifact
+de la tabla. Esto actualiza la conexión y el enlace **Visitar** del dispositivo.
+Las direcciones guardadas se conservan hasta confirmar la reconfiguración;
+actualizar el código de HACS no las reemplaza automáticamente.
+
+Docker publica los puertos 8000 y 5173 en las interfaces del notebook, incluida
+Tailscale. El proxy `/api` de la interfaz sigue conectándose a `http://api:8000`
+dentro de Docker y permite abrir Artifact desde la IP Tailscale sin cambiar
+la configuración CORS.
 
 La interfaz envía las peticiones a `/api` en su propio origen. El servidor web
 las reenvía a `http://api:8000` dentro de Docker, por lo que no se necesitan
@@ -257,6 +286,7 @@ docker compose up --build
 ```
 
 Interfaz: http://localhost:5173. API y documentación: http://localhost:8000/docs.
+Desde Tailscale: http://100.72.168.116:5173 y http://100.72.168.116:8000/docs.
 Los volúmenes `data/`, `storage/` y `models/` conservan el estado entre reinicios.
 El bootstrap restaura los archivos ausentes del paquete publicado y conserva la
 selección de modelo activo existente. No inicia un entrenamiento GAT-LSTM.
