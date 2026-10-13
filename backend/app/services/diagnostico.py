@@ -316,8 +316,8 @@ class DiagnosticWorkbench(DiagnosticRepository):
             "architecture_version": "gat_lstm_v3_segments_multiscale", "schema_version": "gat-lstm-segments-v1"}))
         manifest_path = historical_manifest_path()
         allowed = {item["source_id"] for item in development_sources(manifest_path, self.review)}
-        if len(source_ids) != 1 or source_ids[0] not in allowed:
-            raise ReviewError("GAT-LSTM admite una sola fuente de Desarrollo. Validación y Prueba quedan reservadas para eventos futuros.")
+        if not source_ids or any(identifier not in allowed for identifier in source_ids):
+            raise ReviewError("Selecciona fuentes de Desarrollo. Validación y Prueba quedan reservadas para eventos futuros.")
         dataset = build_sequence_dataset(self.review, source_ids, annotation_ids, config,
                                          self.directory, manifest_path, progress)
         dataset["audit_id"] = sha256_file(manifest_path)
@@ -472,7 +472,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
 
     def train_gat(self, dataset_id, encoder_id=None, gat_config=None,
-                  progress=lambda *_: None, *, checkpoint_dir=None, resume=False):
+                  progress=lambda *_, **__: None, *, checkpoint_dir=None, resume=False):
         if importlib.util.find_spec("torch") is None:
             raise ReviewError("GAT-LSTM no está disponible: falta PyTorch.", 503)
         dataset = self._read("datasets", dataset_id)
@@ -575,7 +575,9 @@ class DiagnosticWorkbench(DiagnosticRepository):
             "training_sample_ids": [m["sample_id"] for m in all_train_meta],
             "training_groups": sorted({m.get("parent_episode_id", "") for m in all_train_meta}),
             "training_end": max((m["context_end"] for m in all_train_meta), default=None),
-            "source_hashes": dataset["source_hashes"], "validated": False,
+            "source_hashes": dataset["source_hashes"],
+            "source_inputs": dataset.get("source_inputs", []),
+            "source_label_counts": dataset.get("source_label_counts", {}), "validated": False,
             "evaluation_status": "candidate", "label_support": support,
             "evidence_origins": dataset.get("evidence_origins", []), "evaluations": [],
             "exploratory": dataset.get("exploratory", False),

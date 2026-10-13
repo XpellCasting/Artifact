@@ -20,7 +20,7 @@ python -m venv .venv-cuda
 
 Si ya clonaste el repositorio, usa `git pull` y `git lfs pull` dentro de esa copia. Git transporta el código y el snapshot publicado; los datasets locales nuevos, checkpoints y candidatos todavía no publicados se trasladan con el exportador descrito más abajo.
 
-Instala **PyTorch con CUDA** siguiendo el [selector oficial de PyTorch](https://pytorch.org/get-started/locally/): elige tu sistema, Pip, Python y una variante CUDA compatible con el controlador. Sustituye el `pip` inicial del comando generado por `.\.venv-cuda\Scripts\python.exe -m pip` para instalar en este entorno. La versión de referencia del proyecto es `torch==2.14.0`; busca esa versión en las [instrucciones oficiales por versión](https://pytorch.org/get-started/previous-versions/) si el selector ofrece otra. No se fija aquí un índice `cuXXX` porque depende de la GPU y del controlador del equipo nuevo.
+Instala **PyTorch con CUDA** siguiendo el [selector oficial de PyTorch](https://pytorch.org/get-started/locally/): elige tu sistema, Pip, Python y una variante CUDA compatible con el controlador. Copia el comando completo que muestra la página y sustituye únicamente su `pip` o `pip3` inicial por `.\.venv-cuda\Scripts\python.exe -m pip`. Conserva `install`, los nombres de paquetes (incluido `torch`) y los argumentos `--index-url` del comando generado. El fragmento que termina en `pip install` no es un comando completo y por sí solo produce el error «You must give at least one requirement to install». La versión de referencia del proyecto es `torch==2.14.0`; busca esa versión en las [instrucciones oficiales por versión](https://pytorch.org/get-started/previous-versions/) si el selector ofrece otra. No se fija aquí un índice `cuXXX` porque depende de la GPU y del controlador del equipo nuevo.
 
 El archivo `requirements-gat-training.txt` contiene las dependencias mínimas para entrenar desde consola. No instala el servidor ni los demás clasificadores de Artifact. Instala después las dependencias neuronales restantes:
 
@@ -42,7 +42,37 @@ En el ordenador actual, prepara un dataset con la versión actual de Artifact, d
 
 El snapshot publicado actualmente en Git LFS contiene el dataset histórico `3c145354dcda4cefb68f1811a21ef488`, con contrato anterior `gat-lstm-entities-v1` y arquitectura `gat_lstm_v2_shared_type`. **Ese dataset y sus pesos no se pueden usar para entrenar esta arquitectura por segmentos.** Hay que preparar un dataset nuevo; cambiar su etiqueta de versión no convierte los datos ni el modelo.
 
-El preparador actual acepta una sola fuente de Desarrollo por dataset. Entrenar con dos históricos independientes, por ejemplo uno real y otro simulado, requiere ampliar la preparación para mantener separados su origen y sus episodios. No concatenes copias simuladas y reales con los mismos sensores y fechas: sus lecturas podrían mezclarse. El soporte CUDA no cambia esta restricción.
+El preparador acepta varios CSV etiquetados de Desarrollo y genera un conjunto con un solo `dataset_id` para entrenar un único modelo. Cada archivo conserva su hash, origen y episodios; sus ventanas se construyen por separado. Los identificadores de sensor deben ser distintos entre archivos y su unión no puede superar `max_nodes` (32). Se rechazan CSV repetidos, entidades compartidas y fechas fuera de Desarrollo. No es necesario concatenar ni renombrar los dos CSV real/sintético suministrados: ya usan 14 identificadores diferentes cada uno.
+
+### Preparación directa desde los dos CSV
+
+Puedes preparar los datos sin iniciar la aplicación. Copia los archivos al ordenador CUDA como `storage/gat-mixto/inputs/real.csv` y `storage/gat-mixto/inputs/sintetico.csv`. El paquete local `storage/gat-mixto/entradas-mixto.zip`, si está disponible, contiene esa estructura: extráelo en la raíz de Artifact. Los CSV no se publican en Git.
+
+Después de actualizar el código e instalar el entorno CUDA, ejecuta desde PowerShell:
+
+```powershell
+.\scripts\train_gat_lstm_mixto.ps1
+```
+
+El script comprueba la GPU, prepara ambos CSV y entrena un único candidato. Usa `training/config-mixto.json` para declarar los valores numéricos/categóricos de los 28 sensores, Desarrollo del 1 de febrero al 21 de mayo de 2026 (fin exclusivo) y la separación cronológica 80/20 del proyecto. No requiere escribir `ID_DATASET`: lo obtiene automáticamente. El resultado queda en `storage/checkpoints/mixto-01/result.json`. La preparación de secuencias usa CPU; el ajuste de pesos usa CUDA y guarda checkpoints al terminar cada época.
+
+Si se interrumpe después de terminar la preparación:
+
+```powershell
+.\scripts\train_gat_lstm_mixto.ps1 -Resume
+```
+
+Si se interrumpe durante la preparación, vuelve a ejecutar sin `-Resume`. El preparador publica solo secuencias completas. Para otro experimento usa `-RunDir storage/checkpoints/mixto-02`; `-BatchSize`, `-MaxEpochs` y `-Patience` permiten cambiar parámetros de una ejecución nueva. Al reanudar conserva los parámetros usados originalmente.
+
+Los comandos equivalentes, para configurar rutas o límites distintos, son:
+
+```powershell
+.\.venv-cuda\Scripts\python.exe scripts/gat_lstm_prepare.py --csv storage/gat-mixto/inputs/real.csv --csv storage/gat-mixto/inputs/sintetico.csv --config training/config-mixto.json --development-start 2026-02-01T00:00:00Z --development-end 2026-05-21T00:00:00Z --result storage/gat-mixto/dataset.json
+$dataset = (Get-Content storage/gat-mixto/dataset.json -Raw | ConvertFrom-Json).dataset_id
+.\.venv-cuda\Scripts\python.exe scripts/gat_lstm_train.py $dataset --device cuda --checkpoint-dir storage/checkpoints/mixto-01 --result storage/checkpoints/mixto-01/result.json
+```
+
+Añade `--inspect-only` al preparador para comprobar columnas, fechas, entidades y etiquetas sin generar secuencias. El resultado entrenado incluye `metrics.dev_metrics_by_source` para revisar cada histórico por separado con la misma política de decisión. Estas métricas siguen siendo de ajuste `dev_tune`.
 
 Para trasladar el dataset nuevo, exporta en el ordenador actual usando el Python que ya ejecuta Artifact:
 

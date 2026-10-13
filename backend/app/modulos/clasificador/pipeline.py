@@ -193,8 +193,6 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     selected = list(dict.fromkeys(source_ids))
     if not selected:
         raise ValueError("Selecciona una fuente etiquetada de Desarrollo")
-    if len(selected) != 1:
-        raise ValueError("Selecciona una sola fuente de Desarrollo para evitar mezclar versiones del histórico")
     sources, exclusions = {}, []
     for identifier in selected:
         if identifier not in available:
@@ -215,6 +213,10 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
         sources[identifier] = {**item, "actual_sha256": actual_hash}
     if not sources:
         raise ValueError("Ninguna fuente seleccionada pasó la verificación de identidad")
+    if len(sources) != len(selected):
+        raise ValueError("Todas las fuentes seleccionadas deben existir y conservar su hash; no se entrenará con una selección incompleta")
+    if len({source["sha256"] for source in sources.values()}) != len(sources):
+        raise ValueError("La misma fuente no puede incorporarse dos veces al dataset")
     progress(5, "Verificando identidad y leyendo fuentes seleccionadas")
 
     event_index, state_values = {}, {}
@@ -222,6 +224,12 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
         event_index[name], state_values[name] = _load_events(
             Path(source["path"]), read_row_labels=bool(source.get("labelled_import")),
             source_id=source["source_id"])
+    owners = {}
+    for name, rows_by_entity in event_index.items():
+        for entity in rows_by_entity:
+            if entity in owners:
+                raise ValueError(f"La entidad {entity} aparece en dos fuentes; usa identificadores distintos para históricos independientes")
+            owners[entity] = name
     eligible_events = defaultdict(list)
     for rows_by_entity in event_index.values():
         for rows in rows_by_entity.values():
@@ -287,16 +295,26 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     preprocessor["architecture_version"] = config.architecture_version
     graph = fit_spec(train_fit, preprocessor, config, bounds["train_fit"])
 
-    merged_index = defaultdict(list)
-    for rows_by_entity in event_index.values():
-        for entity, rows in rows_by_entity.items():
-            merged_index[entity].extend(rows)
-    for rows in merged_index.values():
-        rows.sort(key=lambda item: (item["_time"], item["source_row"]))
-    provider = _provider(merged_index)
-    targets, target_exclusions = index_labelled_targets(all_annotations, provider,
-                                                        split_bounds, config)
-    exclusions.extend(target_exclusions)
+    providers, targets = {}, []
+    annotation_sources = {}
+    for name, source in sources.items():
+        providers[name] = _provider(event_index[name])
+        source_annotations = [a for a in all_annotations if a.get("source_sha256") == source["sha256"]]
+        annotation_sources.update({a["annotation_id"]: name for a in source_annotations})
+        source_targets, target_exclusions = index_labelled_targets(source_annotations, providers[name],
+                                                                   split_bounds, config)
+        targets.extend(source_targets)
+        exclusions.extend({**item, "source_id": name} for item in target_exclusions)
+    episode_parts = defaultdict(set)
+    for annotation in all_annotations:
+        episode = annotation.get("parent_episode_id") or annotation["annotation_id"]
+        episode_parts[episode].update(actual_partition(parse_utc(annotation[key]), split_bounds)
+                                     for key in ("start", "end"))
+    shared_episodes = {episode for episode, parts in episode_parts.items() if len(parts) > 1}
+    if shared_episodes:
+        targets = [target for target in targets if target.episode_id not in shared_episodes]
+        exclusions.extend({"episode_id": episode, "reason": "shared_episode"} for episode in sorted(shared_episodes))
+    targets.sort(key=lambda item: (item.timestamp, item.entity_id, item.annotation_id))
     identifier = uuid4().hex
     root = artifact_directory(diagnostics_dir, "sequences")
     root.mkdir(parents=True, exist_ok=True)
@@ -307,6 +325,7 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     fault_type_entity_windows = {part: defaultdict(Counter) for part in ("train_fit", "dev_tune")}
     fault_type_episodes = {part: defaultdict(lambda: defaultdict(set))
                            for part in ("train_fit", "dev_tune")}
+    source_counts = {name: {part: Counter() for part in ("train_fit", "dev_tune")} for name in sources}
     try:
         with ExitStack() as stack:
             supervised = {part: stack.enter_context(PartitionWriter(temp_dir, part))
@@ -314,8 +333,13 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
             annotations_by_id = {a["annotation_id"]: a for a in all_annotations}
             for index, target in enumerate(targets):
                 target_time = parse_utc(target.timestamp)
-                # Each sample supervises the annotated node only. Other nodes are context.
-                sample = build_causal_sample(provider, target_time, preprocessor, graph, config,
+                source_id = annotation_sources[target.annotation_id]
+                # Each sample supervises the annotated node only.
+                # SegmentGATLSTM operates independently per entity. Building other
+                # entities cannot affect this target and repeats costly DTW work.
+                def target_provider(start, end, entities):
+                    return providers[source_id](start, end, [target.entity_id])
+                sample = build_causal_sample(target_provider, target_time, preprocessor, graph, config,
                                              {target.entity_id: target.label})
                 original = annotations_by_id[target.annotation_id]
                 fault_type = original.get("fault_type")
@@ -326,15 +350,18 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
                 sample["metadata"].update({"sample_id": hashlib.sha256(
                     f"{target.annotation_id}:{target.timestamp}:{target.entity_id}".encode()).hexdigest(),
                     "annotation_id": target.annotation_id, "parent_episode_id": target.episode_id,
+                    "source_id": source_id,
                     "source_sha256": original.get("source_sha256"), "source_dataset_id": original.get("dataset_id"),
                     "partition": target.partition, "evidence_origin": original.get("reference_origin", "unspecified"),
                     "status": original.get("status"), "fault_subtype": original.get("fault_type"),
-                    "context_entities": sample["metadata"]["entity_ids"],
+                    "target_entity_id": target.entity_id, "context_entities": [target.entity_id],
                     "context_start": (target_time - timedelta(seconds=config.context_seconds)).isoformat(),
                     "context_end": target.timestamp, "source_row": target.source_row,
                     "target_label": target.label, "es_sintetica": bool(original.get("es_sintetica", False)),
                     "label_source": original.get("label_source")})
                 supervised[target.partition].append(sample)
+                if any(sample["label_mask"]):
+                    source_counts[source_id][target.partition][LABELS[target.label]] += 1
                 if index % 25 == 0 or index + 1 == len(targets):
                     progress(35 + 30 * (index + 1) / max(1, len(targets)),
                              f"Construyendo secuencias etiquetadas: {index + 1:,} de {len(targets):,}")
@@ -377,6 +404,11 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     result = {"dataset_id": identifier, "method": "gat_lstm", "created_at": datetime.now(timezone.utc).isoformat(),
              "sequence_dir": str(final_dir), "source_ids": selected,
              "source_hashes": {name: source["actual_sha256"] for name, source in sources.items()},
+             "source_inputs": [{key: source.get(key) for key in
+                 ("source_id", "dataset_id", "filename", "sha256", "rows", "imported_labels", "imported_synthetic")}
+                 for source in sources.values()],
+             "source_label_counts": {name: {part: dict(counts) for part, counts in parts.items()}
+                                     for name, parts in source_counts.items()},
              "annotation_ids": list(dict.fromkeys(a["annotation_id"] for a in linked_annotations)),
              "labelled_source_ids": [name for name, source in sources.items() if source.get("labelled_import")],
              "training_scope": "development_only",

@@ -311,6 +311,7 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
                         if active:
                             dev_records.append({"true_label": labels[row_index][node],
                                 "scores": class_probs[row_index][node],
+                                "source_id": meta.get("source_id") or meta.get("source_dataset_id") or "unspecified",
                                 "episode_id": meta.get("parent_episode_id"),
                                 "evidence_origin": meta.get("evidence_origin", "unspecified")})
                     if fault_mask[row_index].any():
@@ -357,6 +358,10 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
     rejection = choose_rejection_policy(best_dev_records)
     return model, {"history": history, "best_dev_loss": best_loss,
         "dev_macro_f1": classification_metrics(best_dev_records, rejection["threshold"], rejection["margin"])["macro_f1"],
+        "dev_metrics_by_source": {source: classification_metrics(
+            [row for row in best_dev_records if row.get("source_id", "unspecified") == source],
+            rejection["threshold"], rejection["margin"])
+            for source in sorted({row.get("source_id", "unspecified") for row in best_dev_records})},
         "train_episode_support": support, "dev_episode_support": dev_support,
         "rejection_policy": choose_rejection_policy(best_dev_records),
         "fault_types": list(FAULT_TYPES), "fault_type_train_episode_support": type_support,

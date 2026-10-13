@@ -184,6 +184,11 @@ def build_sample(provider, target, preprocessor, graph, config, labels=None):
     for node, entity in enumerate(entities):
         info = preprocessor["entities"][entity]
         coverage[entity] = []
+        if not grouped[entity]:
+            coverage[entity] = [{"horizon_seconds": horizon, "known_fraction": 0.,
+                                 "segments": (horizon // resolution) // graph["segment_steps"][scale],
+                                 "usable": False} for scale, (horizon, resolution, _) in enumerate(SCALES)]
+            continue
         for scale, (horizon, resolution, _) in enumerate(SCALES):
             ticks = intervals(grouped[entity], target-timedelta(seconds=horizon), target, resolution, info)
             w = graph["segment_steps"][scale]
