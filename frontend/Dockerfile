@@ -6,6 +6,7 @@ COPY package.json package-lock.json* ./
 RUN npm install
 
 COPY index.html .
+COPY vite.config.js .
 COPY src ./src
 
 EXPOSE 5173

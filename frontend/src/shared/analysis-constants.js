@@ -1,4 +1,4 @@
-export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
 export const DEFAULT_SUSPICION_THRESHOLD = 0.60;
 export const MIN_SUSPICION_THRESHOLD = 0.01;
 export const MAX_SUSPICION_THRESHOLD = 0.99;

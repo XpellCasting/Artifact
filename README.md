@@ -1,5 +1,52 @@
 # Artifact: filtros y diagnóstico GAT-LSTM por segmentos
 
+## Home Assistant (HACS)
+
+La integración de HACS conecta Home Assistant con Artifact y permite abrir su
+interfaz desde la página del dispositivo. Artifact se ejecuta por separado en
+Docker; HACS instala únicamente `custom_components/artifact`, sin copiar los
+modelos, históricos, frontend ni backend dentro de Home Assistant.
+
+1. En el equipo que ejecutará Artifact, iniciar `docker compose up -d --build`.
+2. Comprobar desde otro equipo de la red las direcciones
+   `http://IP_DEL_EQUIPO:8000/health` y `http://IP_DEL_EQUIPO:5173`.
+   La primera debe devolver el estado de la API y la segunda abrir Artifact.
+3. En HACS, abrir **⋮ → Repositorios personalizados**, añadir
+   `https://github.com/XpellCasting/Artifact` con el tipo **Integración**,
+   buscar **Artifact** y descargarlo desde `main`.
+4. Reiniciar Home Assistant. En **Configuración → Dispositivos y servicios →
+   Añadir integración**, buscar **Artifact**.
+5. Introducir la URL de la API (`http://IP_DEL_EQUIPO:8000`) y la URL de la
+   interfaz (`http://IP_DEL_EQUIPO:5173`). Usar una dirección que Home Assistant
+   y el navegador puedan alcanzar, no el `localhost` de otro equipo.
+6. Abrir el dispositivo **Artifact** y pulsar **Visitar** (o el enlace web
+   equivalente de Home Assistant) para abrir la aplicación en el navegador.
+
+El indicador de conexión consulta `/health` cada 30 segundos y queda no disponible
+cuando la API no responde. No carga históricos ni inicia análisis al consultar.
+Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
+Esta versión requiere Home Assistant 2024.12 o posterior y no crea un panel
+embebido, importa históricos ni controla simulaciones.
+
+La interfaz envía las peticiones a `/api` en su propio origen. El servidor web
+las reenvía a `http://api:8000` dentro de Docker, por lo que no se necesitan
+excepciones CORS para cada cliente. Al ejecutar Vite fuera de Docker, el destino
+predeterminado es `http://127.0.0.1:8000`; se puede cambiar con
+`ARTIFACT_API_TARGET`. Si se publica un build estático, el servidor que lo aloje
+debe proporcionar el mismo proxy `/api`. `VITE_API_BASE_URL` permite indicar
+una API externa cuando ya existe una configuración de proxy/CORS propia.
+
+Home Assistant y el navegador necesitan acceso de red al equipo de Artifact.
+La integración comprueba el contrato real de `/health`; no acepta cualquier
+servidor que devuelva `200 OK`. Las URL deben ser HTTP(S), sin credenciales,
+parámetros de consulta ni fragmentos. La autenticación de un proxy externo no
+está implementada en esta primera versión.
+
+Para verificar la integración en un entorno de desarrollo Linux con Python 3.12:
+`pip install homeassistant==2024.12.5 pytest==8.3.4 pytest-asyncio==0.24.0`,
+seguido de `python -m pytest tests/home_assistant -q`. El workflow de HACS
+comprueba además el manifiesto y la estructura del repositorio.
+
 Aplicación local de la tesis: revisión de históricos, filtros estadístico y contextual,
 diagnóstico GAT-LSTM por segmentos y evaluación de flujos causales. Los sensores binarios
 usan FOCuS Bernoulli sobre lecturas 0/1, con estimación basal y calibración separadas

@@ -1,0 +1,12 @@
+{
+  "domain": "artifact",
+  "name": "Artifact",
+  "codeowners": ["@XpellCasting"],
+  "config_flow": true,
+  "documentation": "https://github.com/XpellCasting/Artifact#home-assistant-hacs",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/XpellCasting/Artifact/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -1,0 +1,43 @@
+{
+  "title": "Artifact",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Conectar Artifact",
+        "description": "Artifact debe estar ejecutándose en Docker. Introduce direcciones accesibles desde Home Assistant y tu navegador, por ejemplo http://192.168.1.50:8000 y http://192.168.1.50:5173.",
+        "data": {
+          "url": "URL de la API",
+          "web_url": "URL de la interfaz web"
+        },
+        "data_description": {
+          "url": "Dirección base de la API, sin /health.",
+          "web_url": "Dirección que abre el enlace Visitar del dispositivo Artifact."
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigurar Artifact",
+        "description": "Cambia las direcciones de la API y de la interfaz de Artifact.",
+        "data": {
+          "url": "URL de la API",
+          "web_url": "URL de la interfaz web"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Introduce URL HTTP(S) válidas, sin credenciales, parámetros de consulta ni fragmentos.",
+      "cannot_connect": "No se puede conectar a la API. Comprueba que Artifact está activo y que Home Assistant puede acceder a su dirección.",
+      "invalid_response": "Esta dirección no devuelve el estado de Artifact. Comprueba la URL y el puerto de la API (normalmente 8000)."
+    },
+    "abort": {
+      "already_configured": "Este servidor Artifact ya está configurado.",
+      "reconfigure_successful": "Se actualizó la conexión de Artifact."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connection": {
+        "name": "Conexión"
+      }
+    }
+  }
+}
