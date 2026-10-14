@@ -1,5 +1,26 @@
 .flow-lab { --fl-panel: #111722; --fl-surface: #192230; --fl-border: #303e50; --fl-text: #ecf0f6; --fl-muted: #a8b4c5; color: var(--fl-text); display: grid; gap: 18px; min-width: 0; font-family: Inter, system-ui, sans-serif; }
 .flow-lab * { box-sizing: border-box; }
+.fl-history-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px; border: 1px solid var(--fl-border); background: var(--fl-panel); }
+.fl-history-summary>div { flex: 1 1 250px; display: grid; gap: 6px; }
+.fl-history-summary strong { font-size: 14px; }
+.fl-history-summary p { color: var(--fl-muted); font-size: 12px; }
+.fl-future-source, .fl-future-csv, .fl-live-form, .fl-live-form fieldset { display: grid; gap: 16px; }
+.fl-future-source { margin: 18px 0; }
+.flow-lab .fl-event-sources { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.flow-lab .fl-event-option { display: flex; align-items: center; gap: 12px; padding: 15px; background: var(--fl-surface); border: 1px solid var(--fl-border); cursor: pointer; }
+.flow-lab .fl-event-option.is-selected { background: #12302d; border-color: #2dd4bf; }
+.flow-lab .fl-event-option input[type=radio] { width: 16px; height: 16px; min-height: 0; padding: 0; flex: 0 0 auto; accent-color: #2dd4bf; }
+.fl-event-option span { display: grid; gap: 5px; }
+.fl-event-option strong { color: var(--fl-text); font-size: 13px; }
+.fl-event-option small { color: var(--fl-muted); font-size: 12px; }
+.fl-future-csv>button, .fl-live-form>button { justify-self: start; }
+.fl-live-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 14px; }
+.fl-live-form summary { color: var(--fl-muted); cursor: pointer; font-size: 13px; }
+.fl-live-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: #5eead4; border: 1px solid #28695d; background: #102a25; padding: 14px; font-size: 13px; }
+.fl-live-status span { margin-left: auto; color: var(--fl-muted); font-size: 12px; }
+@media(max-width:700px) { .flow-lab .fl-event-sources, .fl-live-fields { grid-template-columns: 1fr; }.fl-live-status span { margin-left: 0; } }
+.flow-lab .hs-step { display: block; color: #5eead4; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; font-weight: 700; margin-bottom: 7px; }
+.fl-design-heading h3 { margin: 0; font-size: 17px; }
 .fl-upload-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }.flow-lab .file-action { display: inline-flex; align-items: center; padding: 10px 14px; border: 1px solid var(--fl-border); color: var(--fl-text); background: var(--fl-surface); cursor: pointer; }.flow-lab .file-action:has(input:disabled) { opacity: .45; cursor: not-allowed; }.flow-lab .file-action input { display: none; }.fl-results section { display: grid; gap: 12px; padding: 16px 0; }.fl-comparison { padding: 18px; border: 1px solid var(--fl-border); background: var(--fl-panel); display: grid; gap: 12px; }
 .flow-lab h2 { margin: 0 0 8px; font-size: 26px; }.flow-lab h3 { font-size: 15px; margin: 0 0 10px; }.flow-lab p { margin: 0; line-height: 1.5; }
 .fl-header { display: flex; gap: 18px; justify-content: space-between; align-items: center; }.fl-header p,.fl-muted,.fl-hint { color: var(--fl-muted); }.fl-hint { font-size: 12px; line-height: 1.5; }

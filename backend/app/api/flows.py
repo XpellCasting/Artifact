@@ -1,5 +1,6 @@
 from __future__ import annotations
 from copy import deepcopy
+from uuid import uuid4
 from typing import Any
 from fastapi import HTTPException, Query, Request
 import app.database.evaluacion_etiquetada as labelled_evaluation
@@ -7,8 +8,10 @@ from app.flow.definitions import default_flow
 from app.flow.definitions import validate_flow
 from app.flow.evaluacion import CausalFlowRunner
 from fastapi import APIRouter
-from app.api.schemas import FlowRunRequest
-from app.services.runtime import state, flow_store, flow_evaluation_jobs
+from app.api.schemas import FlowRunRequest, HomeAssistantLiveRequest
+from app.services.home_assistant_live import HomeAssistantEventSource
+from app.services.home_assistant_history import resolve_connection
+from app.services.runtime import state, flow_store, flow_evaluation_jobs, home_assistant_bridge
 router = APIRouter()
 
 @router.get("/flows", tags=["flow-lab"])
@@ -85,6 +88,52 @@ def flow_evaluation_status(job_id: str):
         return flow_evaluation_jobs.get(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="La evaluación no está disponible; el servicio pudo reiniciarse. Las ejecuciones terminadas siguen guardadas.") from exc
+
+@router.post("/flows/{flow_id}/live/start", tags=["flow-evaluation"])
+def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
+    try:
+        flow = flow_store.get(flow_id)
+        for node in flow["nodes"]:
+            model_id = node.get("config", {}).get("model_id")
+            if node["type"] == "classifier" and model_id:
+                state.diagnostic_workbench._read("models", model_id)
+        with state.validation_replay_lock:
+            if state.historial is None or state.future_baseline_template is None:
+                raise ValueError("Carga un historial en el Selector de Historial y espera a que se prepare el detector.")
+            development = state.historial.eventos.copy(deep=True)
+            entities = state.historial.entidades.copy(deep=True)
+            baseline = deepcopy(state.future_baseline_template)
+            context_map = deepcopy(state.future_context_map_template or {})
+            runner = CausalFlowRunner(deepcopy(state.filtro_estadistico), deepcopy(state.filtro_contextual), state.diagnostic_workbench)
+        integration = request.connection_mode == "integration" or (
+            request.connection_mode == "auto" and home_assistant_bridge.status()["bridge_connected"]
+            and not request.url and not request.token.get_secret_value())
+        url, token = ("", "") if integration else resolve_connection(request.url, request.token.get_secret_value())
+        source = HomeAssistantEventSource(url, token, entities, development["timestamp_dt"].max(), request.entity_ids,
+                                          bridge=home_assistant_bridge if integration else None)
+        def evaluate(progress, result_sink):
+            summary, results, snapshot = runner.evaluate(
+                flow, development, development.iloc[:0].copy(), entities, context_map, baseline,
+                progress=progress, result_sink=result_sink, batch_source=source.batches(), source_identity=uuid4().hex,
+            )
+            if source.error and not summary["candidate_count"]:
+                raise ValueError(source.error)
+            snapshot["source"].update(filename="Eventos entrantes de Home Assistant", type="home_assistant",
+                                      connection_error=source.error,
+                                      reception={**source.status(), "status": "failed" if source.error else "stopped"})
+            return summary, results, snapshot
+        return flow_evaluation_jobs.start(flow_id, evaluate, live_source=source)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@router.post("/flow-evaluations/{job_id}/stop", tags=["flow-evaluation"])
+def stop_live_flow(job_id: str):
+    try:
+        return flow_evaluation_jobs.stop(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="La recepción ya no está disponible.") from exc
 
 @router.get("/flow-runs", tags=["flow-lab"])
 def flow_runs(flow_id: str | None = None) -> dict[str, Any]:

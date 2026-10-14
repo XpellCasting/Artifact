@@ -323,6 +323,11 @@ class CargadorHistorial:
             trabajo["_raw_index"] = trabajo["_raw_index"].astype("int32")
         metadatos = {
             "source_type": origen,
+            "history_origin": (
+                "home_assistant" if "history_origin" in frame.columns
+                and frame["history_origin"].eq("home_assistant").all() and not frame.empty
+                else "csv" if origen == "real" else origen
+            ),
             "source_path": str(ruta),
             "rows": int(len(trabajo)),
             "entity_count": int(trabajo["entity_id"].nunique()) if not trabajo.empty else 0,

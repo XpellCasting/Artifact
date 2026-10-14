@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import CORS_ORIGINS
-from app.services.runtime import state, REVIEW_DATA_DIRECTORY
+from app.services.runtime import state, REVIEW_DATA_DIRECTORY, home_assistant_bridge
+from app.api.home_assistant_bridge import create_bridge_router
 from app.api.revision import crear_router_revision
 from app.api.diagnostico import crear_router_diagnostico
 from app.api.health import router as health_router
@@ -17,7 +18,10 @@ from app.api.flows import router as flows_router
 async def lifespan(api):
     if state.historial is None and state.real_history_path.is_file():
         state.iniciar_carga_real()
-    yield
+    try:
+        yield
+    finally:
+        await home_assistant_bridge.close()
 
 def crear_app():
     api = FastAPI(title="Artefacto de tesis", version="0.6.0", lifespan=lifespan,
@@ -32,6 +36,7 @@ def crear_app():
     api.include_router(configuracion_router)
     api.include_router(contextual_router)
     api.include_router(flows_router)
+    api.include_router(create_bridge_router(home_assistant_bridge))
     return api
 
 app = crear_app()

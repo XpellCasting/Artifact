@@ -1,10 +1,35 @@
 from __future__ import annotations
 from typing import Any
+import os
 from fastapi import HTTPException, Query, Request
 from fastapi import APIRouter
-from app.api.schemas import AnalyzeRequest
-from app.services.runtime import state
+from app.api.schemas import AnalyzeRequest, HomeAssistantHistoryRequest
+from app.services.home_assistant_history import HomeAssistantHistorySource, resolve_connection
+from app.services.runtime import state, home_assistant_bridge
 router = APIRouter()
+
+@router.get("/history/home-assistant/config", tags=["history"])
+def home_assistant_config() -> dict[str, Any]:
+    return {"url": os.environ.get("HOME_ASSISTANT_URL", "http://homeassistant.local:8123"),
+            "token_configured": bool(os.environ.get("HOME_ASSISTANT_TOKEN", "").strip()),
+            **home_assistant_bridge.status()}
+
+@router.post("/history/home-assistant/import/start", tags=["history"])
+def home_assistant_import(request: HomeAssistantHistoryRequest) -> dict[str, Any]:
+    try:
+        integration = request.connection_mode == "integration" or (
+            request.connection_mode == "auto" and home_assistant_bridge.status()["bridge_connected"]
+            and not request.url and not request.token.get_secret_value())
+        url, token = ("", "") if integration else resolve_connection(request.url, request.token.get_secret_value())
+        source = HomeAssistantHistorySource(
+            url=url,
+            token=token,
+            start=request.start, end=request.end, entity_ids=request.entity_ids,
+            transport=home_assistant_bridge.history_transport if integration else None,
+        )
+        return state.iniciar_importacion_home_assistant(source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.get("/history/static/status", tags=["history"])
 def history_static_status(

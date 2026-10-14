@@ -28,7 +28,72 @@ El indicador de conexión consulta `/health` cada 30 segundos y queda no disponi
 cuando la API no responde. No carga históricos ni inicia análisis al consultar.
 Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
 Esta versión requiere Home Assistant 2024.12 o posterior y no crea un panel
-embebido, importa históricos ni controla simulaciones.
+embebido. A partir de la integración 0.2.0, Home Assistant establece una conexión
+saliente con Artifact y proporciona el historial y los cambios de estado usando
+sus APIs internas. La interfaz detecta esta conexión y no pide URL ni token de
+Home Assistant. La actualización requiere instalar tanto el backend como la
+integración; el enlace existente **Visitar** continúa funcionando.
+
+La integración crea y conserva una clave privada, limitada a este vínculo, en
+su entrada de configuración. Artifact conserva únicamente su huella en
+`storage/home_assistant_bridge.json` y acepta el primer vínculo; las conexiones
+posteriores deben presentar la misma clave. Un vínculo existente no se puede
+sustituir con otra integración ni con otra clave. Se permiten solo consultas
+de entidades/historial y suscripciones de estado, sin llamadas a servicios.
+No se crea un token de acceso de Home Assistant ni se comparte la sesión del
+navegador. Al reiniciar, la integración restablece la conexión automáticamente.
+
+### Selector de Historial y página principal
+
+Artifact abre en **Evaluación de flujos**. El historial que prepara los filtros
+se elige en **Selector de Historial**, accesible desde la navegación y desde
+la evaluación de flujos:
+
+- **Home Assistant:** con la integración conectada, elegir las fechas del período.
+  La conexión se resuelve automáticamente. Opcionalmente,
+  indicar entidades separadas por comas. Sin selección se consultan las entidades
+  compatibles disponibles. Se importa únicamente el historial que conserva Home
+  Assistant; un período sin lecturas devuelve un error y conserva el CSV anterior.
+- **Archivo CSV:** seleccionar un archivo con las columnas `entity_id`, `state`
+  y `last_changed`. También se puede recuperar el CSV guardado en el servidor.
+
+La integración consulta Recorder desde Home Assistant, con consultas por día
+y lotes de entidades, y entrega los datos a Artifact. La interfaz muestra el
+progreso junto con la preparación de los filtros. La procedencia Home
+Assistant/CSV se conserva al reiniciar Artifact. Recorder debe estar activo
+para consultar históricos; los eventos entrantes usan el bus de estados.
+
+Para una instalación independiente que no utilice la integración, se conserva
+la conexión manual mediante la [API de historial de Home Assistant](https://developers.home-assistant.io/docs/api/rest/).
+Se puede introducir URL y token de larga duración, o configurar las variables
+`HOME_ASSISTANT_URL` y `HOME_ASSISTANT_TOKEN` en el backend o `.env` de Docker
+Compose. El token configurado solo se usa para esa URL. El token introducido en
+la interfaz no se guarda en el navegador, CSV ni estado de los trabajos.
+
+En **Evaluación de flujos** se diseña el recorrido y se cargan los eventos
+futuros para evaluarlo. **Selector de Historial** concentra la elección de
+Home Assistant o CSV y las herramientas para consultar entidades,
+normalización y parámetros del histórico activo.
+
+La evaluación de eventos futuros permite elegir **Archivo CSV** o **Home Assistant
+en directo**. La integración transmite los cambios de las entidades seleccionadas
+directamente desde Home Assistant. En una instalación independiente se usa la
+[API WebSocket de Home Assistant](https://developers.home-assistant.io/docs/api/websocket/).
+Artifact evalúa los cambios recibidos de las entidades del historial y conserva el estado
+del flujo entre eventos. La interfaz muestra la conexión, los contadores y los
+últimos resultados. **Detener recepción y guardar** termina la sesión y conserva
+la ejecución en el listado habitual. Si la conexión se interrumpe, se guardan los
+resultados recibidos y se informa del corte; una sesión nueva requiere iniciarla
+de nuevo. La conexión de la integración se restablece automáticamente, mientras
+que una evaluación interrumpida conserva su corte y sus resultados. Las
+instalaciones independientes pueden usar las mismas credenciales del selector.
+
+Los eventos se agrupan durante 250 ms para ordenar las lecturas simultáneas. Los
+eventos que llegan después de que su instante ya fue evaluado se excluyen y se
+cuentan como fuera de orden. Se reciben solo entidades conocidas y cambios
+posteriores al historial; los cambios únicamente de atributos se omiten. Una
+cola llena detiene la recepción e informa del motivo, conservando los resultados
+ya recibidos. Los eventos en directo no llevan etiquetas de referencia.
 
 ### Acceso mediante Tailscale
 

@@ -38,7 +38,7 @@ export function Metric({ icon, label, value, detail }) {
 
 export function ModuleTab({ active, icon, label, onClick }) {
   return (
-    <button className={`module-tab ${active ? "active" : ""}`} type="button" onClick={onClick}>
+    <button className={`module-tab ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} type="button" onClick={onClick}>
       {icon}
       <span>{label}</span>
     </button>

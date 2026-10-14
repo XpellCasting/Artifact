@@ -18,10 +18,11 @@ import { downloadCsv } from "../shared/csv.js";
 import ReviewWorkspace from "../features/review/ReviewWorkspace.jsx";
 import DiagnosticWorkspace from "../features/diagnostics/DiagnosticWorkspace.jsx";
 import FlowLab from "../features/flows/FlowLab.jsx";
+import HistorySource from "../features/history/HistorySource.jsx";
 import { isStatisticalSuspicion, statisticalCounts, episodeLabel } from "../shared/statistical-routing.js";
 import { isEnvironmentalResult, contextRoutingLabel, contextRoutingReasonLabel, contextRoutingCounts, contextCoherenceLabel, contextObservationLabel, preciseContextTimestamp, contextCommonCause } from "../shared/context-routing.js";
 
-import { mergeReplayResults, startHistoryUpload, startValidationUpload, HistoryLoadProgress } from "../features/history/history-runtime.jsx";
+import { mergeReplayResults, startHistoryUpload, startValidationUpload } from "../features/history/history-runtime.jsx";
 import { wait, downloadResultsCsv, compareResultsByExecutionDate, entityLabel, timelineDateRange, timelineQueryString, formatHistoryRange, formatSuspicionPercent, normalityDetail, formatElapsed, formatCount } from "../shared/analysis.jsx";
 import { Metric, ModuleTab, Panel, StepButton, SummaryRow, Empty } from "../shared/components.jsx";
 import { EpisodeGroupingControl, SuspicionThresholdControl, ContinuousConfigEditor, ResultEntityFilters, ResultsTable, CalculationModal, NormalizationModal, TimelineChart } from "../features/statistical/StatisticalWorkspace.jsx";
@@ -49,7 +50,7 @@ export function App() {
   const [historyLoad, setHistoryLoad] = useState(null);
   const [selectedResult, setSelectedResult] = useState(null);
   const [normalizationPreview, setNormalizationPreview] = useState(null);
-  const [activeModule, setActiveModule] = useState("estadistico");
+  const [activeModule, setActiveModule] = useState("flujos");
   const [classifierVisited, setClassifierVisited] = useState(false);
   const [resultEntityFilterIds, setResultEntityFilterIds] = useState(null);
   const [continuousConfig, setContinuousConfig] = useState([]);
@@ -121,12 +122,12 @@ export function App() {
     runStep("init", async () => {
       setHealth(await api("/health"));
       const status = await api("/history/static/status?autoload=false");
-      if (status.history_load && status.history_load.status !== "completed") {
-        setActiveModule("evaluacion");
+      if (["queued", "running"].includes(status.history_load?.status)) {
         const completed = await monitorHistoryLoad(status.history_load);
         await finishHistoryLoad(completed);
       } else {
         applyHistoryStatus(status);
+        if (status.history_load?.status === "failed") setHistoryLoad(status.history_load);
         if (status.exists) await loadTimeline("", "");
       }
       const replay = await api("/validation/replay/status");
@@ -249,7 +250,7 @@ export function App() {
     if (!file) {
       return;
     }
-    await runStep("real-upload", async () => {
+    const uploaded = await runStep("real-upload", async () => {
       setHistoryLoad({
         status: "uploading",
         phase: "uploading",
@@ -269,7 +270,9 @@ export function App() {
       });
       const completed = await monitorHistoryLoad(job, { uploadOffset: true });
       await finishHistoryLoad(completed);
+      return completed;
     });
+    if (!uploaded) setHistoryLoad((current) => ({ ...current, status: "failed", message: "No se pudo cargar el CSV. Revisa el archivo e inténtalo de nuevo." }));
     event.target.value = "";
   }
 
@@ -290,6 +293,21 @@ export function App() {
       await wait(750);
       current = await api(`/history/real/load/jobs/${current.job_id}`);
     }
+  }
+
+  async function importHomeAssistantHistory(source) {
+    return runStep("home-assistant-history", async () => {
+      setHistoryLoad({ status: "running", phase: "connecting_home_assistant", progress: 0, message: "Conectando con Home Assistant" });
+      try {
+        const job = await api("/history/home-assistant/import/start", { method: "POST", body: JSON.stringify(source) });
+        const completed = await monitorHistoryLoad(job);
+        await finishHistoryLoad(completed);
+        return completed;
+      } catch (err) {
+        setHistoryLoad((current) => ({ ...current, status: "failed", error: err.message }));
+        throw err;
+      }
+    });
   }
 
   async function finishHistoryLoad(completedJob) {
@@ -560,12 +578,15 @@ export function App() {
     event.target.value = "";
   }
 
+  const historySource = <HistorySource apiBaseUrl={API_BASE_URL} status={historyStatus} job={historyLoad} busy={Boolean(busy)} onImport={importHomeAssistantHistory} onUpload={uploadRealHistory} onRestore={loadRealHistory} />;
+
   return (
     <main className="app-shell">
       <header className="app-header">
         <div>
-          <span className="eyebrow"></span>
-          <h1>Filtro estadistico-temporal</h1>
+          <span className="eyebrow">Home Assistant</span>
+          <h1>Artifact</h1>
+          <p>Evaluación de flujos y diagnóstico de sensores</p>
         </div>
       </header>
 
@@ -577,10 +598,12 @@ export function App() {
       )}
 
       <nav className="module-tabs" aria-label="Módulos del artefacto">
+        <ModuleTab active={activeModule === "flujos"} icon={<GitBranch size={17} />} label="Evaluación de flujos" onClick={() => setActiveModule("flujos")} />
+        <ModuleTab active={activeModule === "evaluacion"} icon={<Database size={17} />} label="Selector de Historial" onClick={() => setActiveModule("evaluacion")} />
         <ModuleTab
           active={activeModule === "estadistico"}
           icon={<BarChart3 size={17} />}
-          label="Estadistico"
+          label="Estadístico"
           onClick={() => setActiveModule("estadistico")}
         />
         <ModuleTab
@@ -598,15 +621,13 @@ export function App() {
         <ModuleTab
           active={activeModule === "revision"}
           icon={<Eye size={17} />}
-          label="Analisis y etiquetado"
+          label="Análisis y etiquetado"
           onClick={() => setActiveModule("revision")}
         />
-        <ModuleTab active={activeModule === "evaluacion"} icon={<BarChart3 size={17} />} label="Evaluación" onClick={() => setActiveModule("evaluacion")} />
-        <ModuleTab active={activeModule === "flujos"} icon={<GitBranch size={17} />} label="Evaluación de flujos" onClick={() => setActiveModule("flujos")} />
       </nav>
 
       {activeModule === "flujos" ? (
-        <FlowLab continuousModels={historyStatus?.continuous_models} apiBaseUrl={API_BASE_URL} historyReady={Boolean(historyStatus?.exists && historyStatus?.future_evaluation_ready)} replay={validationReplay} upload={validationUpload} uploadBusy={Boolean(busy)} onUpload={uploadValidationHistory} onLabelledUpload={uploadLabelledEvaluation} />
+        <FlowLab onSelectHistory={() => setActiveModule("evaluacion")} continuousModels={historyStatus?.continuous_models} apiBaseUrl={API_BASE_URL} historyReady={Boolean(historyStatus?.exists && historyStatus?.future_evaluation_ready)} replay={validationReplay} upload={validationUpload} uploadBusy={Boolean(busy)} onUpload={uploadValidationHistory} onLabelledUpload={uploadLabelledEvaluation} />
       ) : activeModule === "estadistico" ? (
         <>
           <section className="metric-grid">
@@ -696,12 +717,13 @@ export function App() {
         </>
       ) : activeModule === "evaluacion" ? (
         <>
+          {historySource}
           <section className="workspace-grid lower single">
-            <Panel title="Conjunto de datos">
-              <p>El histórico se conserva y se recupera automáticamente al reiniciar el servidor. Puedes subir otro archivo para reemplazarlo.</p>
+            <Panel title="Detalle del historial de referencia">
+              <p>El histórico se conserva y se recupera automáticamente al reiniciar el servidor.</p>
               <div className="history-summary">
                 <SummaryRow label="API" value={health?.status || "-"} />
-                <SummaryRow label="Origen" value={historyStatus?.source_type || "-"} />
+                <SummaryRow label="Origen" value={historyStatus?.exists ? (historyStatus.history_origin === "home_assistant" ? "Home Assistant" : "CSV") : "-"} />
                 <SummaryRow label="Filas" value={formatCount(historyStatus?.rows)} />
                 <SummaryRow label="Filas normalidad" value={formatCount(historyStatus?.normality_history?.rows)} />
                 <SummaryRow label="Entidades" value={formatCount(historyStatus?.entity_count || entities.length)} />
@@ -709,16 +731,10 @@ export function App() {
                 <SummaryRow label="Rango" value={formatHistoryRange(historyStatus)} />
               </div>
               <div className="button-row">
-                <StepButton id="real-history" busy={busy} onClick={loadRealHistory} icon={<Database size={17} />} label="Cargar historico" />
-                <label className="file-action">
-                  Subir historico
-                  <input type="file" accept=".csv,text/csv" onChange={uploadRealHistory} disabled={Boolean(busy)} />
-                </label>
                 <StepButton id="analyze-history" busy={busy} onClick={analyzeHistory} icon={<BarChart3 size={17} />} label="Analizar historico" disabled={!historyStatus?.exists} />
                 <StepButton id="normalization-preview" busy={busy} onClick={openNormalizationPreview} icon={<Eye size={17} />} label="Ver normalizacion" disabled={!historyStatus?.exists} />
                 <StepButton id="continuous-config" busy={busy} onClick={loadContinuousConfig} icon={<Eye size={17} />} label="Parametros continuos" disabled={!historyStatus?.exists} />
               </div>
-              {historyLoad && <HistoryLoadProgress job={historyLoad} />}
               {continuousConfig.length > 0 && (
                 <ContinuousConfigEditor
                   configs={continuousConfig}

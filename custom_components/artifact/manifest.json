@@ -1,6 +1,7 @@
 {
   "domain": "artifact",
   "name": "Artifact",
+  "after_dependencies": ["recorder"],
   "codeowners": ["@XpellCasting"],
   "config_flow": true,
   "documentation": "https://github.com/XpellCasting/Artifact#home-assistant-hacs",
@@ -8,5 +9,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/XpellCasting/Artifact/issues",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

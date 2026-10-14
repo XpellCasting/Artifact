@@ -24,7 +24,7 @@
 
 @font-face {
   font-family: "TT Octosquares";
-  src: url(".../assets/fonts/tt_octosquares/TT Octosquares Trial Regular.ttf") format("truetype");
+  src: url("../assets/fonts/tt_octosquares/TT Octosquares Trial Regular.ttf") format("truetype");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
@@ -32,7 +32,7 @@
 
 @font-face {
   font-family: "TT Octosquares";
-  src: url(".../assets/fonts/tt_octosquares/TT Octosquares Trial DemiBold.ttf") format("truetype");
+  src: url("../assets/fonts/tt_octosquares/TT Octosquares Trial DemiBold.ttf") format("truetype");
   font-weight: 700;
   font-style: normal;
   font-display: swap;
@@ -40,7 +40,7 @@
 
 @font-face {
   font-family: "TT Octosquares";
-  src: url(".../assets/fonts/tt_octosquares/TT Octosquares Trial Bold.ttf") format("truetype");
+  src: url("../assets/fonts/tt_octosquares/TT Octosquares Trial Bold.ttf") format("truetype");
   font-weight: 800;
   font-style: normal;
   font-display: swap;
@@ -1433,8 +1433,15 @@ button:disabled {
   }
 
   .module-tabs {
-    display: grid;
-    grid-template-columns: 1fr;
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding: 2px 2px 10px;
+  }
+
+  .module-tab {
+    flex: 0 0 auto;
+    white-space: nowrap;
   }
 }
 

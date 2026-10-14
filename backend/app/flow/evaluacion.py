@@ -142,12 +142,12 @@ def _merge_report_groups(target, report):
 
 class CausalFlowRunner(FlowRunner):
     def evaluate(self, flow, development, future, entities, context_map, baseline, truth=(), progress=None,
-                 result_sink=None):
+                 result_sink=None, batch_source=None, source_identity=None):
         total_started = perf_counter()
         compiled = self.compile(flow)
-        if future is None or future.empty:
+        if (future is None or future.empty) and batch_source is None:
             raise ValueError("Carga un conjunto de eventos futuros antes de evaluar el flujo.")
-        if future["timestamp_dt"].min() < development["timestamp_dt"].max():
+        if not future.empty and future["timestamp_dt"].min() < development["timestamp_dt"].max():
             raise ValueError("Los eventos de evaluación deben ser posteriores al histórico de Desarrollo.")
         self.execution_id = uuid4().hex
         self.context_states = {}
@@ -193,7 +193,7 @@ class CausalFlowRunner(FlowRunner):
         columns = [c for c in future.columns if c not in {"es_sintetica", "tipo", "tipo_falla", "fault_type", "label", "evaluation"}]
         ordered = future[columns].sort_values(["timestamp_dt", "entity_id", "_raw_index"], kind="stable").copy()
         identity_columns = [c for c in ("entity_id", "timestamp_dt", "state", "_raw_index") if c in ordered]
-        source_id = hashlib.sha256(pd.util.hash_pandas_object(ordered[identity_columns], index=False).values.tobytes()).hexdigest()
+        source_id = source_identity or hashlib.sha256(pd.util.hash_pandas_object(ordered[identity_columns], index=False).values.tobytes()).hexdigest()
         contextual_nodes = [node for node in flow["nodes"]
                             if node["type"] == "contextual" and node.get("config", {}).get("enabled") is not False]
         active_classifier_ids = {node["id"] for node in flow["nodes"]
@@ -229,7 +229,7 @@ class CausalFlowRunner(FlowRunner):
         if needs_history:
             available = development[[c for c in development.columns if c in columns]].copy()
             available["_raw_index"] = -1 - pd.RangeIndex(len(available))
-            available = retain(available, ordered["timestamp_dt"].min())
+            available = retain(available, ordered["timestamp_dt"].min() if not ordered.empty else development["timestamp_dt"].max())
         else:
             available = None
         if hasattr(self.diagnostic, "create_run_session"):
@@ -263,6 +263,8 @@ class CausalFlowRunner(FlowRunner):
         streamed_statistical_groups = {node_id: {} for node_id in self.baselines}
         timings = Counter()
         processed = 0
+        sample_start = sample_end = None
+        expected_total = len(ordered) if batch_source is None else 0
         groups_completed = 0
         classifier_inputs = Counter()
         checkpoints = []
@@ -275,11 +277,15 @@ class CausalFlowRunner(FlowRunner):
         last_progress_at = None
         # Equal timestamps are simultaneous; no node can see a later timestamp.
         try:
-            for _, batch in ordered.groupby("timestamp_dt", sort=True):
+            for _, batch in (ordered.groupby("timestamp_dt", sort=True) if batch_source is None else batch_source):
+                if batch.empty:
+                    continue
+                sample_start = sample_start if sample_start is not None else batch["timestamp_dt"].min()
+                sample_end = batch["timestamp_dt"].max()
                 batch_started = perf_counter()
                 if progress and (last_progress_at is None or
                                  batch_started - last_progress_at >= FLOW_PROGRESS_INTERVAL_SECONDS):
-                    progress(processed, len(ordered), "evaluation", "Procesando grupo temporal",
+                    progress(processed, expected_total, "evaluation", "Procesando grupo temporal",
                              current_timestamp=_time(batch["timestamp_dt"].iloc[0]),
                              current_batch_rows=len(batch), groups_completed=groups_completed,
                              group_started_at=pd.Timestamp.now(tz="UTC").isoformat())
@@ -344,16 +350,16 @@ class CausalFlowRunner(FlowRunner):
                     })
                     next_checkpoint += 5000
                 # Always publish the final count, even inside the half-second interval.
-                if progress and (processed == len(ordered) or
+                if progress and (batch_source is not None or processed == len(ordered) or
                                  completed_at - last_progress_at >= FLOW_PROGRESS_INTERVAL_SECONDS):
-                    progress(processed, len(ordered), "evaluation", "Reproduciendo grupos temporales",
+                    progress(processed, expected_total, "evaluation", "Evaluando eventos entrantes" if batch_source is not None else "Reproduciendo grupos temporales",
                              current_timestamp=_time(batch["timestamp_dt"].iloc[0]),
                              current_batch_rows=len(batch), groups_completed=groups_completed,
                              last_batch_ms=round((completed_at - batch_started) * 1000, 3),
                              group_started_at=None)
                     last_progress_at = completed_at
             if progress and groups_completed == 0:
-                progress(0, len(ordered), "evaluation", "Reproduciendo grupos temporales")
+                progress(0, expected_total, "evaluation", "Reproduciendo grupos temporales")
         finally:
             for session in self.diagnostic_sessions.values():
                 session.flush()
@@ -396,7 +402,7 @@ class CausalFlowRunner(FlowRunner):
             "diagnostic_writes": round(sum(session.stats["write_ms"] for session in self.diagnostic_sessions.values()), 3),
         })
         performance["phases_ms"]["total"] = round((perf_counter() - total_started) * 1000, 3)
-        performance["counts"].update(groups=groups_completed, statistical_nodes=len(statistical_nodes),
+        performance["counts"].update(future_rows=processed, groups=groups_completed, statistical_nodes=len(statistical_nodes),
                                       classifier_inputs=dict(classifier_inputs), checkpoints=checkpoints)
         performance["included_in"] = {
             "baseline_preparation": "total", "causal_evaluation": "total",
@@ -410,13 +416,13 @@ class CausalFlowRunner(FlowRunner):
             "diagnostic_writes": "classifier_execution and causal_evaluation",
             "classifier_execution": "graph_execution; includes diagnostic inference and writes",
         }
-        summary = {"candidate_count": len(ordered), "output_count": result_count, "node_counts": node_counts, "node_timings_ms": dict(timings), "elapsed_ms": round((perf_counter() - started) * 1000, 2), "by_final_decision": final_decisions, "evaluation": report, "statistical_evaluation": statistical_evaluation, "statistical_evaluation_version": "pre_suppression_v1", "performance": performance}
+        summary = {"candidate_count": processed, "output_count": result_count, "node_counts": node_counts, "node_timings_ms": dict(timings), "elapsed_ms": round((perf_counter() - started) * 1000, 2), "by_final_decision": final_decisions, "evaluation": report, "statistical_evaluation": statistical_evaluation, "statistical_evaluation_version": "pre_suppression_v1", "performance": performance}
         provenance = deepcopy(baseline.get("provenance"))
         continuous_models = {node_id: deepcopy(value.get("continuous_model_manifest")) for node_id, value in self.baselines.items()}
         identity_payload = {"base": (provenance or {}).get("baseline_id"), "continuous_methods": {node_id: value.get("continuous_method") for node_id, value in self.baselines.items()}, "continuous_models": continuous_models}
         run_baseline_id = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
         performance["counts"]["diagnostic_sessions"] = {node_id: session.stats for node_id, session in self.diagnostic_sessions.items()}
-        snapshot = {"flow": deepcopy(flow), "execution_mode": "causal_future", "statistical_evaluation_version": "pre_suppression_v1", "source": {"rows": len(ordered), "fingerprint": source_id, "sample_start": _time(ordered["timestamp_dt"].min()), "sample_end": _time(ordered["timestamp_dt"].max())}, "development_end": _time(development["timestamp_dt"].max()), "context_map_version": context_map.get("map_version"), "baseline_version": baseline.get("version"), "baseline_id": run_baseline_id, "baseline_provenance": {**(provenance or {}), "continuous_models": continuous_models}, "diagnostic_snapshots": diagnostic_snapshots}
+        snapshot = {"flow": deepcopy(flow), "execution_mode": "causal_live" if batch_source is not None else "causal_future", "statistical_evaluation_version": "pre_suppression_v1", "source": {"rows": processed, "fingerprint": source_id, "sample_start": _time(sample_start) if sample_start is not None else None, "sample_end": _time(sample_end) if sample_end is not None else None}, "development_end": _time(development["timestamp_dt"].max()), "context_map_version": context_map.get("map_version"), "baseline_version": baseline.get("version"), "baseline_id": run_baseline_id, "baseline_provenance": {**(provenance or {}), "continuous_models": continuous_models}, "diagnostic_snapshots": diagnostic_snapshots}
         return summary, dict(outputs) if outputs is not None else None, snapshot
 
     def _statistical(self, node_id, incoming, events, entities, config):
@@ -477,14 +483,17 @@ class FlowEvaluationJobs:
     def __init__(self, store):
         self.store = store
         self.jobs = {}
+        self.sources = {}
         self.lock = Lock()
 
-    def start(self, flow_id, evaluate):
+    def start(self, flow_id, evaluate, live_source=None):
         with self.lock:
             if any(job["status"] == "running" for job in self.jobs.values()):
                 raise ValueError("Ya hay una evaluación de flujos en curso. Espera a que termine.")
             job_id = uuid4().hex
-            self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "status": "running", "processed": 0, "total": 0, "phase": "preparation"}
+            self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "status": "running", "processed": 0, "total": 0, "phase": "preparation", "mode": "home_assistant" if live_source is not None else "csv"}
+            if live_source is not None:
+                self.sources[job_id] = live_source
         recent_completions = deque()
         last_completed = {"processed": 0, "at": None, "wall": None}
         job_started = perf_counter()
@@ -513,24 +522,54 @@ class FlowEvaluationJobs:
                                          last_completed_at=last_completed["wall"],
                                          **metadata)
         spool = FlowResultSpool(job_id)
+        def sink(results):
+            spool.write_block(results)
+            if live_source is not None:
+                with self.lock:
+                    job = self.jobs[job_id]
+                    job["recent_results"] = (job.get("recent_results", []) + results.get("output", []))[-100:]
         def work():
             try:
-                summary, _, snapshot = evaluate(progress, spool.write_block)
+                summary, _, snapshot = evaluate(progress, sink)
                 progress(summary.get("candidate_count", 0), summary.get("candidate_count", 0),
                          "saving", "Guardando resultados por nodo")
                 spool.finish()
                 run_id, persistence_ms = self.store.save_run_stream(flow_id, snapshot, summary, spool.records())
                 with self.lock:
                     self.jobs[job_id].update(status="completed", persistence_ms=persistence_ms,
+                                             warning=snapshot.get("source", {}).get("connection_error"),
                                              run={"run_id": run_id, "summary": summary, "snapshot": snapshot})
             except Exception as exc:
                 with self.lock:
                     self.jobs[job_id].update(status="failed", error=str(exc))
             finally:
+                if live_source is not None:
+                    live_source.stop()
+                    with self.lock:
+                        connection = live_source.status()
+                        if connection["status"] == "stopping":
+                            connection["status"] = "stopped"
+                        self.jobs[job_id]["connection"] = connection
+                        self.sources.pop(job_id, None)
                 spool.cleanup()
         Thread(target=work, daemon=True).start()
         return {"job_id": job_id, "status": "running"}
 
     def get(self, job_id):
         with self.lock:
-            return deepcopy(self.jobs[job_id])
+            payload = deepcopy(self.jobs[job_id])
+            source = self.sources.get(job_id)
+            if source is not None:
+                payload["connection"] = source.status()
+            return payload
+
+    def stop(self, job_id):
+        with self.lock:
+            source = self.sources.get(job_id)
+            if source is None:
+                if job_id not in self.jobs:
+                    raise KeyError(job_id)
+            else:
+                self.jobs[job_id]["phase"] = "stopping"
+                source.stop()
+        return self.get(job_id)

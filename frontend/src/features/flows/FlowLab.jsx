@@ -5,6 +5,7 @@ import { AlertTriangle, ArrowLeft, ArrowRight, Check, Copy, GitBranch, Maximize2
 import "@xyflow/react/dist/style.css";
 import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, edgeLabel, fingerprint, flowPayload, labelNode, removeNode, templates, validateDraft } from "./flow-lab-model.js";
 import "./flow-lab.css";
+import FutureEventsSource from "./FutureEventsSource.jsx";
 
 const PRESETS = templates();
 const PAGE_SIZE = 50;
@@ -70,7 +71,7 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
   </section>;
 }
 
-function FlowLabContent({ apiBaseUrl, historyReady, continuousModels, replay, upload, uploadBusy, onUpload, onLabelledUpload }) {
+function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousModels, replay, upload, uploadBusy, onUpload, onLabelledUpload }) {
   const [draft, setDraft] = useState(() => restoreFlowDraft().draft);
   const [savedKey, setSavedKey] = useState(() => restoreFlowDraft().savedKey);
   const [flows, setFlows] = useState([]);
@@ -142,7 +143,8 @@ function FlowLabContent({ apiBaseUrl, historyReady, continuousModels, replay, up
         if (state.status === "completed") {
           localStorage.removeItem("flow-evaluation-job"); setJob(null); setBusy(false);
           setActiveRun(state.run); setInspecting(true); setResultNode("output"); setSelection(null);
-          setMessage("Evaluación terminada. El gráfico muestra el flujo utilizado con todos los eventos futuros.");
+          setMessage(state.mode === "home_assistant" ? "Recepción terminada. La ejecución y sus resultados quedaron guardados." : "Evaluación terminada. El gráfico muestra el flujo utilizado con todos los eventos futuros.");
+          if (state.warning) setError(state.warning);
           await refresh();
         } else { setJob(state); timer = setTimeout(poll, 1500); }
       } catch (reason) { if (!stopped) { setError(reason.message); setBusy(false); setJob(null); localStorage.removeItem("flow-evaluation-job"); } }
@@ -195,6 +197,21 @@ function FlowLabContent({ apiBaseUrl, historyReady, continuousModels, replay, up
       localStorage.setItem("flow-evaluation-job", started.job_id); setJob(started);
     } catch (reason) { setError(reason.message); setBusy(false); }
   }
+  async function startLive(connection) {
+    setBusy(true); setError(""); setMessage("");
+    try {
+      const saved = dirty || !draft.flow_id ? await persist() : draft;
+      const started = await request(apiBaseUrl, `/flows/${saved.flow_id}/live/start`, { method: "POST", body: JSON.stringify(connection) });
+      localStorage.setItem("flow-evaluation-job", started.job_id);
+      setJob({ ...started, mode: "home_assistant" });
+      return true;
+    } catch (reason) { setError(reason.message); setBusy(false); return false; }
+  }
+  async function stopLive() {
+    setError("");
+    try { setJob(await request(apiBaseUrl, `/flow-evaluations/${job.job_id}/stop`, { method: "POST" })); }
+    catch (reason) { setError(reason.message); }
+  }
   const loadPage = useCallback(async (runId, nodeId, offset) => {
     const revision = ++pageRequest.current;
     setResultBusy(true); setSelectedResult(null); setPage({ items: [], total: 0, offset, next_offset: null });
@@ -209,8 +226,10 @@ function FlowLabContent({ apiBaseUrl, historyReady, continuousModels, replay, up
 
   return <section className="flow-lab" aria-label="Evaluación de flujos">
     <header className="fl-header"><div><span className="eyebrow">Evaluación causal</span><h2>Evaluación de flujos</h2><p>Diseña el recorrido de los filtros y comprueba qué identifica en los eventos futuros.</p></div><div className="fl-state"><span className={`fl-dot ${inspecting || !dirty ? "is-saved" : ""}`} />{inspecting ? "Inspección de una ejecución" : dirty ? "Cambios sin guardar" : "Todos los cambios guardados"}</div></header>
+    {onSelectHistory && <section className="fl-history-summary" aria-label="Historial de referencia"><div><strong>{historyReady ? "Historial de referencia listo" : "Prepara tu historial de referencia"}</strong><p>{historyReady ? "Los filtros están preparados con el historial seleccionado." : "Elige el historial de Home Assistant o un archivo CSV en el Selector de Historial."}</p></div><button type="button" disabled={busy} onClick={onSelectHistory}>Selector de Historial<ArrowRight size={16} /></button></section>}
     {error && <div role="alert" className="fl-notice fl-error"><AlertTriangle size={18} /><span>{error}</span>{!loaded && <button onClick={() => { setError(""); refresh().catch((e) => setError(e.message)); }}>Reintentar</button>}</div>}
     {message && <div role="status" className="fl-notice"><Check size={16} />{message}</div>}
+    <div className="fl-design-heading"><span className="hs-step">Diseño del flujo</span><h3>Configura el recorrido de los filtros</h3></div>
     <div className="fl-toolbar">{inspecting ? <>
       <button onClick={() => { setInspecting(false); setSelection(null); }}><ArrowLeft size={16} />Volver al diseño</button><strong>{graph.name}</strong><span className="fl-muted">Configuración de la ejecución · solo lectura</span><button onClick={() => choose({ ...clone(graph), flow_id: null, name: `${graph.name} (copia)` })}><Copy size={16} />Editar una copia</button>
     </> : <>
@@ -241,15 +260,12 @@ function FlowLabContent({ apiBaseUrl, historyReady, continuousModels, replay, up
       {!inspecting && <details className="fl-connect"><summary>Conectar mediante formulario</summary><fieldset disabled={busy} className="fl-fields"><label>Desde<select aria-label="Origen de conexión" value={source} onChange={(event) => setSource(event.target.value)}><option value="">Seleccionar…</option>{draft.nodes.filter((item) => item.type !== "output").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><label>Hacia<select aria-label="Destino de conexión" value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Seleccionar…</option>{draft.nodes.filter((item) => item.type !== "input").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><button disabled={!source || !target} onClick={() => addConnection({ source, target })}><GitBranch size={15} />Conectar</button></fieldset></details>}
     </aside></div>
     {!inspecting && <>{!!errors.length && <div className="fl-validation" role="status"><strong>Completa el diseño para ejecutar</strong><ul>{errors.map((text) => <li key={text}>{text}</li>)}</ul></div>}
-      <section className="fl-execution"><div><h3>Evaluación con eventos futuros</h3><p>El histórico prepara el detector. Se evalúa todo el archivo futuro en orden temporal, usando el flujo visible y sin consultar eventos posteriores. Cada ejecución empieza con una copia nueva del estado histórico.</p>
-        <div className="fl-upload-actions"><label className="file-action">Cargar eventos futuros<input type="file" accept=".csv,text/csv" disabled={busy || uploadBusy || !historyReady} onChange={onUpload} /></label><label className="file-action">Cargar conjunto etiquetado<input type="file" accept=".csv,text/csv" disabled={busy || uploadBusy || !historyReady} onChange={onLabelledUpload} /></label></div>
-        <p className="fl-hint">CSV etiquetado: entity_id, state, last_changed, es_sintetica, tipo, tipo_falla. Las etiquetas se usan solo para comprobar los resultados.</p>
-        {replay?.loaded && <p><strong>{replay.filename}</strong> · {replay.rows} eventos · {replay.labelled ? "Con etiquetas" : "Sin etiquetas"}</p>}
-        {upload && <p role="status">{upload.message}</p>}
-        {!historyReady && <p className="fl-required">Carga un histórico desde Evaluación y espera a que se prepare el detector.</p>}
+      <section className="fl-execution"><div><span className="hs-step">Evaluación</span><h3>Evaluación con eventos futuros</h3>
+        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} replay={replay} upload={upload} onUpload={onUpload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
+        {!historyReady && <p className="fl-required">Carga un historial desde el Selector de Historial y espera a que se prepare el detector.</p>}
         <CalibrationReport models={continuousModels} />
-        {job && <FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} />}
-      </div><button className="fl-primary" disabled={busy || uploadBusy || !loaded || !historyReady || !replay?.loaded || !!errors.length} onClick={execute}><Play size={16} />{busy ? "Evaluando…" : dirty || !draft.flow_id ? "Guardar y evaluar" : "Evaluar flujo"}</button></section>
+        {job && job.mode !== "home_assistant" && <FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} />}
+      </div></section>
     </>}
     <section className="fl-comparison" aria-label="Comparación de conjuntos etiquetados"><h3>Conjuntos etiquetados evaluados</h3><p>Compara las detecciones de cada flujo. La huella identifica el contenido de los eventos: archivos con nombres iguales pueden contener datos diferentes.</p><div className="fl-table-scroll"><table><thead><tr><th>Conjunto · huella</th><th>Flujo · fecha</th><th>Fallas detectadas / total</th><th>Anomalías detectadas / total</th><th>Tipos identificados / etiquetados</th><th>Falsos positivos</th><th>Detalle</th></tr></thead><tbody>{runs.filter(r => r.summary.evaluation?.labelled).map(run => {
       const groups = run.summary.evaluation.groups;
@@ -258,7 +274,7 @@ function FlowLabContent({ apiBaseUrl, historyReady, continuousModels, replay, up
     })}</tbody></table></div>{!runs.some(r => r.summary.evaluation?.labelled) && <p className="fl-muted">Carga un conjunto etiquetado y evalúa un flujo para comenzar la comparación.</p>}</section>
     <section className="fl-results" aria-label="Resultados de flujos"><div className="fl-results-toolbar"><h3>Ejecuciones</h3><label>Consultar<select aria-label="Ejecución guardada" value={activeRun?.run_id || ""} disabled={busy} onChange={(event) => { const run = runs.find((item) => item.run_id === event.target.value); if (run) { setActiveRun(run); setInspecting(true); setResultNode("output"); setSelection(null); setError(""); setMessage(""); setLayoutRevision((value) => value + 1); } }}><option value="">Seleccionar ejecución…</option>{runs.map((run) => <option key={run.run_id} value={run.run_id}>{run.snapshot?.flow?.name} · {run.snapshot.source?.filename || "Histórico"} · {new Date(run.created_at).toLocaleString()}</option>)}</select></label><button disabled={busy} aria-label="Actualizar ejecuciones" onClick={() => refresh().catch((e) => setError(e.message))}><RotateCcw size={16} /></button></div>
       {!activeRun ? <div className="fl-empty"><GitBranch size={28} /><strong>Tu primera ejecución aparecerá aquí</strong><p>Guarda un flujo y ejecútalo para revisar el recorrido y la evidencia.</p></div> : <>
-        <p><strong>{activeRun.snapshot.source?.filename || "Ejecución anterior"}</strong> · {activeRun.snapshot.execution_mode === "causal_future" ? "Eventos futuros · evaluación causal" : "Análisis retrospectivo anterior"} · {activeRun.snapshot.baseline_id ? `Base ${activeRun.snapshot.baseline_id.slice(0, 16)}` : "Base sin procedencia registrada"}</p>
+        <p><strong>{activeRun.snapshot.source?.filename || "Ejecución anterior"}</strong> · {activeRun.snapshot.execution_mode === "causal_live" ? "Eventos de Home Assistant · evaluación en directo" : activeRun.snapshot.execution_mode === "causal_future" ? "Eventos futuros · evaluación causal" : "Análisis retrospectivo anterior"} · {activeRun.snapshot.baseline_id ? `Base ${activeRun.snapshot.baseline_id.slice(0, 16)}` : "Base sin procedencia registrada"}</p>
         <CalibrationReport models={Object.assign({}, ...Object.values(activeRun.snapshot.baseline_provenance?.continuous_models || {}))} />
         {activeRun.snapshot.baseline_provenance?.continuous_models && <p className="fl-muted">Entrenamiento completado · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => model.eligible).length} sensores preparados · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => !model.eligible).length} no evaluables</p>}
         <div className="fl-metrics"><span><strong>{activeRun.summary.candidate_count}</strong>Lecturas de entrada</span><span><strong>{activeRun.summary.output_count}</strong>Resultados finales</span><span><strong>{Number(activeRun.summary.elapsed_ms).toLocaleString()} ms</strong>Tiempo total</span>{Object.entries(activeRun.summary.by_final_decision || {}).map(([key, value]) => <span key={key}><strong>{value}</strong>{DECISIONS[key] || key}</span>)}</div>

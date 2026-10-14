@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from threading import Event
 import sys
 
 import pytest
@@ -14,22 +15,27 @@ from homeassistant.config_entries import ConfigEntryNotReady, ConfigEntryState
 from homeassistant.core import HomeAssistant
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 
 from custom_components.artifact import async_setup_entry, async_unload_entry
 from custom_components.artifact import api, config_flow, coordinator
 from custom_components.artifact.api import ArtifactClient, InvalidArtifactResponse, normalize_url
 from custom_components.artifact.binary_sensor import ArtifactConnection
 from custom_components.artifact.config_flow import ArtifactConfigFlow
+from custom_components.artifact.bridge import ArtifactBridge
+from app.services.home_assistant_bridge import HomeAssistantBridge
 
 
 @pytest_asyncio.fixture
-async def endpoint() -> AsyncIterator[tuple[str, dict]]:
+async def endpoint(tmp_path) -> AsyncIterator[tuple[str, dict]]:
     """Serve the real health contract without loading Artifact's ML runtime."""
     state = {
         "payload": {"status": "ok", "static_history_dir": "/private/history", "real_history_path": "/private/history.csv"},
         "status": 200,
         "delay": 0,
         "paths": [],
+        "bridge_support": False,
+        "bridge": HomeAssistantBridge(tmp_path / "bridge.json"),
     }
 
     async def health(request):
@@ -41,6 +47,32 @@ async def endpoint() -> AsyncIterator[tuple[str, dict]]:
         return web.json_response(state["payload"], status=state["status"])
 
     app = web.Application()
+    async def register_bridge(request):
+        if not state["bridge_support"]:
+            raise web.HTTPNotFound()
+        payload = await request.json()
+        try:
+            state["bridge"].register(payload["bridge_id"], request.headers.get("Authorization", "")[7:])
+        except PermissionError:
+            raise web.HTTPConflict() from None
+        return web.json_response({"registered": True})
+
+    async def bridge_socket(request):
+        if not state["bridge"].authorized(request.headers.get("Authorization", "")[7:]):
+            raise web.HTTPUnauthorized()
+        socket = web.WebSocketResponse()
+        await socket.prepare(request)
+        connection = await state["bridge"].attach(socket)
+        try:
+            async for message in socket:
+                if message.type == web.WSMsgType.TEXT:
+                    connection.receive(message.json())
+        finally:
+            state["bridge"].detach(connection)
+        return socket
+
+    app.router.add_post("/home-assistant/bridge/register", register_bridge)
+    app.router.add_get("/home-assistant/bridge", bridge_socket)
     app.router.add_get("/health", health)
     app.router.add_get("/artifact/health", health)
     runner = web.AppRunner(app)
@@ -51,6 +83,7 @@ async def endpoint() -> AsyncIterator[tuple[str, dict]]:
     try:
         yield f"http://127.0.0.1:{port}", state
     finally:
+        await state["bridge"].close()
         await runner.cleanup()
 
 
@@ -66,6 +99,7 @@ async def hass(tmp_path):
     instance.config_entries = SimpleNamespace(
         async_forward_entry_setups=AsyncMock(),
         async_unload_platforms=AsyncMock(return_value=True),
+        async_update_entry=Mock(),
     )
     yield instance
     await instance.async_block_till_done()
@@ -80,6 +114,7 @@ def make_entry(base_url):
         async_on_unload=Mock(),
         pref_disable_polling=False,
         runtime_data=None,
+        async_create_background_task=lambda current_hass, coroutine, name: current_hass.async_create_background_task(coroutine, name),
     )
 
 
@@ -219,3 +254,106 @@ async def test_first_refresh_retries_without_forwarding_entities(hass, endpoint,
     with pytest.raises(ConfigEntryNotReady):
         await async_setup_entry(hass, entry)
     hass.config_entries.async_forward_entry_setups.assert_not_awaited()
+
+
+async def connected_bridge(hass, endpoint, session):
+    base, state = endpoint
+    state["bridge_support"] = True
+    entry = make_entry(base)
+    integration = ArtifactBridge(hass, entry, ArtifactClient(session, base))
+    await integration.async_start()
+    for _ in range(100):
+        if state["bridge"].status()["bridge_connected"]:
+            return integration, state["bridge"]
+        await asyncio.sleep(.01)
+    await integration.async_close()
+    pytest.fail("The automatic bridge did not connect")
+
+
+@pytest.mark.asyncio
+async def test_bridge_pairs_automatically_without_creating_a_home_assistant_token(hass, endpoint, session):
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        assert bridge.status() == {"bridge_configured": True, "bridge_connected": True}
+        assert len(integration.token) >= 32
+        assert integration.token not in bridge.path.read_text()
+        stored = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+        assert stored["bridge_token"] == integration.token
+        assert "access_token" not in stored
+    finally:
+        await integration.async_close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_reads_states_using_hass_and_preserves_rpc_chunk_order(hass, endpoint, session):
+    hass.states.async_set("sensor.temperature", "20")
+    hass.states.async_set("light.private", "on")
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        states = await asyncio.to_thread(bridge.request, "states", {})
+        assert [row["entity_id"] for row in states] == ["sensor.temperature"]
+        assert states[0]["state"] == "20"
+    finally:
+        await integration.async_close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_queries_recorder_in_executor_without_a_rest_token(hass, endpoint, session, monkeypatch):
+    from homeassistant.components import recorder
+    from homeassistant.components.recorder import history
+    hass.config.components.add("recorder")
+    rows = [{"entity_id": "sensor.temperature", "state": str(index), "last_changed": "2026-01-01T01:00:00Z"} for index in range(601)]
+    query = Mock(return_value={"sensor.temperature": rows})
+    monkeypatch.setattr(history, "get_significant_states", query)
+    executor = AsyncMock(side_effect=lambda operation: operation())
+    monkeypatch.setattr(recorder, "get_instance", lambda _: SimpleNamespace(async_add_executor_job=executor))
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        result = await asyncio.to_thread(bridge.request, "history", {"start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z", "entity_ids": ["sensor.temperature"]})
+        assert result == [rows]
+        executor.assert_awaited_once()
+        assert query.call_args.kwargs["include_start_time_state"] is False
+        assert query.call_args.kwargs["minimal_response"] is True
+    finally:
+        await integration.async_close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_forwards_selected_state_events_and_removes_listener_on_stop(hass, endpoint, session):
+    hass.states.async_set("binary_sensor.door", "off")
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    stopped = Event()
+    received = asyncio.Event()
+    events = []
+    def accept(message):
+        events.append(message)
+        hass.loop.call_soon_threadsafe(received.set)
+    listener = asyncio.create_task(asyncio.to_thread(bridge.listen, ["binary_sensor.door"], accept, stopped))
+    try:
+        for _ in range(100):
+            if integration.unsubscribers:
+                break
+            await asyncio.sleep(.01)
+        assert integration.unsubscribers
+        hass.states.async_set("binary_sensor.door", "on")
+        await asyncio.wait_for(received.wait(), timeout=3)
+        assert events[0]["event"]["data"]["new_state"]["state"] == "on"
+        stopped.set()
+        await asyncio.wait_for(listener, timeout=3)
+        assert not integration.unsubscribers
+    finally:
+        stopped.set()
+        await integration.async_close()
+        await asyncio.gather(listener, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_bridge_refuses_service_calls_and_unbounded_history(hass, endpoint, session):
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        with pytest.raises(ValueError, match="no está permitida"):
+            await asyncio.to_thread(bridge.request, "call_service", {})
+        with pytest.raises(ValueError, match="intervalo"):
+            await asyncio.to_thread(bridge.request, "history", {"start": "2026-01-01T00:00:00Z", "end": "2026-01-05T00:00:00Z", "entity_ids": ["sensor.temperature"]})
+    finally:
+        await integration.async_close()

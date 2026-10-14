@@ -139,6 +139,8 @@ export function HistoryLoadProgress({ job }) {
 export function historyLoadPhaseLabel(phase) {
   const labels = {
     queued: "Carga en espera",
+    connecting_home_assistant: "Conectando con Home Assistant",
+    fetching_home_assistant: "Importando historial de Home Assistant",
     uploading: "Subiendo archivo",
     saving_upload: "Guardando archivo",
     upload_saved: "Archivo recibido",

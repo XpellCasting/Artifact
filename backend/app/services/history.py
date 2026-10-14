@@ -124,6 +124,20 @@ class ServicesHistoryMixin:
         )
         self._iniciar_hilo_carga(job_id)
         return self.estado_carga_real(job_id)
+    def iniciar_importacion_home_assistant(self, source) -> dict[str, Any]:
+        job_id = self._crear_job_carga(0, phase="connecting_home_assistant")
+
+        def prepare(report):
+            temporary_path = self.real_history_path.with_suffix(f".{job_id}.importing")
+            try:
+                size = source.export_csv(temporary_path, report)
+                temporary_path.replace(self.real_history_path)
+                return size
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+        self._iniciar_hilo_carga(job_id, prepare=prepare)
+        return self.estado_carga_real(job_id)
     def estado_carga_real(self, job_id: str) -> dict[str, Any]:
         with self.history_load_jobs_lock:
             job = self.history_load_jobs.get(job_id)
@@ -194,14 +208,14 @@ class ServicesHistoryMixin:
                     break
                 self.history_load_jobs.pop(oldest_id, None)
         return job_id
-    def _iniciar_hilo_carga(self, job_id: str) -> None:
+    def _iniciar_hilo_carga(self, job_id: str, prepare=None) -> None:
         Thread(
             target=self._ejecutar_job_carga,
-            args=(job_id,),
+            args=(job_id, prepare),
             name=f"history-load-{job_id[:8]}",
             daemon=True,
         ).start()
-    def _ejecutar_job_carga(self, job_id: str) -> None:
+    def _ejecutar_job_carga(self, job_id: str, prepare=None) -> None:
         with self.history_load_execution_lock:
             started_epoch = time()
             self._actualizar_job_carga(
@@ -214,12 +228,17 @@ class ServicesHistoryMixin:
                 _started_epoch=started_epoch,
             )
             try:
+                if prepare is not None:
+                    size = prepare(lambda phase, progress, message: self._actualizar_job_carga(
+                        job_id, status="running", phase=phase, progress=progress, message=message,
+                    ))
+                    self._actualizar_job_carga(job_id, file_size_bytes=size)
                 history_status = self.cargar_real(
                     progress_callback=lambda phase, progress, message: self._actualizar_job_carga(
                         job_id,
                         status="running",
                         phase=phase,
-                        progress=progress,
+                        progress=10 + progress * .9 if prepare is not None else progress,
                         message=message,
                     )
                 )

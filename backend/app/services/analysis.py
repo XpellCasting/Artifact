@@ -351,6 +351,7 @@ class ServicesAnalysisMixin:
             "entities": historial.entidades.to_dict("records"),
             "source_type": metadatos.get("source_type", ""),
             "source_path": metadatos.get("source_path", ""),
+            "history_origin": metadatos.get("history_origin", "csv"),
             "start": metadatos.get("start"),
             "end": metadatos.get("end"),
             "normality_history": normalidad,
