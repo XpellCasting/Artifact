@@ -45,6 +45,13 @@ La integración 0.3.1 corrige la altura del panel para ocupar toda la ventana,
 incluidas las pantallas móviles. Después de instalar esta corrección, recargar
 la página de Home Assistant con **Ctrl+F5** para cargar el componente actualizado.
 
+La integración 0.3.2 sincroniza el tema activo de Home Assistant con
+Artifact-Alertas: fondos, tarjetas, textos, botones y tipografía. La vista sigue
+los cambios entre tema claro y oscuro sin recargar sus alertas. Las fallas
+conservan la señal roja y las anomalías la amarilla. Al abrir la vista directamente
+fuera de Home Assistant, se utiliza la preferencia clara u oscura del navegador.
+Esta actualización requiere actualizar tanto la integración como la interfaz.
+
 A partir de la integración 0.2.0, Home Assistant establece una conexión
 saliente con Artifact y proporciona el historial y los cambios de estado usando
 sus APIs internas. La interfaz detecta esta conexión y no pide URL ni token de

@@ -1445,9 +1445,9 @@ button:disabled {
   }
 }
 
-*,
-*::before,
-*::after {
+:root:not(.artifact-alerts-document) *,
+:root:not(.artifact-alerts-document) *::before,
+:root:not(.artifact-alerts-document) *::after {
   border-radius: 0 !important;
 }
 

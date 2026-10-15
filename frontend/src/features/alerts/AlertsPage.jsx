@@ -3,6 +3,7 @@ import { Bell, RotateCcw } from "lucide-react";
 import { request } from "../../shared/api.js";
 import FlowOutputResult from "../flows/FlowOutputResult.jsx";
 import { flowOutputAlert } from "../flows/flow-output-alert.js";
+import { connectHomeAssistantTheme } from "./home-assistant-theme.js";
 import "../flows/flow-lab.css";
 import "./alerts-page.css";
 
@@ -12,6 +13,8 @@ export default function AlertsPage({ apiBaseUrl }) {
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  useEffect(() => connectHomeAssistantTheme(), []);
 
   useEffect(() => {
     const previousTitle = document.title;
@@ -44,8 +47,8 @@ export default function AlertsPage({ apiBaseUrl }) {
     return () => { stopped = true; controller.abort(); clearTimeout(timer); };
   }, [apiBaseUrl, beforeId, revision]);
 
-  return <main className="app-shell artifact-alerts">
-    <header className="app-header"><div><span className="eyebrow">Artifact</span><h1>Artifact-Alertas</h1>
+  return <main className="artifact-alerts">
+    <header className="artifact-alerts-header"><div><h1>Artifact-Alertas</h1>
       <p>Alertas de las entidades que llegan a la salida del flujo.</p></div>
       <button type="button" disabled={loading} onClick={() => { setBeforeId(null); setRevision((value) => value + 1); }}><RotateCcw size={17} />Actualizar</button>
     </header>

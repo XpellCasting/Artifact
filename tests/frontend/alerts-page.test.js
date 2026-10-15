@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { React, createServer, renderInteractive } from "../../frontend/test-runtime.js";
+import { connectHomeAssistantTheme } from "../../frontend/src/features/alerts/home-assistant-theme.js";
 
 const fault = { alert_id: 3, created_at: "2026-01-01T01:00:00Z", result: {
   entity_id: "sensor.temperature", timestamp: "2026-01-01T01:00:00Z", final_decision: "fault_compatible",
@@ -91,13 +92,13 @@ test("the alerts route opens directly without loading history or starting the fl
 test("the Home Assistant sidebar panel embeds the alerts view, supports the menu and offers a separate window", () => {
   const require = createRequire(new URL("../../frontend/package.json", import.meta.url));
   const { JSDOM } = require("jsdom");
-  const dom = new JSDOM("<!doctype html><body></body>", { url: "http://ha.local:8123", runScripts: "outside-only" });
+  const dom = new JSDOM("<!doctype html><body></body>", { url: "http://ha.local:8123", runScripts: "outside-only", pretendToBeVisual: true });
   try {
     dom.window.eval(readFileSync(new URL("../../custom_components/artifact/frontend/alerts-panel.js", import.meta.url), "utf8"));
     const panel = dom.window.document.createElement("artifact-alerts-panel");
     dom.window.document.body.append(panel);
     panel.panel = { config: { url: "http://artifact.local:5173/alertas" } };
-    assert.equal(panel.shadowRoot.querySelector("iframe").src, "http://artifact.local:5173/alertas");
+    assert.equal(panel.shadowRoot.querySelector("iframe").src, "http://artifact.local:5173/alertas?ha_origin=http%3A%2F%2Fha.local%3A8123");
     const link = panel.shadowRoot.querySelector("a");
     assert.equal(link.href, "http://artifact.local:5173/alertas");
     assert.equal(link.target, "_blank");
@@ -106,6 +107,79 @@ test("the Home Assistant sidebar panel embeds the alerts view, supports the menu
     panel.shadowRoot.querySelector("button").click();
     assert.equal(toggled, true);
     panel.panel = { config: { url: "javascript:alert(1)" } };
-    assert.equal(panel.shadowRoot.querySelector("iframe").src, "http://artifact.local:5173/alertas");
+    assert.equal(panel.shadowRoot.querySelector("iframe").src, "http://artifact.local:5173/alertas?ha_origin=http%3A%2F%2Fha.local%3A8123");
   } finally { dom.window.close(); }
+});
+
+test("the panel shares only theme properties with its configured alerts origin and reacts to theme changes", async () => {
+  const require = createRequire(new URL("../../frontend/package.json", import.meta.url));
+  const { JSDOM } = require("jsdom");
+  const dom = new JSDOM("<!doctype html><body></body>", { url: "http://ha.local:8123", runScripts: "outside-only", pretendToBeVisual: true });
+  try {
+    dom.window.eval(readFileSync(new URL("../../custom_components/artifact/frontend/alerts-panel.js", import.meta.url), "utf8"));
+    const panel = dom.window.document.createElement("artifact-alerts-panel");
+    panel.style.setProperty("--primary-background-color", "#111111");
+    panel.style.setProperty("--primary-color", "#03a9f4");
+    panel.style.setProperty("--ha-font-family-body", "Roboto, sans-serif");
+    panel.hass = { themes: { darkMode: true }, auth: { secret: "never-shared" } };
+    dom.window.document.body.append(panel);
+    panel.panel = { config: { url: "http://artifact.local:5173/alertas" } };
+    const frame = panel.shadowRoot.querySelector("iframe");
+    const messages = [];
+    // JSDOM does not create browsing contexts for iframes inside shadow roots.
+    Object.defineProperty(frame, "contentWindow", { value: { postMessage: (data, origin) => messages.push({ data, origin }) } });
+    await new Promise((resolve) => dom.window.requestAnimationFrame(resolve));
+    assert.equal(messages.at(-1).origin, "http://artifact.local:5173");
+    assert.equal(messages.at(-1).data.dark, true);
+    assert.equal(messages.at(-1).data.variables["--primary-background-color"], "#111111");
+    assert.equal(messages.at(-1).data.variables["--ha-font-family-body"], "Roboto, sans-serif");
+    assert.doesNotMatch(JSON.stringify(messages), /never-shared|auth/);
+    const count = messages.length;
+    dom.window.dispatchEvent(new dom.window.MessageEvent("message", { origin: "http://other.local", source: frame.contentWindow, data: { type: "artifact-alerts-theme-ready" } }));
+    assert.equal(messages.length, count);
+    dom.window.dispatchEvent(new dom.window.MessageEvent("message", { origin: "http://artifact.local:5173", source: frame.contentWindow, data: { type: "artifact-alerts-theme-ready" } }));
+    assert.equal(messages.length, count + 1);
+    panel.style.setProperty("--primary-background-color", "#fafafa");
+    panel.hass = { themes: { darkMode: false } };
+    await new Promise((resolve) => dom.window.requestAnimationFrame(resolve));
+    assert.equal(messages.at(-1).data.dark, false);
+    assert.equal(messages.at(-1).data.variables["--primary-background-color"], "#fafafa");
+    panel.remove();
+  } finally { dom.window.close(); }
+});
+
+test("the alerts document accepts theme changes only from its Home Assistant parent and restores its styles on exit", () => {
+  const require = createRequire(new URL("../../frontend/package.json", import.meta.url));
+  const { JSDOM } = require("jsdom");
+  const dom = new JSDOM("<!doctype html><body></body>", { url: "http://artifact.local/alertas?ha_origin=http%3A%2F%2Fha.local%3A8123" });
+  let disconnect;
+  try {
+    const messages = [], parent = { postMessage: (...args) => messages.push(args) };
+    const target = { document: dom.window.document, location: dom.window.location, parent,
+      addEventListener: dom.window.addEventListener.bind(dom.window), removeEventListener: dom.window.removeEventListener.bind(dom.window) };
+    const root = dom.window.document.documentElement;
+    root.style.setProperty("--primary-color", "#123456");
+    disconnect = connectHomeAssistantTheme(target);
+    assert.equal(root.classList.contains("artifact-alerts-document"), true);
+    assert.deepEqual(messages, [[{ type: "artifact-alerts-theme-ready" }, "http://ha.local:8123"]]);
+    const data = { type: "artifact-alerts-theme", dark: true, variables: {
+      "--primary-background-color": "#111111", "--primary-color": "#03a9f4", "--ha-card-background": "#1c1c1c", "--unrelated": "ignored",
+    } };
+    for (const [origin, source] of [["http://other.local", parent], ["http://ha.local:8123", {}]]) {
+      dom.window.dispatchEvent(new dom.window.MessageEvent("message", { origin, source, data }));
+      assert.equal(root.style.getPropertyValue("--primary-color"), "#123456");
+    }
+    dom.window.dispatchEvent(new dom.window.MessageEvent("message", { origin: "http://ha.local:8123", source: parent, data }));
+    assert.equal(root.style.getPropertyValue("--primary-background-color"), "#111111");
+    assert.equal(root.style.getPropertyValue("--primary-color"), "#03a9f4");
+    assert.equal(root.style.getPropertyValue("--unrelated"), "");
+    assert.equal(root.style.colorScheme, "dark");
+    dom.window.dispatchEvent(new dom.window.MessageEvent("message", { origin: "http://ha.local:8123", source: parent,
+      data: { type: "artifact-alerts-theme", dark: false, variables: { "--primary-background-color": "#fafafa" } } }));
+    assert.equal(root.style.colorScheme, "light");
+    assert.equal(root.style.getPropertyValue("--ha-card-background"), "");
+    disconnect(); disconnect = null;
+    assert.equal(root.classList.contains("artifact-alerts-document"), false);
+    assert.equal(root.style.getPropertyValue("--primary-color"), "#123456");
+  } finally { disconnect?.(); dom.window.close(); }
 });

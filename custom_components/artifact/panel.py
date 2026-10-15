@@ -30,7 +30,7 @@ async def async_setup_alerts_panel(hass, entry):
         webcomponent_name="artifact-alerts-panel",
         sidebar_title="Artifact-Alertas",
         sidebar_icon="mdi:bell-alert",
-        module_url=f"{PANEL_MODULE_URL}?v=0.3.1",
+        module_url=f"{PANEL_MODULE_URL}?v=0.3.2",
         embed_iframe=False,
         config={"url": f"{entry.data[CONF_WEB_URL].rstrip('/')}/alertas"},
     )
