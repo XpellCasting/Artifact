@@ -1,6 +1,11 @@
 """Resultado explícito cuando no hay clasificador disponible."""
 from copy import deepcopy
 
+CLASSIFIER_MODEL_REQUIRED = (
+    "No se puede iniciar la evaluación: el filtro clasificador no tiene un modelo disponible. "
+    "Selecciona un modelo válido en el inspector del flujo o desactiva ese filtro para continuar."
+)
+
 def unavailable_results(results):
     enriched = deepcopy(results)
     for item in enriched:

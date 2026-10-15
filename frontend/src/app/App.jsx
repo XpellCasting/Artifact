@@ -18,11 +18,12 @@ import { downloadCsv } from "../shared/csv.js";
 import ReviewWorkspace from "../features/review/ReviewWorkspace.jsx";
 import DiagnosticWorkspace from "../features/diagnostics/DiagnosticWorkspace.jsx";
 import FlowLab from "../features/flows/FlowLab.jsx";
+import AlertsPage from "../features/alerts/AlertsPage.jsx";
 import HistorySource from "../features/history/HistorySource.jsx";
 import { isStatisticalSuspicion, statisticalCounts, episodeLabel } from "../shared/statistical-routing.js";
 import { isEnvironmentalResult, contextRoutingLabel, contextRoutingReasonLabel, contextRoutingCounts, contextCoherenceLabel, contextObservationLabel, preciseContextTimestamp, contextCommonCause } from "../shared/context-routing.js";
 
-import { mergeReplayResults, startHistoryUpload, startValidationUpload } from "../features/history/history-runtime.jsx";
+import { mergeReplayResults, startValidationUpload } from "../features/history/history-runtime.jsx";
 import { wait, downloadResultsCsv, compareResultsByExecutionDate, entityLabel, timelineDateRange, timelineQueryString, formatHistoryRange, formatSuspicionPercent, normalityDetail, formatElapsed, formatCount } from "../shared/analysis.jsx";
 import { Metric, ModuleTab, Panel, StepButton, SummaryRow, Empty } from "../shared/components.jsx";
 import { EpisodeGroupingControl, SuspicionThresholdControl, ContinuousConfigEditor, ResultEntityFilters, ResultsTable, CalculationModal, NormalizationModal, TimelineChart } from "../features/statistical/StatisticalWorkspace.jsx";
@@ -35,6 +36,13 @@ export async function api(path, options = {}) {
 
 
 export function App() {
+  if (typeof window !== "undefined" && window.location.pathname.replace(/\/$/, "").endsWith("/alertas")) {
+    return <AlertsPage apiBaseUrl={API_BASE_URL} />;
+  }
+  return <ArtifactApp />;
+}
+
+function ArtifactApp() {
   const [health, setHealth] = useState(null);
   const [historyStatus, setHistoryStatus] = useState(null);
   const [entities, setEntities] = useState([]);
@@ -236,44 +244,19 @@ export function App() {
     }
   }
 
-  async function loadRealHistory() {
-    await runStep("real-history", async () => {
+  async function prepareSelectedCsv(candidateId, entityIds) {
+    return runStep("prepare-history", async () => {
       setHistoryLoad(null);
-      const job = await api("/history/real/load/start", { method: "POST" });
-      const completed = await monitorHistoryLoad(job);
-      await finishHistoryLoad(completed);
+      try {
+        const job = await api(`/history/selection/${candidateId}/prepare`, { method: "POST", body: JSON.stringify({ entity_ids: entityIds }) });
+        const completed = await monitorHistoryLoad(job);
+        await finishHistoryLoad(completed);
+        return completed;
+      } catch (reason) {
+        setHistoryLoad((current) => ({ ...current, status: "failed", error: reason.message }));
+        throw reason;
+      }
     });
-  }
-
-  async function uploadRealHistory(event) {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
-    const uploaded = await runStep("real-upload", async () => {
-      setHistoryLoad({
-        status: "uploading",
-        phase: "uploading",
-        progress: 0,
-        message: `Subiendo ${file.name}`,
-        file_size_bytes: file.size,
-      });
-      const job = await startHistoryUpload(file, (loaded, total) => {
-        setHistoryLoad({
-          status: "uploading",
-          phase: "uploading",
-          progress: Math.min(8, (loaded / Math.max(1, total)) * 8),
-          message: `Subiendo ${file.name}`,
-          file_size_bytes: total,
-          uploaded_bytes: loaded,
-        });
-      });
-      const completed = await monitorHistoryLoad(job, { uploadOffset: true });
-      await finishHistoryLoad(completed);
-      return completed;
-    });
-    if (!uploaded) setHistoryLoad((current) => ({ ...current, status: "failed", message: "No se pudo cargar el CSV. Revisa el archivo e inténtalo de nuevo." }));
-    event.target.value = "";
   }
 
   async function monitorHistoryLoad(initialJob, { uploadOffset = false } = {}) {
@@ -299,7 +282,7 @@ export function App() {
     return runStep("home-assistant-history", async () => {
       setHistoryLoad({ status: "running", phase: "connecting_home_assistant", progress: 0, message: "Conectando con Home Assistant" });
       try {
-        const job = await api("/history/home-assistant/import/start", { method: "POST", body: JSON.stringify(source) });
+        const job = await api("/history/home-assistant/prepare", { method: "POST", body: JSON.stringify(source) });
         const completed = await monitorHistoryLoad(job);
         await finishHistoryLoad(completed);
         return completed;
@@ -578,7 +561,7 @@ export function App() {
     event.target.value = "";
   }
 
-  const historySource = <HistorySource apiBaseUrl={API_BASE_URL} status={historyStatus} job={historyLoad} busy={Boolean(busy)} onImport={importHomeAssistantHistory} onUpload={uploadRealHistory} onRestore={loadRealHistory} />;
+  const historySource = <HistorySource apiBaseUrl={API_BASE_URL} status={historyStatus} job={historyLoad} busy={Boolean(busy)} onImport={importHomeAssistantHistory} onPrepareCsv={prepareSelectedCsv} />;
 
   return (
     <main className="app-shell">

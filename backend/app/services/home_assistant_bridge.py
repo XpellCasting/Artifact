@@ -11,6 +11,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 import re
 from threading import Lock
+from time import monotonic
 from uuid import uuid4
 
 
@@ -154,10 +155,23 @@ class HomeAssistantBridge:
         return connection
 
     @staticmethod
-    def _wait(connection, coroutine, timeout=125):
+    def _wait(connection, coroutine, timeout=125, stop_event=None):
         future = asyncio.run_coroutine_threadsafe(coroutine, connection.loop)
         try:
-            return future.result(timeout)
+            if stop_event is None:
+                return future.result(timeout)
+            deadline = monotonic() + timeout
+            while not stop_event.is_set():
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise FutureTimeout()
+                try:
+                    return future.result(min(.25, remaining))
+                except FutureTimeout:
+                    if future.done():
+                        raise
+            future.cancel()
+            raise BridgeUnavailable("La recepción se detuvo por solicitud del usuario.")
         except FutureTimeout:
             future.cancel()
             raise BridgeUnavailable("La integración de Home Assistant no respondió a tiempo.") from None
@@ -176,11 +190,20 @@ class HomeAssistantBridge:
                                         "end": query["end_time"][0],
                                         "entity_ids": query["filter_entity_id"][0].split(",")})
 
-    def listen(self, entity_ids, accept, stop_event):
+    def listen(self, entity_ids, accept, stop_event, on_connected=None):
         connection = self._connection()
-        identifier, queue = uuid4().hex, Queue(maxsize=5000)
-        self._wait(connection, connection.subscribe(identifier, list(entity_ids), queue))
+        entity_ids = list(entity_ids)
+        identifiers, queue = [], Queue(maxsize=5000)
         try:
+            # Keep compatibility with integrations limiting each subscription to 1000 IDs.
+            for index in range(0, len(entity_ids), 1000):
+                if stop_event.is_set():
+                    break
+                identifier = uuid4().hex
+                identifiers.append(identifier)
+                self._wait(connection, connection.subscribe(identifier, entity_ids[index:index + 1000], queue), stop_event=stop_event)
+            if on_connected is not None and not stop_event.is_set():
+                on_connected()
             while not stop_event.is_set():
                 try:
                     event = queue.get(timeout=.25)
@@ -190,8 +213,10 @@ class HomeAssistantBridge:
                     raise event
                 accept({"type": "event", "event": event})
         finally:
+            async def unsubscribe_all():
+                await asyncio.gather(*(connection.unsubscribe(identifier) for identifier in identifiers), return_exceptions=True)
             try:
-                self._wait(connection, connection.unsubscribe(identifier), timeout=5)
+                self._wait(connection, unsubscribe_all(), timeout=5)
             except (BridgeUnavailable, RuntimeError):
                 pass
 

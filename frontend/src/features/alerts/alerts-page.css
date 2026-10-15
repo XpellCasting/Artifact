@@ -1,0 +1,16 @@
+.artifact-alerts { max-width: 1100px; margin: 0 auto; }
+.artifact-alerts button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 14px; color: #fafafa; background: #192230; border: 1px solid #303e50; border-radius: 7px; cursor: pointer; }
+.artifact-alerts button:disabled { opacity: .5; cursor: wait; }
+.artifact-alerts button:focus-visible { outline: 2px solid #5eead4; outline-offset: 3px; }
+.artifact-alerts-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; color: #a8b4c5; font-size: 13px; margin-bottom: 20px; }
+.artifact-alerts-list { display: grid; gap: 14px; }
+.artifact-alert-card { padding: 18px; border: 1px solid; border-left-width: 5px; border-radius: 9px; }
+.artifact-alert-card-fault { background: #230d10; border-color: #ef4444; }
+.artifact-alert-card-anomaly { background: #27210d; border-color: #facc15; }
+.artifact-alert-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.artifact-alert-heading h2 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.artifact-alert-heading time { color: #c1c8d3; font-size: 12px; }
+.artifact-alerts-empty { display: grid; justify-items: center; padding: 64px 16px; color: #a8b4c5; }
+.artifact-alerts-error { color: #fecaca; padding: 14px; border: 1px solid #ef4444; border-radius: 7px; }
+.artifact-alerts-older { margin-top: 20px; }
+@media(max-width:600px) { .artifact-alerts { padding: 16px; }.artifact-alerts .app-header { grid-template-columns: 1fr; }.artifact-alert-heading { align-items: start; flex-direction: column; } }

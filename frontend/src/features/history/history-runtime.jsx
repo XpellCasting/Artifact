@@ -37,11 +37,12 @@ export function mergeReplayResults(current, incoming, limit = 500) {
 }
 
 
-export function startHistoryUpload(file, onProgress) {
+export function startHistoryUpload(file, onProgress, url = `${API_BASE_URL}/history/real/upload/start`) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
-    request.open("POST", `${API_BASE_URL}/history/real/upload/start`);
+    request.open("POST", url);
     request.setRequestHeader("Content-Type", "text/csv");
+    request.setRequestHeader("X-Filename", encodeURIComponent(file.name));
     request.upload.onprogress = (event) => {
       if (event.lengthComputable) {
         onProgress(event.loaded, event.total);
@@ -64,6 +65,10 @@ export function startHistoryUpload(file, onProgress) {
     };
     request.send(file);
   });
+}
+
+export function previewHistoryUpload(file, onProgress, apiBaseUrl = API_BASE_URL) {
+  return startHistoryUpload(file, onProgress, `${apiBaseUrl}/history/selection/csv`);
 }
 
 
@@ -141,6 +146,7 @@ export function historyLoadPhaseLabel(phase) {
     queued: "Carga en espera",
     connecting_home_assistant: "Conectando con Home Assistant",
     fetching_home_assistant: "Importando historial de Home Assistant",
+    filtering_entities: "Seleccionando sensores del historial",
     uploading: "Subiendo archivo",
     saving_upload: "Guardando archivo",
     upload_saved: "Archivo recibido",

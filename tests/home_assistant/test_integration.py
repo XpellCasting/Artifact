@@ -24,6 +24,8 @@ from custom_components.artifact.binary_sensor import ArtifactConnection
 from custom_components.artifact.config_flow import ArtifactConfigFlow
 from custom_components.artifact.bridge import ArtifactBridge
 from app.services.home_assistant_bridge import HomeAssistantBridge
+from custom_components.artifact.panel import alerts_panel_path, async_setup_alerts_panel, async_remove_alerts_panel
+from homeassistant.components.frontend import DATA_PANELS
 
 
 @pytest_asyncio.fixture
@@ -96,6 +98,7 @@ async def session():
 @pytest_asyncio.fixture
 async def hass(tmp_path):
     instance = HomeAssistant(str(tmp_path))
+    instance.http = SimpleNamespace(async_register_static_paths=AsyncMock())
     instance.config_entries = SimpleNamespace(
         async_forward_entry_setups=AsyncMock(),
         async_unload_platforms=AsyncMock(return_value=True),
@@ -230,6 +233,9 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     monkeypatch.setattr(coordinator, "async_get_clientsession", lambda _: session)
     assert await async_setup_entry(hass, entry)
     assert hass.config_entries.async_forward_entry_setups.await_count == 1
+    panel = hass.data[DATA_PANELS][alerts_panel_path(entry)]
+    assert panel.sidebar_title == "Artifact-Alertas"
+    assert panel.config["url"] == "http://artifact.example:5173/alertas"
     sensor = ArtifactConnection(entry.runtime_data, entry)
     assert sensor.available and sensor.is_on
     assert sensor.device_info["configuration_url"] == entry.data["web_url"]
@@ -241,8 +247,26 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     await entry.runtime_data.async_refresh()
     assert sensor.available and sensor.is_on
     assert await async_unload_entry(hass, entry)
+    assert alerts_panel_path(entry) not in hass.data[DATA_PANELS]
     await entry.runtime_data.async_shutdown()
     assert not session.closed
+
+
+@pytest.mark.asyncio
+async def test_alerts_panels_use_distinct_paths_and_can_reload_without_registering_static_routes_twice(hass):
+    first, second = make_entry("http://first.example"), make_entry("http://second.example")
+    second.entry_id = "artifact-second"
+    second.data["web_url"] = "http://second.example:5173/"
+    await async_setup_alerts_panel(hass, first)
+    await async_setup_alerts_panel(hass, second)
+    assert len(hass.data[DATA_PANELS]) == 2
+    assert hass.data[DATA_PANELS][alerts_panel_path(second)].config["url"] == "http://second.example:5173/alertas"
+    async_remove_alerts_panel(hass, first)
+    assert alerts_panel_path(second) in hass.data[DATA_PANELS]
+    first.data["web_url"] = "http://changed.example:5173"
+    await async_setup_alerts_panel(hass, first)
+    assert hass.data[DATA_PANELS][alerts_panel_path(first)].config["url"] == "http://changed.example:5173/alertas"
+    assert hass.http.async_register_static_paths.await_count == 1
 
 
 @pytest.mark.asyncio

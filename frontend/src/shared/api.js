@@ -8,7 +8,9 @@ export async function request(base, path, options = {}) {
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
-    throw new Error(typeof payload.detail === "string" ? payload.detail : payload.detail ? JSON.stringify(payload.detail) : `Error HTTP ${response.status}`);
+    const error = new Error(typeof payload.detail === "string" ? payload.detail : payload.detail ? JSON.stringify(payload.detail) : `Error HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }

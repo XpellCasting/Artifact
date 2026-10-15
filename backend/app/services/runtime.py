@@ -14,6 +14,7 @@ from app.services.aplicacion import EstadoAplicacion
 from app.config import ARTIFACT_ROOT
 from app.config import STORAGE_DIR
 from app.services.home_assistant_bridge import HomeAssistantBridge
+from app.services.history_selection import HistoryCandidates
 REVIEW_DATA_DIRECTORY = Path(
     setting('REVIEW_DATA_DIR')
 )
@@ -46,5 +47,6 @@ state = EstadoAplicacion(
 flow_store = FlowStore(Path(setting('FLOW_LAB_DB_PATH')))
 flow_evaluation_jobs = FlowEvaluationJobs(flow_store)
 home_assistant_bridge = HomeAssistantBridge(STORAGE_DIR / "home_assistant_bridge.json")
+history_candidates = HistoryCandidates(STORAGE_DIR / "history_candidates")
 
 

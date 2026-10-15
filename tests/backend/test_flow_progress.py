@@ -118,7 +118,8 @@ class FlowProgressTests(unittest.TestCase):
         jobs = FlowEvaluationJobs(store)
         saving_states = []
 
-        def save(flow_id, snapshot, summary, records):
+        def save(flow_id, snapshot, summary, records, execution_id=None):
+            self.assertIn(execution_id, jobs.jobs)
             saving_states.append(jobs.get(next(iter(jobs.jobs))))
             self.assertTrue(list(records))
             return "fixture-run", 1.

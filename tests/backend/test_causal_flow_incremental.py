@@ -21,6 +21,17 @@ class _SessionWorkbench:
 
 
 class CausalHistoryTests(unittest.TestCase):
+    def test_diagnostic_session_accepts_history_without_an_active_model(self):
+        class NoModelWorkbench(_SessionWorkbench):
+            def _run_snapshot(self, source, run_id):
+                return {"run_id": run_id, "model": None, "references": []}
+        session = DiagnosticRunSession(NoModelWorkbench(), "test", "no-model")
+        at = pd.Timestamp("2026-01-01T00:00:00Z")
+        session.add_events(pd.DataFrame([{"entity_id": "sensor.a", "timestamp_dt": at,
+                                          "state": "20", "_raw_index": 0}]))
+        self.assertEqual(len(session.events_between(at, at, ["sensor.a"])), 1)
+        self.assertIsNone(session.snapshot["model"])
+
     def test_context_index_incremental_matches_full_index_and_keeps_window_boundary(self):
         filtro = FiltroContextualEspacioTemporal()
         entities = pd.DataFrame([{"entity_id": "binary.a", "domain": "binary_sensor"}])

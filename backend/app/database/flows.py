@@ -8,11 +8,14 @@ from typing import Any
 from uuid import uuid4
 from app.flow.definitions import _json, _now, validate_flow
 
+ALERT_DECISIONS = {"fault_compatible", "environmental", "suspicion"}
+
 class FlowStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._database() as db:
+            import_alerts = not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_alerts'").fetchone()
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS flows (
                     flow_id TEXT PRIMARY KEY, name TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -25,7 +28,21 @@ class FlowStore:
                     PRIMARY KEY (run_id, node_id, observation_id)
                 );
                 CREATE INDEX IF NOT EXISTS flow_results_page ON flow_results(run_id, node_id, sequence);
+                CREATE TABLE IF NOT EXISTS flow_alerts (
+                    alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT NOT NULL, observation_id TEXT NOT NULL,
+                    flow_id TEXT NOT NULL, run_id TEXT, created_at TEXT NOT NULL, payload TEXT NOT NULL,
+                    UNIQUE (execution_id, observation_id)
+                );
             """)
+            if import_alerts:
+                db.execute("""INSERT OR IGNORE INTO flow_alerts
+                    (execution_id,observation_id,flow_id,run_id,created_at,payload)
+                    SELECT result.run_id,result.observation_id,run.flow_id,result.run_id,run.created_at,result.payload
+                    FROM flow_results AS result JOIN flow_runs AS run ON run.run_id=result.run_id
+                    WHERE result.node_id='output'
+                      AND json_extract(result.payload,'$.final_decision') IN ('fault_compatible','environmental','suspicion')
+                    ORDER BY run.created_at,result.sequence""")
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=30)
@@ -81,9 +98,10 @@ class FlowStore:
                 for sequence, item in enumerate(items):
                     records.append((run_id, node_id, str(item["observation_id"]), sequence, _json(item)))
             db.executemany("INSERT INTO flow_results VALUES (?,?,?,?,?)", records)
+            self._insert_alerts(db, run_id, flow_id, results.get("output", []), run_id)
         return run_id
 
-    def save_run_stream(self, flow_id: str, snapshot: dict[str, Any], summary: dict[str, Any], records) -> tuple[str, float]:
+    def save_run_stream(self, flow_id: str, snapshot: dict[str, Any], summary: dict[str, Any], records, execution_id: str | None = None) -> tuple[str, float]:
         """Persist a completed spool atomically without materializing its rows."""
         run_id = uuid4().hex
         started = perf_counter()
@@ -92,6 +110,8 @@ class FlowStore:
             db.execute("BEGIN IMMEDIATE")
             def values():
                 for record in records:
+                    if record["node_id"] == "output" and record["payload"].get("final_decision") in ALERT_DECISIONS:
+                        self._insert_alerts(db, execution_id or run_id, flow_id, [record["payload"]], run_id)
                     yield (run_id, record["node_id"], record["observation_id"],
                            record["sequence"], _json(record["payload"]))
             db.executemany("INSERT INTO flow_results VALUES (?,?,?,?,?)", values())
@@ -105,6 +125,8 @@ class FlowStore:
             included["total_with_result_inserts"] = "evaluation and result insertion; excludes commit latency"
             db.execute("INSERT INTO flow_runs VALUES (?,?,?,?,?)",
                        (run_id, flow_id, _json(snapshot), _json(summary), _now()))
+            if execution_id:
+                db.execute("UPDATE flow_alerts SET run_id=? WHERE execution_id=?", (run_id, execution_id))
             db.commit()
             return run_id, round((perf_counter() - started) * 1000, 3)
         except Exception:
@@ -112,6 +134,29 @@ class FlowStore:
             raise
         finally:
             db.close()
+
+    @staticmethod
+    def _insert_alerts(db, execution_id, flow_id, items, run_id=None):
+        created_at = _now()
+        db.executemany("""INSERT OR IGNORE INTO flow_alerts
+            (execution_id,observation_id,flow_id,run_id,created_at,payload) VALUES (?,?,?,?,?,?)""",
+            ((execution_id, str(item["observation_id"]), flow_id, run_id, created_at, _json(item))
+             for item in items if item.get("final_decision") in ALERT_DECISIONS))
+
+    def record_alerts(self, execution_id: str, flow_id: str, items: list[dict[str, Any]]) -> None:
+        if not any(item.get("final_decision") in ALERT_DECISIONS for item in items):
+            return
+        with self._database() as db:
+            self._insert_alerts(db, execution_id, flow_id, items)
+
+    def alerts(self, before_id: int | None = None, limit: int = 50) -> dict[str, Any]:
+        clause, args = (" WHERE alert_id<?", [before_id]) if before_id is not None else ("", [])
+        with self._database() as db:
+            rows = db.execute("SELECT alert_id,flow_id,run_id,created_at,payload FROM flow_alerts" + clause
+                              + " ORDER BY alert_id DESC LIMIT ?", [*args, limit + 1]).fetchall()
+        items = [{"alert_id": row[0], "flow_id": row[1], "run_id": row[2], "created_at": row[3],
+                  "result": json.loads(row[4])} for row in rows[:limit]]
+        return {"items": items, "next_before_id": items[-1]["alert_id"] if len(rows) > limit else None}
 
     def list_runs(self, flow_id: str | None = None) -> list[dict[str, Any]]:
         clause, args = (" WHERE flow_id=?", [flow_id]) if flow_id else ("", [])

@@ -1,5 +1,10 @@
 .flow-lab { --fl-panel: #111722; --fl-surface: #192230; --fl-border: #303e50; --fl-text: #ecf0f6; --fl-muted: #a8b4c5; color: var(--fl-text); display: grid; gap: 18px; min-width: 0; font-family: Inter, system-ui, sans-serif; }
 .flow-lab * { box-sizing: border-box; }
+.fl-output-alert { display: inline-flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid; border-radius: 7px; line-height: 1.4; }
+.fl-output-alert svg { flex-shrink: 0; }
+.fl-output-alert strong { overflow-wrap: anywhere; }
+.fl-output-alert-fault { color: #fecaca; background: #450a0a; border-color: #ef4444; }
+.fl-output-alert-anomaly { color: #fef08a; background: #422006; border-color: #facc15; }
 .fl-history-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px; border: 1px solid var(--fl-border); background: var(--fl-panel); }
 .fl-history-summary>div { flex: 1 1 250px; display: grid; gap: 6px; }
 .fl-history-summary strong { font-size: 14px; }

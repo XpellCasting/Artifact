@@ -27,8 +27,21 @@ modelos, históricos, frontend ni backend dentro de Home Assistant.
 El indicador de conexión consulta `/health` cada 30 segundos y queda no disponible
 cuando la API no responde. No carga históricos ni inicia análisis al consultar.
 Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
-Esta versión requiere Home Assistant 2024.12 o posterior y no crea un panel
-embebido. A partir de la integración 0.2.0, Home Assistant establece una conexión
+Esta versión requiere Home Assistant 2024.12 o posterior. La integración 0.3.0
+añade **Artifact-Alertas** a la barra lateral izquierda de Home Assistant. Abre
+una vista independiente que se actualiza cada tres segundos: rojo para una
+falla, con el posible tipo si fue identificado; amarillo con **Se encontró una
+anomalía.** para anomalías y sospechas sin diagnóstico. Cada aviso muestra su
+entidad y fecha. Las alertas se guardan al llegar a salida, incluso durante una
+evaluación en curso, y siguen disponibles al cerrar la evaluación o reiniciar
+Artifact. **Ver alertas anteriores** permite consultar el registro por páginas.
+Las ejecuciones anteriores también aportan sus alertas al actualizar la API.
+La misma vista se puede abrir directamente en `/alertas` de la interfaz de
+Artifact; el panel incluye **Abrir en otra ventana** para abrirla por separado.
+Para que aparezca la nueva entrada hay que actualizar la API, la interfaz y la
+integración en HACS, y recargar la integración.
+
+A partir de la integración 0.2.0, Home Assistant establece una conexión
 saliente con Artifact y proporciona el historial y los cambios de estado usando
 sus APIs internas. La interfaz detecta esta conexión y no pide URL ni token de
 Home Assistant. La actualización requiere instalar tanto el backend como la
@@ -43,6 +56,32 @@ de entidades/historial y suscripciones de estado, sin llamadas a servicios.
 No se crea un token de acceso de Home Assistant ni se comparte la sesión del
 navegador. Al reiniciar, la integración restablece la conexión automáticamente.
 
+### Actualizar una instalación existente
+
+HACS actualiza únicamente la integración. Para que los cambios de la aplicación
+aparezcan al abrirla desde Home Assistant, también hay que actualizar los
+contenedores en el equipo de Artifact. Con el código actualizado, ejecutar
+desde la carpeta del repositorio:
+
+```powershell
+docker compose up -d --build api web
+```
+
+Esto reconstruye la API y la interfaz y conserva los datos de los volúmenes.
+Reiniciar contenedores existentes sin reconstruirlos sigue usando su código
+anterior. El puerto habitual de la interfaz es **5173**; **5174** corresponde
+a una vista de desarrollo independiente.
+
+Después de actualizar los contenedores y la integración en HACS, recargar
+**Configuración → Dispositivos y servicios → Artifact → ⋮ → Recargar**
+(o reiniciar Home Assistant). Si Home Assistant se reinició antes de actualizar
+la API de Artifact, recargar la integración después para iniciar el vínculo.
+Finalmente, volver a abrir **Visitar** y recargar la página del navegador.
+
+Para comprobar el vínculo, abrir `/api/history/home-assistant/config` en la
+misma dirección de la interfaz. `bridge_connected: true` confirma la conexión;
+una respuesta `404` indica que se sigue utilizando una API anterior.
+
 ### Selector de Historial y página principal
 
 Artifact abre en **Evaluación de flujos**. El historial que prepara los filtros
@@ -50,12 +89,36 @@ se elige en **Selector de Historial**, accesible desde la navegación y desde
 la evaluación de flujos:
 
 - **Home Assistant:** con la integración conectada, elegir las fechas del período.
-  La conexión se resuelve automáticamente. Opcionalmente,
-  indicar entidades separadas por comas. Sin selección se consultan las entidades
-  compatibles disponibles. Se importa únicamente el historial que conserva Home
+  La conexión se resuelve automáticamente. Al consultar el catálogo se pueden
+  desactivar los sensores que no se quieran analizar.
+  Se importa únicamente el historial que conserva Home
   Assistant; un período sin lecturas devuelve un error y conserva el CSV anterior.
 - **Archivo CSV:** seleccionar un archivo con las columnas `entity_id`, `state`
-  y `last_changed`. También se puede recuperar el CSV guardado en el servidor.
+  y `last_changed`. También se puede revisar el CSV guardado en el servidor.
+
+Ambos orígenes muestran una selección de sensores antes de crear las bases.
+Todos comienzan activos. Solo al pulsar **Preparar filtros con N sensores** se
+importa o activa el historial elegido y se preparan las bases estadística y
+contextual. Las lecturas de los sensores desactivados quedan fuera de ambas
+bases y del catálogo de evaluación. Revisar un CSV o consultar el catálogo de
+Home Assistant conserva la referencia activa y no inicia su preparación.
+
+La selección permite buscar por nombre o identificador, filtrar por dominio,
+tipo y estado de selección, y activar/desactivar todos o todos los resultados
+filtrados, incluidas otras páginas. Se muestran 50 sensores por página, incluso
+con 5.000 disponibles. Las selecciones grandes muestran un aviso del coste
+contextual: 5.000 sensores permiten hasta 12.497.500 pares antes de considerar
+retardos. La paginación evita saturar la interfaz, pero no elimina ese coste de
+cálculo; el usuario puede reducir el conjunto antes de confirmarlo.
+
+Los CSV se reciben y revisan en streaming en un área temporal, sin guardar sus
+lecturas completas en memoria para construir el catálogo. Las preselecciones
+caducan tras 24 horas; la referencia confirmada conserva únicamente las lecturas
+activas y se recupera al reiniciar. Un CSV guardado sin selección confirmada
+espera esa selección y no prepara bases automáticamente al iniciar el servidor.
+Las suscripciones en directo se dividen en
+lotes de hasta 1.000 entidades para admitir selecciones de 5.000 sin cambiar la
+integración de Home Assistant.
 
 La integración consulta Recorder desde Home Assistant, con consultas por día
 y lotes de entidades, y entrega los datos a Artifact. La interfaz muestra el
@@ -82,11 +145,18 @@ directamente desde Home Assistant. En una instalación independiente se usa la
 Artifact evalúa los cambios recibidos de las entidades del historial y conserva el estado
 del flujo entre eventos. La interfaz muestra la conexión, los contadores y los
 últimos resultados. **Detener recepción y guardar** termina la sesión y conserva
-la ejecución en el listado habitual. Si la conexión se interrumpe, se guardan los
-resultados recibidos y se informa del corte; una sesión nueva requiere iniciarla
-de nuevo. La conexión de la integración se restablece automáticamente, mientras
-que una evaluación interrumpida conserva su corte y sus resultados. Las
+la ejecución en el listado habitual. La falta de eventos no detiene la recepción.
+Si la conexión se interrumpe, la misma sesión reintenta conectarse automáticamente
+y conserva el estado del flujo y los resultados recibidos. La interfaz informa
+de los cortes; puede haber eventos durante esos intervalos que no se reciban.
+Un fallo temporal al consultar el estado desde el navegador tampoco descarta
+la sesión. Las
 instalaciones independientes pueden usar las mismas credenciales del selector.
+
+Si un flujo incluye un clasificador habilitado sin modelo disponible, la
+evaluación no se inicia. Se muestra un aviso junto a los controles de evaluación
+para seleccionar un modelo válido o desactivar ese filtro. Los errores de
+preparación se informan explícitamente y no se presentan como falta de eventos.
 
 Los eventos se agrupan durante 250 ms para ordenar las lecturas simultáneas. Los
 eventos que llegan después de que su instante ya fue evaluado se excluyen y se

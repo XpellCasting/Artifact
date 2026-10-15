@@ -6,6 +6,7 @@ import "@xyflow/react/dist/style.css";
 import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, edgeLabel, fingerprint, flowPayload, labelNode, removeNode, templates, validateDraft } from "./flow-lab-model.js";
 import "./flow-lab.css";
 import FutureEventsSource from "./FutureEventsSource.jsx";
+import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
 
 const PRESETS = templates();
 const PAGE_SIZE = 50;
@@ -131,27 +132,19 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
       document.removeEventListener("visibilitychange", updateModels);
     };
   }, [refreshClassifierModels]);
-  useEffect(() => {
-    if (!job?.job_id) return;
-    let stopped = false;
-    let timer;
-    async function poll() {
-      try {
-        const state = await request(apiBaseUrl, `/flow-evaluations/${job.job_id}`);
-        if (stopped) return;
-        if (state.status === "failed") throw new Error(state.error);
-        if (state.status === "completed") {
-          localStorage.removeItem("flow-evaluation-job"); setJob(null); setBusy(false);
-          setActiveRun(state.run); setInspecting(true); setResultNode("output"); setSelection(null);
-          setMessage(state.mode === "home_assistant" ? "Recepción terminada. La ejecución y sus resultados quedaron guardados." : "Evaluación terminada. El gráfico muestra el flujo utilizado con todos los eventos futuros.");
-          if (state.warning) setError(state.warning);
-          await refresh();
-        } else { setJob(state); timer = setTimeout(poll, 1500); }
-      } catch (reason) { if (!stopped) { setError(reason.message); setBusy(false); setJob(null); localStorage.removeItem("flow-evaluation-job"); } }
-    }
-    poll();
-    return () => { stopped = true; clearTimeout(timer); };
-  }, [job?.job_id, apiBaseUrl, refresh]);
+  useFlowEvaluationPolling({
+    apiBaseUrl, jobId: job?.job_id,
+    onUpdate: (state) => setJob(state),
+    onConnectionError: (detail) => setJob((current) => current ? { ...current, polling_error: detail } : current),
+    onFailure: (detail) => { setError(detail); setBusy(false); setJob(null); localStorage.removeItem("flow-evaluation-job"); },
+    onComplete: (state) => {
+      localStorage.removeItem("flow-evaluation-job"); setJob(null); setBusy(false);
+      setActiveRun(state.run); setInspecting(true); setResultNode("output"); setSelection(null);
+      setMessage(state.mode === "home_assistant" ? "Recepción terminada. La ejecución y sus resultados quedaron guardados." : "Evaluación terminada. El gráfico muestra el flujo utilizado con todos los eventos futuros.");
+      if (state.warning) setError(state.warning);
+      refresh().catch((reason) => setError(reason.message));
+    },
+  });
   useEffect(() => { const frame = requestAnimationFrame(() => fitView({ padding: .18, duration: 200, maxZoom: 1 })); return () => cancelAnimationFrame(frame); }, [layoutRevision, inspecting, fitView]);
   useEffect(() => {
     const observer = new ResizeObserver(() => fitView({ padding: .18, maxZoom: 1 }));
@@ -261,7 +254,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     </aside></div>
     {!inspecting && <>{!!errors.length && <div className="fl-validation" role="status"><strong>Completa el diseño para ejecutar</strong><ul>{errors.map((text) => <li key={text}>{text}</li>)}</ul></div>}
       <section className="fl-execution"><div><span className="hs-step">Evaluación</span><h3>Evaluación con eventos futuros</h3>
-        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} replay={replay} upload={upload} onUpload={onUpload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
+        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} error={error} replay={replay} upload={upload} onUpload={onUpload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
         {!historyReady && <p className="fl-required">Carga un historial desde el Selector de Historial y espera a que se prepare el detector.</p>}
         <CalibrationReport models={continuousModels} />
         {job && job.mode !== "home_assistant" && <FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} />}

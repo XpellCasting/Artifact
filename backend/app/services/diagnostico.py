@@ -33,6 +33,7 @@ from app.database.review import UTC
 from app.services.inyecciones import InjectionStore
 from app.modulos.clasificador.catalogo import CATALOG
 from app.modulos.clasificador.disponibilidad import unavailable_results
+from app.modulos.clasificador.disponibilidad import CLASSIFIER_MODEL_REQUIRED
 ENGINE_VERSION = "gat-lstm-segments-v3"
 from app.modulos.clasificador.config import Config as GATConfig
 from app.modulos.clasificador.config import historical_manifest_path
@@ -159,7 +160,7 @@ class DiagnosticRunSession:
             for entity, items in list(self.events.items()):
                 head = self.event_heads.get(entity, 0)
                 boundary = bisect_left(items, cutoff, lo=head, key=lambda item: item[0])
-                if self.snapshot.get("model", {}).get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+                if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
                     boundary = max(head, boundary - 1)
                 for at, row in items[head:boundary]:
                     self.seen.discard((entity, at.value, row.get("source_row")))
@@ -191,7 +192,7 @@ class DiagnosticRunSession:
             values = self.events.get(str(entity), [])
             head = self.event_heads.get(str(entity), 0)
             left = bisect_left(values, start, lo=head, key=lambda item: item[0])
-            if self.snapshot.get("model", {}).get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+            if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
                 left = max(head, left - 1)
             right = bisect_right(values, end, lo=head, key=lambda item: item[0])
             result.extend(row for _, row in values[left:right])
@@ -656,6 +657,18 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
     def create_run_session(self, source, run_id, model_id=None):
         return DiagnosticRunSession(self, source, run_id, model_id=model_id)
+
+    def require_classifier_model(self, model_id=None):
+        identifier = model_id or self._active()
+        if not identifier:
+            raise ValueError(CLASSIFIER_MODEL_REQUIRED)
+        try:
+            model = self._read("models", identifier)
+            if not (self.directory / "weights" / f"{identifier}.pt").is_file():
+                raise ValueError("Falta el archivo de pesos del modelo.")
+            return model
+        except ValueError as exc:
+            raise ValueError(f"El modelo del filtro clasificador no está disponible. {exc} Selecciona otro modelo o desactiva ese filtro.") from exc
 
     def classifier_models(self):
         active = self._active()

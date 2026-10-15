@@ -1,11 +1,13 @@
 from __future__ import annotations
 from typing import Any
 import os
+from urllib.parse import unquote
 from fastapi import HTTPException, Query, Request
 from fastapi import APIRouter
-from app.api.schemas import AnalyzeRequest, HomeAssistantHistoryRequest
+from starlette.concurrency import run_in_threadpool
+from app.api.schemas import AnalyzeRequest, HomeAssistantHistoryRequest, HistorySelectionRequest
 from app.services.home_assistant_history import HomeAssistantHistorySource, resolve_connection
-from app.services.runtime import state, home_assistant_bridge
+from app.services.runtime import state, home_assistant_bridge, history_candidates
 router = APIRouter()
 
 @router.get("/history/home-assistant/config", tags=["history"])
@@ -29,6 +31,54 @@ def home_assistant_import(request: HomeAssistantHistoryRequest) -> dict[str, Any
         )
         return state.iniciar_importacion_home_assistant(source)
     except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@router.post("/history/home-assistant/entities", tags=["history"])
+def home_assistant_entities(request: HomeAssistantHistoryRequest):
+    try:
+        integration = request.connection_mode == "integration" or (
+            request.connection_mode == "auto" and home_assistant_bridge.status()["bridge_connected"]
+            and not request.url and not request.token.get_secret_value())
+        url, token = ("", "") if integration else resolve_connection(request.url, request.token.get_secret_value())
+        source = HomeAssistantHistorySource(url, token, request.start, request.end, [],
+            transport=home_assistant_bridge.history_transport if integration else None)
+        return source.discover_entities()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@router.post("/history/home-assistant/prepare", tags=["history"])
+def prepare_home_assistant(request: HomeAssistantHistoryRequest):
+    if not request.entity_ids:
+        raise HTTPException(status_code=400, detail="Activa al menos un sensor antes de preparar los filtros.")
+    return home_assistant_import(request)
+
+@router.post("/history/selection/csv", tags=["history"])
+async def inspect_history_csv(request: Request):
+    identifier, destination = history_candidates.create()
+    try:
+        with destination.open("wb") as handle:
+            async for chunk in request.stream():
+                await run_in_threadpool(handle.write, chunk)
+        filename = unquote(request.headers.get("X-Filename", "history.csv")).replace("\\", "/").rsplit("/", 1)[-1]
+        return await run_in_threadpool(history_candidates.inspect, identifier, filename)
+    except BaseException as exc:
+        history_candidates.discard(identifier)
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise
+
+@router.post("/history/selection/saved", tags=["history"])
+def inspect_saved_csv():
+    try:
+        return history_candidates.from_saved(state.real_history_path)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@router.post("/history/selection/{candidate_id}/prepare", tags=["history"])
+def prepare_selected_csv(candidate_id: str, request: HistorySelectionRequest):
+    try:
+        return state.iniciar_seleccion_csv(history_candidates, candidate_id, request.entity_ids)
+    except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.get("/history/static/status", tags=["history"])

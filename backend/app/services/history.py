@@ -13,19 +13,20 @@ from app.services.procedencia_normalidad import SCHEMA_VERSION as NORMALITY_PROV
 from app.services.procedencia_normalidad import build_identity as build_baseline_identity
 from app.services.procedencia_normalidad import effective_parameters as baseline_effective_parameters
 from app.services.procedencia_normalidad import write_manifest as write_baseline_manifest
+from app.services.history_selection import confirm_selection, selection_confirmed
 
 class ServicesHistoryMixin:
     def status(self, autoload: bool = True) -> dict[str, Any]:
         with self.history_load_jobs_lock:
             has_load_job = bool(self.history_load_jobs)
         if self.historial is None and autoload and not has_load_job:
-            if self.real_history_path.exists():
+            if self.real_history_path.exists() and selection_confirmed(self.real_history_path):
                 try:
                     self.historial = self.cargador.cargar_real(self.real_history_path)
                     self._preparar_continuidad_historica()
                 except Exception:
                     pass
-            elif (self.static_history_dir / "events.csv").exists():
+            elif not self.real_history_path.exists() and (self.static_history_dir / "events.csv").exists():
                 try:
                     self.historial = self.cargador.cargar_canonico(self.static_history_dir)
                     self._preparar_continuidad_historica()
@@ -45,6 +46,7 @@ class ServicesHistoryMixin:
                 "normality_history": {"exists": False, "rows": 0},
                 "future_evaluation_ready": False,
                 "real_history_available": self.real_history_path.exists(),
+                "selection_required": self.real_history_path.exists() and not selection_confirmed(self.real_history_path),
                 "real_history_size_bytes": (
                     self.real_history_path.stat().st_size
                     if self.real_history_path.exists()
@@ -132,10 +134,28 @@ class ServicesHistoryMixin:
             try:
                 size = source.export_csv(temporary_path, report)
                 temporary_path.replace(self.real_history_path)
+                if source.entity_ids:
+                    confirm_selection(self.real_history_path, source.entity_ids)
                 return size
             finally:
                 temporary_path.unlink(missing_ok=True)
 
+        self._iniciar_hilo_carga(job_id, prepare=prepare)
+        return self.estado_carga_real(job_id)
+
+    def iniciar_seleccion_csv(self, candidates, identifier, entity_ids):
+        candidates.selected(identifier, entity_ids)
+        job_id = self._crear_job_carga(candidates.path(identifier).stat().st_size, phase="filtering_entities")
+        def prepare(report):
+            temporary = self.real_history_path.with_suffix(f".{job_id}.selecting")
+            try:
+                temporary.parent.mkdir(parents=True, exist_ok=True)
+                size = candidates.export_selected(identifier, entity_ids, temporary, report)
+                temporary.replace(self.real_history_path)
+                confirm_selection(self.real_history_path, entity_ids)
+                return size
+            finally:
+                temporary.unlink(missing_ok=True)
         self._iniciar_hilo_carga(job_id, prepare=prepare)
         return self.estado_carga_real(job_id)
     def estado_carga_real(self, job_id: str) -> dict[str, Any]:

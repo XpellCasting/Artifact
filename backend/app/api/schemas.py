@@ -18,14 +18,18 @@ class HomeAssistantHistoryRequest(BaseModel):
     connection_mode: Literal["auto", "integration", "manual"] = "auto"
     start: AwareDatetime
     end: AwareDatetime
-    entity_ids: list[str] = Field(default_factory=list, max_length=1000)
+    entity_ids: list[str] = Field(default_factory=list, max_length=10000)
 
 class HomeAssistantLiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     url: str = Field(default="", max_length=2048)
     token: SecretStr = Field(default=SecretStr(""), max_length=4096)
     connection_mode: Literal["auto", "integration", "manual"] = "auto"
-    entity_ids: list[str] = Field(default_factory=list, max_length=1000)
+    entity_ids: list[str] = Field(default_factory=list, max_length=10000)
+
+class HistorySelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entity_ids: list[str] = Field(min_length=1, max_length=10000)
 
 class ContinuousConfigRequest(BaseModel):
     configs: list[dict[str, Any]] = Field(default_factory=list)

@@ -14,6 +14,13 @@ from app.services.home_assistant_history import resolve_connection
 from app.services.runtime import state, flow_store, flow_evaluation_jobs, home_assistant_bridge
 router = APIRouter()
 
+
+def require_classifier_models(flow):
+    for node in flow.get("nodes", []):
+        config = node.get("config", {})
+        if node.get("type") == "classifier" and config.get("enabled") is not False:
+            state.diagnostic_workbench.require_classifier_model(config.get("model_id"))
+
 @router.get("/flows", tags=["flow-lab"])
 def flows() -> dict[str, Any]:
     return {"items": flow_store.list(), "default": default_flow(),
@@ -54,10 +61,7 @@ async def update_flow(flow_id: str, request: Request) -> dict[str, Any]:
 def run_flow(flow_id: str, request: FlowRunRequest) -> dict[str, Any]:
     try:
         flow = flow_store.get(flow_id)
-        for node in flow.get("nodes", []):
-            identifier = node.get("config", {}).get("model_id")
-            if node.get("type") == "classifier" and identifier:
-                state.diagnostic_workbench._read("models", identifier)
+        require_classifier_models(flow)
         with state.validation_replay_lock:
             if state.historial is None or state.future_baseline_template is None:
                 raise ValueError("Carga el histórico de Desarrollo y espera a que se prepare el detector.")
@@ -93,10 +97,7 @@ def flow_evaluation_status(job_id: str):
 def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
     try:
         flow = flow_store.get(flow_id)
-        for node in flow["nodes"]:
-            model_id = node.get("config", {}).get("model_id")
-            if node["type"] == "classifier" and model_id:
-                state.diagnostic_workbench._read("models", model_id)
+        require_classifier_models(flow)
         with state.validation_replay_lock:
             if state.historial is None or state.future_baseline_template is None:
                 raise ValueError("Carga un historial en el Selector de Historial y espera a que se prepare el detector.")
@@ -138,6 +139,13 @@ def stop_live_flow(job_id: str):
 @router.get("/flow-runs", tags=["flow-lab"])
 def flow_runs(flow_id: str | None = None) -> dict[str, Any]:
     return {"items": flow_store.list_runs(flow_id)}
+
+@router.get("/flow-alerts", tags=["flow-lab"])
+def flow_alerts(
+    before_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, Any]:
+    return flow_store.alerts(before_id, limit)
 
 @router.get("/flow-runs/{run_id}/results", tags=["flow-lab"])
 def flow_run_results(

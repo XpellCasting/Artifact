@@ -30,7 +30,9 @@ class HomeAssistantEventSource:
         self.stop_event = Event()
         self.lock = Lock()
         self.error = None
-        self.stats = {"status": "connecting", "received": 0, "ignored": 0, "late": 0, "last_event_at": None}
+        self.stats = {"status": "connecting", "received": 0, "ignored": 0, "late": 0, "last_event_at": None,
+                      "interruptions": 0, "reconnections": 0, "last_error": None, "retry_seconds": None}
+        self._has_connected = False
         self.last_seen = {}
         self.sequence = 0
 
@@ -43,6 +45,14 @@ class HomeAssistantEventSource:
             self.stop_event.set()
             if self.stats["status"] not in {"failed", "stopped"}:
                 self.stats["status"] = "stopping"
+
+    def _connected(self):
+        with self.lock:
+            if not self.stop_event.is_set():
+                if self._has_connected:
+                    self.stats["reconnections"] += 1
+                self._has_connected = True
+                self.stats.update(status="connected", retry_seconds=None)
 
     def accept(self, message):
         event = message.get("event") or {}
@@ -102,8 +112,7 @@ class HomeAssistantEventSource:
             acknowledgement = await receive()
             if acknowledgement.get("type") != "result" or not acknowledgement.get("success"):
                 raise ValueError("Home Assistant no permitió suscribirse a los cambios de estado.")
-            with self.lock:
-                self.stats["status"] = "connected"
+            self._connected()
             while not self.stop_event.is_set():
                 try:
                     message = json.loads(await asyncio.wait_for(socket.recv(), timeout=1))
@@ -113,22 +122,34 @@ class HomeAssistantEventSource:
                     self.accept(message)
 
     def _receive(self):
+        delay = 1
         try:
-            if not self.stop_event.is_set() and self.bridge is not None:
-                with self.lock:
-                    self.stats["status"] = "connected"
-                self.bridge.listen(self.selected, self.accept, self.stop_event)
-            elif not self.stop_event.is_set():
-                asyncio.run(self._listen())
-        except Exception as exc:
-            if not self.stop_event.is_set():
-                # Library exceptions may include handshake details. Expose only our own errors.
-                self.error = str(exc) if isinstance(exc, ValueError) else "Se perdió la conexión con Home Assistant. Los eventos recibidos se conservarán en la ejecución."
+            while not self.stop_event.is_set():
+                try:
+                    if self.bridge is not None:
+                        self.bridge.listen(self.selected, self.accept, self.stop_event, on_connected=self._connected)
+                    else:
+                        asyncio.run(self._listen())
+                    if not self.stop_event.is_set():
+                        raise ConnectionError("Home Assistant closed the reception")
+                except Exception as exc:
+                    if self.stop_event.is_set():
+                        break
+                    # Keep the same evaluation and its causal state while reconnecting.
+                    # Library errors may contain private handshake details.
+                    detail = str(exc) if isinstance(exc, ValueError) else "Se perdió la conexión con Home Assistant."
+                    with self.lock:
+                        if self.stats["status"] == "connected":
+                            delay = 1
+                            self.stats["interruptions"] += 1
+                        self.stats.update(status="reconnecting", last_error=detail, retry_seconds=delay)
+                    if self.stop_event.wait(delay):
+                        break
+                    delay = min(30, delay * 2)
         finally:
             self._token = ""
             with self.lock:
-                self.stats["status"] = "failed" if self.error else "stopped"
-            self.stop_event.set()
+                self.stats.update(status="stopped", retry_seconds=None)
 
     def batches(self):
         Thread(target=self._receive, daemon=True, name="home-assistant-events").start()

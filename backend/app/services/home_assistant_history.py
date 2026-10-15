@@ -160,3 +160,26 @@ class HomeAssistantHistorySource:
         if not rows:
             raise ValueError("No hay lecturas en el período seleccionado. Revisa las entidades y la retención del historial de Home Assistant.")
         return destination.stat().st_size
+
+    def discover_entities(self):
+        from app.services.tipos_entidad import infer_kind
+        states = self._get("/states")
+        if not isinstance(states, list):
+            raise ValueError("Home Assistant no devolvió una lista de entidades válida.")
+        catalog = {}
+        for item in states:
+            if not isinstance(item, dict):
+                continue
+            entity_id = item.get("entity_id", "")
+            if not ENTITY_ID.fullmatch(entity_id) or entity_id.split(".", 1)[0] not in SUPPORTED_DOMAINS:
+                continue
+            attributes = item.get("attributes") or {}
+            domain = entity_id.split(".", 1)[0]
+            catalog[entity_id] = {"entity_id": entity_id, "friendly_name": attributes.get("friendly_name", ""),
+                "domain": domain, "device_class": attributes.get("device_class", ""),
+                "unit_of_measurement": attributes.get("unit_of_measurement", ""),
+                "sensor_kind": infer_kind(entity_id, [item.get("state", "")], domain=domain,
+                    unit=attributes.get("unit_of_measurement", ""), device_class=attributes.get("device_class", ""))}
+        if not catalog:
+            raise ValueError("No hay sensores compatibles para seleccionar en Home Assistant.")
+        return {"source": "home_assistant", "entities": [catalog[key] for key in sorted(catalog)], "entity_count": len(catalog)}

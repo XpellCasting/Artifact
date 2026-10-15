@@ -33,10 +33,18 @@ test("restored live reception displays results and keeps stop enabled while the 
     let stopped = false;
     view = await renderInteractive(Source, { apiBaseUrl: "/api", busy: true, canRun: true,
       job: { mode: "home_assistant", status: "running", processed: 4, connection: { status: "connected", received: 5 },
-        recent_results: [{ observation_id: "one", entity_id: "sensor.temperature", timestamp: "2026-01-01T01:00:00Z", final_decision: "suspicion" }] },
+        recent_results: [
+          { observation_id: "one", entity_id: "sensor.temperature", timestamp: "2026-01-01T01:00:00Z", final_decision: "suspicion" },
+          { observation_id: "two", entity_id: "sensor.humidity", timestamp: "2026-01-01T01:01:00Z", final_decision: "fault_compatible",
+            evidence: [{ status: "compatible", data: { fault_type: "drift", fault_type_status: "identified" } }] },
+          { observation_id: "three", entity_id: "sensor.pressure", timestamp: "2026-01-01T01:02:00Z", final_decision: "fault_compatible" },
+          { observation_id: "four", entity_id: "sensor.light", timestamp: "2026-01-01T01:03:00Z", final_decision: "normal" },
+        ] },
       onStopLive: () => { stopped = true; } });
     assert.match(view.container.textContent, /5 recibidos · 4 evaluados/);
     assert.match(view.container.textContent, /sensor.temperature/);
+    assert.equal(view.container.querySelectorAll(".fl-output-alert").length, 0);
+    assert.match(view.container.textContent, /Compatible con falla/);
     assert.equal(view.container.querySelector('input[type="password"]'), null);
     const stop = [...view.container.querySelectorAll("button")].find((button) => button.textContent.includes("Detener recepción"));
     assert.equal(stop.disabled, false);
@@ -81,5 +89,30 @@ test("live events use the integration automatically and wait for it when disconn
       } else assert.match(view.container.textContent, /Esperando la conexión/);
       await view.close(); view = undefined;
     }
+  } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
+});
+
+test("live reception explains idle and reconnecting states and keeps the manual stop available", async () => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ bridge_configured: true, bridge_connected: true }) });
+  let view;
+  try {
+    const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
+    for (const [connection, polling_error, expected] of [
+      [{ status: "connected", received: 0 }, null, /Esperando cambios de estado/],
+      [{ status: "reconnecting", received: 2, last_error: "Se perdió la conexión", interruptions: 1 }, null, /Reconectando con Home Assistant/],
+      [{ status: "connected", received: 2 }, "No se pudo consultar la API", /Recuperando comunicación con Artifact/],
+    ]) {
+      view = await renderInteractive(Source, { apiBaseUrl: "/api", busy: true, job: {
+        mode: "home_assistant", status: "running", phase: "evaluation", connection, polling_error } });
+      assert.match(view.container.textContent, expected);
+      const stop = [...view.container.querySelectorAll("button")].find((button) => button.textContent.includes("Detener recepción"));
+      assert.equal(stop.disabled, false);
+      await view.close(); view = undefined;
+    }
+    view = await renderInteractive(Source, { apiBaseUrl: "/api", canRun: true,
+      error: "No se puede iniciar la evaluación: el filtro clasificador no tiene un modelo disponible. Selecciona un modelo válido o desactiva ese filtro." });
+    assert.match(view.container.querySelector('[role="alert"]').textContent, /clasificador.*Selecciona un modelo válido/);
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });

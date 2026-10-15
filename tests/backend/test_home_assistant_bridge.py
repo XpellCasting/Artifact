@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import patch
 
@@ -41,6 +42,117 @@ class BridgeRegistrationTests(unittest.TestCase):
 
 
 class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_5000_entities_use_bounded_subscriptions_and_all_are_removed_on_stop(self):
+        connected = Event()
+        stopped = Event()
+        subscriptions, unsubscribed, received = [], [], []
+        class Socket:
+            async def send_json(inner, message):
+                if message["operation"] == "subscribe":
+                    ids = message["arguments"]["entity_ids"]
+                    self.assertLessEqual(len(ids), 1000)
+                    subscriptions.extend(ids)
+                else:
+                    unsubscribed.append(message["arguments"]["subscription_id"])
+                inner.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": []})
+            async def close(self, **kwargs):
+                pass
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
+            socket = Socket()
+            socket.connection = await bridge.attach(socket)
+            ids = [f"sensor.entity_{index}" for index in range(5000)]
+            listener = asyncio.create_task(asyncio.to_thread(bridge.listen, ids, received.append, stopped, connected.set))
+            try:
+                self.assertTrue(await asyncio.to_thread(connected.wait, 3))
+                self.assertEqual(subscriptions, ids)
+                self.assertEqual(len(socket.connection.subscriptions), 5)
+                socket.connection.receive({"type": "event", "subscription_id": list(socket.connection.subscriptions)[-1],
+                    "event": {"data": {"entity_id": "sensor.entity_4999"}}})
+                for _ in range(100):
+                    if received:
+                        break
+                    await asyncio.sleep(.01)
+                self.assertEqual(received[0]["event"]["data"]["entity_id"], "sensor.entity_4999")
+            finally:
+                stopped.set()
+                await asyncio.wait_for(listener, 3)
+                await bridge.close()
+            self.assertEqual(len(unsubscribed), 5)
+            self.assertFalse(socket.connection.subscriptions)
+
+    async def test_live_receiver_resubscribes_after_the_native_bridge_is_replaced(self):
+        import pandas as pd
+        from app.services.home_assistant_live import HomeAssistantEventSource
+        class Socket:
+            async def send_json(self, message):
+                self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": []})
+            async def close(self, **kwargs):
+                pass
+        async def until(condition):
+            for _ in range(400):
+                if condition():
+                    return
+                await asyncio.sleep(.01)
+            self.fail("The native reception did not reach the expected state")
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
+            first_socket = Socket()
+            first = first_socket.connection = await bridge.attach(first_socket)
+            source = HomeAssistantEventSource("", "", pd.DataFrame([
+                {"entity_id": "binary_sensor.door", "sensor_kind": "binary"}]),
+                pd.Timestamp("2026-01-01T00:00:00Z"), bridge=bridge)
+            reception = asyncio.create_task(asyncio.to_thread(lambda: list(source.batches())))
+            def deliver(connection, second, state, old):
+                connection.receive({"type": "event", "subscription_id": next(iter(connection.subscriptions)),
+                    "event": {"event_type": "state_changed", "data": {"entity_id": "binary_sensor.door",
+                        "old_state": {"state": old}, "new_state": {"state": state, "last_changed": f"2026-01-01T00:00:0{second}Z"}}}})
+            try:
+                await until(lambda: source.status()["status"] == "connected")
+                deliver(first, 1, "on", "off")
+                await until(lambda: source.status()["received"] == 1)
+                bridge.detach(first)
+                second_socket = Socket()
+                second = second_socket.connection = await bridge.attach(second_socket)
+                await until(lambda: source.status()["reconnections"] == 1)
+                deliver(second, 2, "off", "on")
+                await until(lambda: source.status()["received"] == 2)
+                self.assertFalse(reception.done())
+                self.assertIsNone(source.error)
+                self.assertEqual(source.status()["interruptions"], 1)
+            finally:
+                source.stop()
+                batches = await asyncio.wait_for(reception, timeout=3)
+                await bridge.close()
+            self.assertEqual(sum(len(batch) for _, batch in batches), 2)
+
+    async def test_manual_stop_cancels_a_pending_native_subscription(self):
+        sent = asyncio.Event()
+        class Socket:
+            async def send_json(self, message):
+                if message["operation"] == "subscribe":
+                    sent.set()
+                else:
+                    self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": []})
+            async def close(self, **kwargs):
+                pass
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
+            socket = Socket()
+            socket.connection = await bridge.attach(socket)
+            stopped = Event()
+            listener = asyncio.create_task(asyncio.to_thread(bridge.listen, ["sensor.a"], lambda event: None, stopped))
+            try:
+                await asyncio.wait_for(sent.wait(), timeout=2)
+                stopped.set()
+                with self.assertRaisesRegex(BridgeUnavailable, "solicitud del usuario"):
+                    await asyncio.wait_for(listener, timeout=2)
+                await asyncio.sleep(0)
+                self.assertEqual(socket.connection.subscriptions, {})
+            finally:
+                stopped.set()
+                await bridge.close()
+
     async def test_chunked_history_reassembles_before_completing_request(self):
         sent = asyncio.Queue()
         class Socket:

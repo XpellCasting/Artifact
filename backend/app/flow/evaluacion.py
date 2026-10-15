@@ -3,6 +3,7 @@ from collections import Counter, defaultdict, deque
 from copy import deepcopy
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -16,6 +17,7 @@ from app.flow.runner import FlowRunner
 from app.flow.definitions import _time
 from app.flow.definitions import observation_valid
 from app.services.reproduccion import MotorReproduccionValidacion
+from app.modulos.clasificador.disponibilidad import CLASSIFIER_MODEL_REQUIRED
 
 FLOW_PROGRESS_INTERVAL_SECONDS = 0.5
 
@@ -169,6 +171,8 @@ class CausalFlowRunner(FlowRunner):
                     diagnostic_snapshots[node["id"]] = (snapshot_fn(*args, model_id=model_id)
                                                          if model_id and hasattr(self.diagnostic, "_run_snapshot_for_model")
                                                          else snapshot_fn(*args))
+                    if not diagnostic_snapshots[node["id"]].get("model"):
+                        raise ValueError(CLASSIFIER_MODEL_REQUIRED)
         statistical_nodes = [n for n in flow["nodes"] if n["type"] in {"statistical_focus"} and n.get("config", {}).get("enabled") is not False]
         motor = MotorReproduccionValidacion(self.statistical)
         # Models may be shared internally, but each node receives an independent runtime.
@@ -239,6 +243,9 @@ class CausalFlowRunner(FlowRunner):
                     model_id = node.get("config", {}).get("model_id")
                     session = (self.diagnostic.create_run_session("flow_evaluation", f"{self.execution_id}:{node['id']}", model_id=model_id)
                               if model_id else self.diagnostic.create_run_session("flow_evaluation", f"{self.execution_id}:{node['id']}"))
+                    if ((session.snapshot.get("model") or {}).get("method") == "gat_lstm"
+                            and session.gat_snapshot is None):
+                        raise ValueError("No se pudo cargar el modelo del filtro clasificador. Comprueba sus archivos y dependencias, selecciona otro modelo o desactiva ese filtro.")
                     session.add_events(available)
                     self.diagnostic_sessions[node["id"]] = session
         if contextual_nodes:
@@ -524,6 +531,7 @@ class FlowEvaluationJobs:
         spool = FlowResultSpool(job_id)
         def sink(results):
             spool.write_block(results)
+            self.store.record_alerts(job_id, flow_id, results.get("output", []))
             if live_source is not None:
                 with self.lock:
                     job = self.jobs[job_id]
@@ -534,12 +542,13 @@ class FlowEvaluationJobs:
                 progress(summary.get("candidate_count", 0), summary.get("candidate_count", 0),
                          "saving", "Guardando resultados por nodo")
                 spool.finish()
-                run_id, persistence_ms = self.store.save_run_stream(flow_id, snapshot, summary, spool.records())
+                run_id, persistence_ms = self.store.save_run_stream(flow_id, snapshot, summary, spool.records(), execution_id=job_id)
                 with self.lock:
                     self.jobs[job_id].update(status="completed", persistence_ms=persistence_ms,
                                              warning=snapshot.get("source", {}).get("connection_error"),
                                              run={"run_id": run_id, "summary": summary, "snapshot": snapshot})
             except Exception as exc:
+                logging.getLogger(__name__).exception("Falló la evaluación del flujo %s", flow_id)
                 with self.lock:
                     self.jobs[job_id].update(status="failed", error=str(exc))
             finally:

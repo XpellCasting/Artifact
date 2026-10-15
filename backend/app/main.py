@@ -13,10 +13,11 @@ from app.api.validation import router as validation_router
 from app.api.configuracion import router as configuracion_router
 from app.api.contextual import router as contextual_router
 from app.api.flows import router as flows_router
+from app.services.history_selection import selection_confirmed
 
 @asynccontextmanager
 async def lifespan(api):
-    if state.historial is None and state.real_history_path.is_file():
+    if state.historial is None and state.real_history_path.is_file() and selection_confirmed(state.real_history_path):
         state.iniciar_carga_real()
     try:
         yield
