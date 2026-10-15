@@ -41,6 +41,10 @@ Artifact; el panel incluye **Abrir en otra ventana** para abrirla por separado.
 Para que aparezca la nueva entrada hay que actualizar la API, la interfaz y la
 integración en HACS, y recargar la integración.
 
+La integración 0.3.1 corrige la altura del panel para ocupar toda la ventana,
+incluidas las pantallas móviles. Después de instalar esta corrección, recargar
+la página de Home Assistant con **Ctrl+F5** para cargar el componente actualizado.
+
 A partir de la integración 0.2.0, Home Assistant establece una conexión
 saliente con Artifact y proporciona el historial y los cambios de estado usando
 sus APIs internas. La interfaz detecta esta conexión y no pide URL ni token de

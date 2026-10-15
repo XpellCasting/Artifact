@@ -4,12 +4,12 @@ class ArtifactAlertsPanel extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this.shadowRoot.innerHTML = `
       <style>
-        :host { display: flex; flex-direction: column; height: 100%; background: var(--primary-background-color, #000); }
+        :host { display: grid; grid-template-rows: auto minmax(0, 1fr); width: 100%; height: 100vh; height: 100dvh; overflow: hidden; background: var(--primary-background-color, #000); }
         header { display: flex; align-items: center; gap: 16px; min-height: 56px; padding: 0 16px; color: var(--primary-text-color); border-bottom: 1px solid var(--divider-color); }
         button { border: 0; background: transparent; color: inherit; font: inherit; font-size: 24px; cursor: pointer; }
         strong { flex: 1; }
         a { color: var(--primary-color, #03a9f4); font-size: 13px; }
-        iframe { flex: 1; width: 100%; min-height: 0; border: 0; }
+        iframe { display: block; width: 100%; height: 100%; min-height: 0; border: 0; }
       </style>
       <header><button type="button" aria-label="Abrir menú">☰</button><strong>Artifact-Alertas</strong><a target="_blank" rel="noopener noreferrer">Abrir en otra ventana</a></header>
       <iframe title="Artifact-Alertas" referrerpolicy="no-referrer"></iframe>`;
