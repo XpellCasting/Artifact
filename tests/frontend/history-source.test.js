@@ -25,7 +25,7 @@ test("flow evaluation opens first and links to the separate history selector", a
     assert.match(html, /module-tab active[\s\S]*?<span>Evaluación de flujos<\/span>/);
     assert.match(html, /Selector de Historial/);
     assert.match(html, /Prepara tu historial de referencia/);
-    assert.match(html, /Configura el recorrido de los filtros/);
+    assert.match(html, /Diseño del flujo/);
     assert.doesNotMatch(html, /Origen del historial de referencia|name="history-source"|Paso [123]/);
   } finally {
     if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;

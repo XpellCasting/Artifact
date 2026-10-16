@@ -3,7 +3,7 @@ import { AlertTriangle, FileSpreadsheet, House, Loader2, Play, Radio, Square } f
 import { useHomeAssistantConnection } from "../history/use-home-assistant-connection.js";
 import { DECISIONS } from "./flow-lab-model.js";
 
-export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload = canRun, dirty, job, error, replay, upload, onUpload, onLabelledUpload, onEvaluate, onStartLive, onStopLive }) {
+export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload = canRun, dirty, job, error, replay, upload, onLabelledUpload, onEvaluate, onStartLive, onStopLive }) {
   const [source, setSource] = useState("csv");
   const [url, setUrl] = useState("http://homeassistant.local:8123");
   const [configuredUrl, setConfiguredUrl] = useState("");
@@ -30,17 +30,15 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
   }
 
   return <div className="fl-future-source" aria-label="Origen de los eventos futuros">
-    <fieldset className="fl-event-sources" disabled={busy}><legend>Elige cómo recibir los eventos</legend>
-      <label className={`fl-event-option ${source === "csv" ? "is-selected" : ""}`}><input type="radio" name="future-event-source" checked={source === "csv"} onChange={() => setSource("csv")} /><FileSpreadsheet size={22} /><span><strong>Archivo CSV</strong><small>Evalúa un conjunto de eventos existente.</small></span></label>
+    <fieldset className="fl-event-sources" aria-label="Origen de los eventos" disabled={busy}>
+      <label className={`fl-event-option ${source === "csv" ? "is-selected" : ""}`}><input type="radio" name="future-event-source" checked={source === "csv"} onChange={() => setSource("csv")} /><FileSpreadsheet size={22} /><span><strong>Archivo CSV</strong><small>Evalúa un conjunto etiquetado.</small></span></label>
       <label className={`fl-event-option ${source === "home_assistant" ? "is-selected" : ""}`}><input type="radio" name="future-event-source" checked={source === "home_assistant"} onChange={() => setSource("home_assistant")} /><House size={22} /><span><strong>Home Assistant en directo</strong><small>Evalúa los cambios de estado que lleguen.</small></span></label>
     </fieldset>
     {source === "csv" ? <div className="fl-future-csv">
-      <p>Se recorre todo el CSV en orden temporal. Cada ejecución comienza con una copia nueva del estado del historial de referencia.</p>
-      <div className="fl-upload-actions"><label className="file-action">Cargar eventos futuros<input type="file" accept=".csv,text/csv" disabled={busy || !canUpload} onChange={onUpload} /></label><label className="file-action">Cargar conjunto etiquetado<input type="file" accept=".csv,text/csv" disabled={busy || !canUpload} onChange={onLabelledUpload} /></label></div>
-      <p className="fl-hint">Columnas: entity_id, state, last_changed. Un conjunto etiquetado añade es_sintetica, tipo y tipo_falla; las etiquetas sirven para comprobar los resultados.</p>
+      <div className="fl-upload-actions"><label className="file-action">Cargar conjunto etiquetado<input type="file" accept=".csv,text/csv" disabled={busy || !canUpload} onChange={onLabelledUpload} /></label></div>
       {replay?.loaded && <p><strong>{replay.filename}</strong> · {replay.rows} eventos · {replay.labelled ? "Con etiquetas" : "Sin etiquetas"}</p>}
       {upload && <p role="status">{upload.message}</p>}
-      <button className="fl-primary" type="button" disabled={busy || !canRun || !replay?.loaded} onClick={onEvaluate}><Play size={16} />{busy ? "Evaluando…" : dirty ? "Guardar y evaluar CSV" : "Evaluar CSV"}</button>
+      <button className="fl-primary" type="button" disabled={busy || !canRun || !replay?.loaded || !replay?.labelled} onClick={onEvaluate}><Play size={16} />{busy ? "Evaluando…" : dirty ? "Guardar y evaluar CSV" : "Evaluar CSV"}</button>
     </div> : <form className="fl-live-form" onSubmit={start}>
       <p>Recibe los cambios de las entidades del historial de referencia y evalúalos a medida que llegan. La recepción permanece activa aunque no lleguen eventos y reintenta la conexión si se corta. Al detenerla se guarda la ejecución.</p>
       {!live && <fieldset disabled={busy}>

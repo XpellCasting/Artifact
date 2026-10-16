@@ -1,0 +1,48 @@
+:root {
+  --ha-background: var(--primary-background-color, #111);
+  --ha-surface: var(--ha-card-background, var(--card-background-color, #1c1c1c));
+  --ha-surface-alt: var(--secondary-background-color, #202020);
+  --ha-text: var(--primary-text-color, #e1e1e1);
+  --ha-muted: var(--secondary-text-color, #9b9b9b);
+  --ha-divider: var(--ha-card-border-color, var(--divider-color, #383838));
+  --ha-primary: var(--primary-color, #03a9f4);
+  --ha-on-primary: var(--text-primary-color, #fff);
+  --ha-error: var(--error-color, #db4437);
+  --ha-warning: var(--warning-color, #ffa600);
+  --ha-success: var(--success-color, #43a047);
+}
+:root.artifact-ha-theme {
+  color-scheme: light;
+  --primary-background-color: #fafafa;
+  --secondary-background-color: #e5e5e5;
+  --card-background-color: #fff;
+  --primary-text-color: #212121;
+  --secondary-text-color: #727272;
+  --divider-color: #e0e0e0;
+  --primary-color: #03a9f4;
+  --text-primary-color: #fff;
+  --error-color: #db4437;
+  --warning-color: #ffa600;
+  --success-color: #43a047;
+  color: var(--ha-text);
+  background: var(--ha-background);
+  font-family: var(--ha-font-family-body, Roboto, Noto, Arial, sans-serif);
+}
+@media(prefers-color-scheme:dark) {
+  :root.artifact-ha-theme {
+    color-scheme: dark;
+    --primary-background-color: #111;
+    --secondary-background-color: #202020;
+    --card-background-color: #1c1c1c;
+    --primary-text-color: #e1e1e1;
+    --secondary-text-color: #9b9b9b;
+    --divider-color: #383838;
+  }
+}
+.artifact-ha-theme body, .artifact-ha-theme .app-shell { background: var(--ha-background); color: var(--ha-text); }
+.artifact-ha-theme .app-header { background: var(--ha-surface); box-shadow: none; backdrop-filter: none; }
+.artifact-ha-theme .app-header::before { display: none; }
+.artifact-ha-theme .app-header h1 { font-size: 28px; font-weight: 400; }
+.artifact-ha-theme .module-tab.active { border-color: var(--ha-primary); color: var(--ha-primary); background: color-mix(in srgb, var(--ha-primary) 12%, var(--ha-surface)); box-shadow: none; }
+.artifact-ha-theme :is(.metric,.panel,.charts-panel,.chart-card,.entity-row,.modal-block,.equation-card,.fl-node) { box-shadow: var(--ha-card-box-shadow, none); }
+.artifact-ha-theme :is(button,input,select,textarea) { color-scheme: inherit; }

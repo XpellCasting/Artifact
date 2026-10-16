@@ -1,6 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { templates, validateDraft, connect, removeNode, fingerprint, clone } from "../../frontend/src/features/flows/flow-lab-model.js";
+import { templates, validateDraft, connect, removeNode, fingerprint, clone, nextNodeId } from "../../frontend/src/features/flows/flow-lab-model.js";
+
+test("adding multiple nodes preserves distinct IDs in a restored flow without browser cryptography", () => {
+  const previousCrypto = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  Object.defineProperty(globalThis, "crypto", { configurable: true, value: {} });
+  try {
+    const flow = clone(templates()[0]);
+    flow.nodes.push({ id: "statistical_focus_1", type: "statistical_focus" },
+      { id: "statistical_focus_3", type: "statistical_focus" },
+      { id: "decision_a1b2c3d4", type: "decision" });
+    const originalIds = flow.nodes.map((node) => node.id);
+    for (const type of ["statistical_focus", "statistical_focus", "decision", "contextual", "classifier", "merge"]) {
+      const id = nextNodeId(flow, type);
+      assert.ok(!flow.nodes.some((node) => node.id === id));
+      flow.nodes.push({ id, type });
+    }
+    assert.deepEqual(flow.nodes.slice(0, originalIds.length).map((node) => node.id), originalIds);
+    assert.equal(new Set(flow.nodes.map((node) => node.id)).size, flow.nodes.length);
+  } finally {
+    if (previousCrypto) Object.defineProperty(globalThis, "crypto", previousCrypto);
+    else delete globalThis.crypto;
+  }
+});
 
 test("all researcher templates are valid graphs", () => {
   for (const flow of templates()) assert.deepEqual(validateDraft(flow), [], flow.name);

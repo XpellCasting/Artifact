@@ -498,6 +498,7 @@ class FlowEvaluationJobs:
             if any(job["status"] == "running" for job in self.jobs.values()):
                 raise ValueError("Ya hay una evaluación de flujos en curso. Espera a que termine.")
             job_id = uuid4().hex
+            self.store.begin_alert_execution(job_id)
             self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "status": "running", "processed": 0, "total": 0, "phase": "preparation", "mode": "home_assistant" if live_source is not None else "csv"}
             if live_source is not None:
                 self.sources[job_id] = live_source

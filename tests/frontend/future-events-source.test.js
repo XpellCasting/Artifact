@@ -2,17 +2,24 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, renderInteractive } from "../../frontend/test-runtime.js";
 
-test("future evaluation switches from CSV to live events and starts without an uploaded CSV", async () => {
+test("CSV accepts only labelled uploads, while live events start without an uploaded CSV", async () => {
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ url: "http://ha.local:8123", token_configured: true }) });
   let view;
   try {
     const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
-    let connection;
+    let connection, uploaded;
     view = await renderInteractive(Source, { apiBaseUrl: "/api", canRun: true, dirty: true,
+      onLabelledUpload: (event) => { uploaded = event.target.files[0]; },
       onStartLive: async (value) => { connection = value; return true; } });
-    assert.equal(view.container.querySelectorAll('input[type="file"]').length, 2);
+    assert.equal(view.container.querySelectorAll('input[type="file"]').length, 1);
+    assert.doesNotMatch(view.container.textContent, /Cargar eventos futuros/);
+    const input = view.container.querySelector('input[type="file"]');
+    const file = { name: "ground_truth.csv" };
+    Object.defineProperty(input, "files", { value: [file] });
+    await view.event(input, "change");
+    assert.equal(uploaded, file);
     assert.equal(view.container.querySelector("button").disabled, true);
     await view.event(view.container.querySelectorAll('input[type="radio"]')[1], "click");
     assert.equal(view.container.querySelectorAll('input[type="file"]').length, 0);
@@ -20,6 +27,26 @@ test("future evaluation switches from CSV to live events and starts without an u
     assert.equal(view.container.querySelector('button[type="submit"]').disabled, false);
     await view.event(view.container.querySelector("form"), "submit");
     assert.deepEqual(connection, { url: "http://ha.local:8123", token: "", entity_ids: [] });
+  } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
+});
+
+test("CSV evaluation requires reference labels, including previously uploaded files", async () => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+  let view;
+  try {
+    const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
+    for (const labelled of [false, true]) {
+      let evaluated = false;
+      view = await renderInteractive(Source, { apiBaseUrl: "/api", canRun: true,
+        replay: { loaded: true, labelled, filename: "events.csv", rows: 3 }, onEvaluate: () => { evaluated = true; } });
+      const button = view.container.querySelector('button');
+      assert.equal(button.disabled, !labelled);
+      await view.event(button, "click");
+      assert.equal(evaluated, labelled);
+      await view.close(); view = undefined;
+    }
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });
 

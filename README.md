@@ -33,11 +33,15 @@ una vista independiente que se actualiza cada tres segundos: rojo para una
 falla, con el posible tipo si fue identificado; amarillo con **Se encontró una
 anomalía.** para anomalías y sospechas sin diagnóstico. Cada aviso muestra su
 entidad y fecha. Las alertas se guardan al llegar a salida, incluso durante una
-evaluación en curso, y siguen disponibles al cerrar la evaluación o reiniciar
-Artifact. **Ver alertas anteriores** permite consultar el registro por páginas.
-Las ejecuciones anteriores también aportan sus alertas al actualizar la API.
+evaluación en curso. El panel muestra únicamente la última ejecución, también
+después de reiniciar Artifact. Al iniciar otra ejecución se dejan de mostrar las
+alertas previas, aunque la nueva todavía no tenga detecciones.
+**Ver alertas anteriores** consulta páginas de esa misma ejecución.
+El selector **Mostrar** permite ver **Anomalías**, **Alertas de falla** o **Ambas**,
+también al consultar páginas anteriores; las sospechas se incluyen en anomalías.
 La misma vista se puede abrir directamente en `/alertas` de la interfaz de
-Artifact; el panel incluye **Abrir en otra ventana** para abrirla por separado.
+Artifact. El panel ocupa toda la ventana sin añadir una barra superior a la
+navegación de Home Assistant.
 Para que aparezca la nueva entrada hay que actualizar la API, la interfaz y la
 integración en HACS, y recargar la integración.
 
@@ -51,6 +55,25 @@ los cambios entre tema claro y oscuro sin recargar sus alertas. Las fallas
 conservan la señal roja y las anomalías la amarilla. Al abrir la vista directamente
 fuera de Home Assistant, se utiliza la preferencia clara u oscura del navegador.
 Esta actualización requiere actualizar tanto la integración como la interfaz.
+
+La integración 0.3.3 amplía el tema a toda la aplicación: evaluación de flujos,
+historial, estadístico, contextual, clasificador y revisión. El dashboard que
+incrusta la interfaz principal también puede recibir el tema de Home Assistant,
+sin cambiar su tarjeta ni la URL configurada. Se comparten únicamente colores,
+tipografía y propiedades visuales con los marcos del servidor Artifact configurado.
+Las alertas siguen distinguiendo fallas en rojo y anomalías en amarillo.
+
+**Actualizar HACS por sí solo no actualiza los estilos de la aplicación.** Para
+aplicar cambios de la interfaz, reconstruir el servicio web desde el repositorio:
+
+```powershell
+docker compose up -d --build --no-deps web
+```
+
+Después, recargar el dashboard principal y Artifact-Alertas con **Ctrl+F5**.
+Actualizar y recargar la integración 0.3.3 añade la sincronización directa del
+tema en el dashboard. Con la integración 0.3.2, la interfaz principal puede
+reutilizar el último tema recibido al abrir Artifact-Alertas en el mismo navegador.
 
 A partir de la integración 0.2.0, Home Assistant establece una conexión
 saliente con Artifact y proporciona el historial y los cambios de estado usando
@@ -150,7 +173,11 @@ Home Assistant o CSV y las herramientas para consultar entidades,
 normalización y parámetros del histórico activo.
 
 La evaluación de eventos futuros permite elegir **Archivo CSV** o **Home Assistant
-en directo**. La integración transmite los cambios de las entidades seleccionadas
+en directo**. En modo CSV se carga únicamente un conjunto etiquetado, con
+`entity_id,state,last_changed,es_sintetica,tipo,tipo_falla`. Sus etiquetas se
+guardan separadas de las entradas de los filtros y permiten comparar las
+ejecuciones en **Conjuntos etiquetados evaluados**. El modo en directo no
+requiere archivos ni etiquetas. La integración transmite los cambios de las entidades seleccionadas
 directamente desde Home Assistant. En una instalación independiente se usa la
 [API WebSocket de Home Assistant](https://developers.home-assistant.io/docs/api/websocket/).
 Artifact evalúa los cambios recibidos de las entidades del historial y conserva el estado

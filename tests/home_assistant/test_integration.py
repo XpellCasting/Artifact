@@ -25,7 +25,7 @@ from custom_components.artifact.config_flow import ArtifactConfigFlow
 from custom_components.artifact.bridge import ArtifactBridge
 from app.services.home_assistant_bridge import HomeAssistantBridge
 from custom_components.artifact.panel import alerts_panel_path, async_setup_alerts_panel, async_remove_alerts_panel
-from homeassistant.components.frontend import DATA_PANELS
+from homeassistant.components.frontend import DATA_PANELS, DATA_EXTRA_MODULE_URL, UrlManager
 
 
 @pytest_asyncio.fixture
@@ -99,6 +99,7 @@ async def session():
 async def hass(tmp_path):
     instance = HomeAssistant(str(tmp_path))
     instance.http = SimpleNamespace(async_register_static_paths=AsyncMock())
+    instance.data[DATA_EXTRA_MODULE_URL] = UrlManager(lambda *_: None, [])
     instance.config_entries = SimpleNamespace(
         async_forward_entry_setups=AsyncMock(),
         async_unload_platforms=AsyncMock(return_value=True),
@@ -236,6 +237,7 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     panel = hass.data[DATA_PANELS][alerts_panel_path(entry)]
     assert panel.sidebar_title == "Artifact-Alertas"
     assert panel.config["url"] == "http://artifact.example:5173/alertas"
+    assert any("dashboard-theme.js" in url for url in hass.data[DATA_EXTRA_MODULE_URL].urls)
     sensor = ArtifactConnection(entry.runtime_data, entry)
     assert sensor.available and sensor.is_on
     assert sensor.device_info["configuration_url"] == entry.data["web_url"]
@@ -248,6 +250,7 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     assert sensor.available and sensor.is_on
     assert await async_unload_entry(hass, entry)
     assert alerts_panel_path(entry) not in hass.data[DATA_PANELS]
+    assert not hass.data[DATA_EXTRA_MODULE_URL].urls
     await entry.runtime_data.async_shutdown()
     assert not session.closed
 

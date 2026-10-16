@@ -67,9 +67,105 @@ test("older alerts use a stable cursor and temporary API errors retain displayed
     assert.equal(calls.at(-1), "/api/flow-alerts?limit=50&before_id=3");
     const count = calls.length;
     await React.act(async () => context.mock.timers.tick(6000));
-    assert.equal(calls.length, count);
+    assert.ok(calls.length > count);
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50&before_id=3");
     await view.event(button(view, "Volver a las recientes"), "click");
     assert.equal(calls.at(-1), "/api/flow-alerts?limit=50");
+  } finally { if (view) await view.close(); context.mock.timers.reset(); globalThis.fetch = previousFetch; await server.close(); }
+});
+
+test("severity filtering applies to polling and older pages, and changing it returns to recent alerts", async (context) => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  const anomaly = { ...fault, alert_id: 2, result: { ...fault.result, final_decision: "environmental" } };
+  const suspicion = { ...fault, alert_id: 1, result: { ...fault.result, final_decision: "suspicion" } };
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    const query = new URL(url, "http://artifact.local").searchParams;
+    const severity = query.get("severity");
+    return response({ items: severity === "fault" ? [fault] : severity === "anomaly" ? [anomaly, suspicion] : [fault, anomaly],
+      next_before_id: severity === "fault" && !query.has("before_id") ? 3 : null });
+  };
+  let view;
+  try {
+    const { default: Page } = await server.ssrLoadModule("/src/features/alerts/AlertsPage.jsx");
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    view = await renderInteractive(Page, { apiBaseUrl: "/api" });
+    const select = view.container.querySelector('select[aria-label="Tipo de alerta"]');
+    assert.equal(select.value, "all");
+    assert.equal(view.container.querySelectorAll(".artifact-alert-card").length, 2);
+    select.value = "fault";
+    await view.event(select, "change");
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50&severity=fault");
+    assert.equal(view.container.querySelectorAll(".artifact-alert-card-anomaly").length, 0);
+    await React.act(async () => context.mock.timers.tick(3000));
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50&severity=fault");
+    await view.event(button(view, "Ver alertas anteriores"), "click");
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50&before_id=3&severity=fault");
+    select.value = "anomaly";
+    await view.event(select, "change");
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50&severity=anomaly");
+    assert.equal(view.container.querySelectorAll(".artifact-alert-card-fault").length, 0);
+    assert.equal(view.container.querySelectorAll(".artifact-alert-card-anomaly").length, 2);
+    assert.doesNotMatch(view.container.textContent, /Consultando alertas anteriores/);
+    await view.event(button(view, "Actualizar"), "click");
+    assert.equal(select.value, "anomaly");
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50&severity=anomaly");
+    select.value = "all";
+    await view.event(select, "change");
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50");
+    assert.equal(view.container.querySelectorAll(".artifact-alert-card").length, 2);
+  } finally { if (view) await view.close(); context.mock.timers.reset(); globalThis.fetch = previousFetch; await server.close(); }
+});
+
+test("a response from a previous filter cannot replace the selected filter's empty state", async (context) => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  let resolveFault;
+  globalThis.fetch = async (url) => url.includes("severity=fault") ? new Promise((resolve) => { resolveFault = resolve; })
+    : response({ items: [], next_before_id: null });
+  let view;
+  try {
+    const { default: Page } = await server.ssrLoadModule("/src/features/alerts/AlertsPage.jsx");
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    view = await renderInteractive(Page, { apiBaseUrl: "/api" });
+    const select = view.container.querySelector('select[aria-label="Tipo de alerta"]');
+    select.value = "fault";
+    await view.event(select, "change");
+    select.value = "anomaly";
+    await view.event(select, "change");
+    await React.act(async () => resolveFault(response({ items: [fault], next_before_id: null })));
+    assert.equal(select.value, "anomaly");
+    assert.match(view.container.textContent, /No hay anomalías/);
+    assert.equal(view.container.querySelectorAll(".artifact-alert-card").length, 0);
+  } finally { if (view) await view.close(); context.mock.timers.reset(); globalThis.fetch = previousFetch; await server.close(); }
+});
+
+test("an older page follows the newest execution automatically without keeping the previous execution's alerts", async (context) => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  let current = "first";
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    const older = url.includes("before_id");
+    return response({ execution_id: current,
+      items: current === "first" ? [fault] : older ? [] : [{ ...fault, alert_id: 4, result: { ...fault.result, entity_id: "sensor.new" } }],
+      next_before_id: current === "first" && !older ? 3 : null });
+  };
+  let view;
+  try {
+    const { default: Page } = await server.ssrLoadModule("/src/features/alerts/AlertsPage.jsx");
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    view = await renderInteractive(Page, { apiBaseUrl: "/api" });
+    await view.event(button(view, "Ver alertas anteriores"), "click");
+    assert.match(view.container.textContent, /Consultando alertas anteriores/);
+    current = "second";
+    await React.act(async () => context.mock.timers.tick(3000));
+    assert.equal(calls.at(-1), "/api/flow-alerts?limit=50");
+    assert.match(view.container.textContent, /sensor.new/);
+    assert.doesNotMatch(view.container.textContent, /sensor.temperature|Consultando alertas anteriores/);
   } finally { if (view) await view.close(); context.mock.timers.reset(); globalThis.fetch = previousFetch; await server.close(); }
 });
 
@@ -89,7 +185,7 @@ test("the alerts route opens directly without loading history or starting the fl
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });
 
-test("the Home Assistant sidebar panel embeds the alerts view, supports the menu and offers a separate window", () => {
+test("the Home Assistant sidebar panel embeds the alerts view without a duplicate toolbar", () => {
   const require = createRequire(new URL("../../frontend/package.json", import.meta.url));
   const { JSDOM } = require("jsdom");
   const dom = new JSDOM("<!doctype html><body></body>", { url: "http://ha.local:8123", runScripts: "outside-only", pretendToBeVisual: true });
@@ -99,13 +195,7 @@ test("the Home Assistant sidebar panel embeds the alerts view, supports the menu
     dom.window.document.body.append(panel);
     panel.panel = { config: { url: "http://artifact.local:5173/alertas" } };
     assert.equal(panel.shadowRoot.querySelector("iframe").src, "http://artifact.local:5173/alertas?ha_origin=http%3A%2F%2Fha.local%3A8123");
-    const link = panel.shadowRoot.querySelector("a");
-    assert.equal(link.href, "http://artifact.local:5173/alertas");
-    assert.equal(link.target, "_blank");
-    let toggled = false;
-    dom.window.document.addEventListener("hass-toggle-menu", () => { toggled = true; });
-    panel.shadowRoot.querySelector("button").click();
-    assert.equal(toggled, true);
+    assert.equal(panel.shadowRoot.querySelector("header, button, a"), null);
     panel.panel = { config: { url: "javascript:alert(1)" } };
     assert.equal(panel.shadowRoot.querySelector("iframe").src, "http://artifact.local:5173/alertas?ha_origin=http%3A%2F%2Fha.local%3A8123");
   } finally { dom.window.close(); }

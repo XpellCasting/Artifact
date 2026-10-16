@@ -1,4 +1,5 @@
 import { request } from "../shared/api.js";
+import { connectHomeAssistantTheme } from "../shared/home-assistant-theme.js";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Activity,
@@ -23,7 +24,7 @@ import HistorySource from "../features/history/HistorySource.jsx";
 import { isStatisticalSuspicion, statisticalCounts, episodeLabel } from "../shared/statistical-routing.js";
 import { isEnvironmentalResult, contextRoutingLabel, contextRoutingReasonLabel, contextRoutingCounts, contextCoherenceLabel, contextObservationLabel, preciseContextTimestamp, contextCommonCause } from "../shared/context-routing.js";
 
-import { mergeReplayResults, startValidationUpload } from "../features/history/history-runtime.jsx";
+import { mergeReplayResults } from "../features/history/history-runtime.jsx";
 import { wait, downloadResultsCsv, compareResultsByExecutionDate, entityLabel, timelineDateRange, timelineQueryString, formatHistoryRange, formatSuspicionPercent, normalityDetail, formatElapsed, formatCount } from "../shared/analysis.jsx";
 import { Metric, ModuleTab, Panel, StepButton, SummaryRow, Empty } from "../shared/components.jsx";
 import { EpisodeGroupingControl, SuspicionThresholdControl, ContinuousConfigEditor, ResultEntityFilters, ResultsTable, CalculationModal, NormalizationModal, TimelineChart } from "../features/statistical/StatisticalWorkspace.jsx";
@@ -43,6 +44,7 @@ export function App() {
 }
 
 function ArtifactApp() {
+  useEffect(() => connectHomeAssistantTheme(), []);
   const [health, setHealth] = useState(null);
   const [historyStatus, setHistoryStatus] = useState(null);
   const [entities, setEntities] = useState([]);
@@ -509,70 +511,10 @@ function ArtifactApp() {
     event.target.value = "";
   }
 
-  async function uploadValidationHistory(event) {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
-    setValidationAutoRunning(false);
-    setHistoricalResults([]);
-    setContextResults([]);
-    setContextSummary(null);
-    const completedUpload = await runStep("validation-upload", async () => {
-      setValidationUpload({
-        status: "uploading",
-        progress: 0,
-        message: `Subiendo ${file.name}`,
-        file_size_bytes: file.size,
-      });
-      const payload = await startValidationUpload(
-        file,
-        (loaded, total) => setValidationUpload({
-          status: "uploading",
-          progress: Math.min(90, (loaded / Math.max(total, 1)) * 90),
-          message: `Subiendo ${file.name}`,
-          file_size_bytes: total,
-          uploaded_bytes: loaded,
-        }),
-        () => setValidationUpload({
-          status: "processing",
-          progress: 94,
-          message: "Archivo recibido; validando y ordenando eventos de Evaluacion",
-          file_size_bytes: file.size,
-          uploaded_bytes: file.size,
-        }),
-      );
-      applyValidationPipeline(payload);
-      setValidationUpload({
-        status: "completed",
-        progress: 100,
-        message: "Evaluacion lista para reproducir",
-        file_size_bytes: file.size,
-      });
-      return payload;
-    });
-    if (!completedUpload) {
-      setValidationUpload((current) => ({
-        ...(current || {}),
-        status: "failed",
-        message: "No se pudo cargar el CSV de Evaluacion",
-      }));
-    }
-    event.target.value = "";
-  }
-
   const historySource = <HistorySource apiBaseUrl={API_BASE_URL} status={historyStatus} job={historyLoad} busy={Boolean(busy)} onImport={importHomeAssistantHistory} onPrepareCsv={prepareSelectedCsv} />;
 
   return (
     <main className="app-shell">
-      <header className="app-header">
-        <div>
-          <span className="eyebrow">Home Assistant</span>
-          <h1>Artifact</h1>
-          <p>Evaluación de flujos y diagnóstico de sensores</p>
-        </div>
-      </header>
-
       {error && (
         <section className="alert">
           <AlertTriangle size={18} />
@@ -610,7 +552,7 @@ function ArtifactApp() {
       </nav>
 
       {activeModule === "flujos" ? (
-        <FlowLab onSelectHistory={() => setActiveModule("evaluacion")} continuousModels={historyStatus?.continuous_models} apiBaseUrl={API_BASE_URL} historyReady={Boolean(historyStatus?.exists && historyStatus?.future_evaluation_ready)} replay={validationReplay} upload={validationUpload} uploadBusy={Boolean(busy)} onUpload={uploadValidationHistory} onLabelledUpload={uploadLabelledEvaluation} />
+        <FlowLab onSelectHistory={() => setActiveModule("evaluacion")} continuousModels={historyStatus?.continuous_models} apiBaseUrl={API_BASE_URL} historyReady={Boolean(historyStatus?.exists && historyStatus?.future_evaluation_ready)} replay={validationReplay} upload={validationUpload} uploadBusy={Boolean(busy)} onLabelledUpload={uploadLabelledEvaluation} />
       ) : activeModule === "estadistico" ? (
         <>
           <section className="metric-grid">

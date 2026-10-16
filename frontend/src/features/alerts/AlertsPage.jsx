@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Bell, RotateCcw } from "lucide-react";
 import { request } from "../../shared/api.js";
 import FlowOutputResult from "../flows/FlowOutputResult.jsx";
@@ -10,6 +10,8 @@ import "./alerts-page.css";
 export default function AlertsPage({ apiBaseUrl }) {
   const [page, setPage] = useState({ items: [], next_before_id: null });
   const [beforeId, setBeforeId] = useState(null);
+  const [severity, setSeverity] = useState("all");
+  const executionId = useRef(undefined);
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -28,10 +30,20 @@ export default function AlertsPage({ apiBaseUrl }) {
     const controller = new AbortController();
     setLoading(true);
     setPage({ items: [], next_before_id: null });
+    setError("");
     async function refresh() {
       try {
-        const data = await request(apiBaseUrl, `/flow-alerts?limit=50${beforeId ? `&before_id=${beforeId}` : ""}`, { signal: controller.signal });
+        const data = await request(apiBaseUrl, `/flow-alerts?limit=50${beforeId ? `&before_id=${beforeId}` : ""}${severity === "all" ? "" : `&severity=${severity}`}`, { signal: controller.signal });
         if (stopped) return;
+        if (data.execution_id !== executionId.current) {
+          const changed = executionId.current !== undefined;
+          executionId.current = data.execution_id;
+          if (changed && beforeId !== null) {
+            setPage({ items: [], next_before_id: null });
+            setBeforeId(null);
+            return;
+          }
+        }
         setPage(data); setError("");
       } catch (reason) {
         if (stopped) return;
@@ -39,25 +51,29 @@ export default function AlertsPage({ apiBaseUrl }) {
       } finally {
         if (!stopped) {
           setLoading(false);
-          if (beforeId === null) timer = setTimeout(refresh, 3000);
+          timer = setTimeout(refresh, 3000);
         }
       }
     }
     refresh();
     return () => { stopped = true; controller.abort(); clearTimeout(timer); };
-  }, [apiBaseUrl, beforeId, revision]);
+  }, [apiBaseUrl, beforeId, revision, severity]);
 
   return <main className="artifact-alerts">
     <header className="artifact-alerts-header"><div><h1>Artifact-Alertas</h1>
-      <p>Alertas de las entidades que llegan a la salida del flujo.</p></div>
+      <p>Alertas de la última ejecución del flujo.</p></div>
       <button type="button" disabled={loading} onClick={() => { setBeforeId(null); setRevision((value) => value + 1); }}><RotateCcw size={17} />Actualizar</button>
     </header>
-    <div className="artifact-alerts-toolbar"><span>{beforeId === null ? "Actualización automática cada 3 segundos" : "Consultando alertas anteriores"}</span>
+    <div className="artifact-alerts-toolbar">
+      <label className="artifact-alerts-filter">Mostrar<select aria-label="Tipo de alerta" value={severity} onChange={(event) => { setBeforeId(null); setSeverity(event.target.value); }}>
+        <option value="all">Ambas</option><option value="anomaly">Anomalías</option><option value="fault">Alertas de falla</option>
+      </select></label>
+      <span>{beforeId === null ? "Actualización automática cada 3 segundos" : "Consultando alertas anteriores"}</span>
       {beforeId !== null && <button type="button" disabled={loading} onClick={() => setBeforeId(null)}>Volver a las recientes</button>}
     </div>
     {error && <p className="artifact-alerts-error" role="alert">No se pudieron actualizar las alertas. {error}</p>}
     {loading && <p role="status">Cargando alertas…</p>}
-    {!loading && !error && !page.items.length && <div className="artifact-alerts-empty"><Bell size={30} /><p>No hay alertas de salida.</p></div>}
+    {!loading && !error && !page.items.length && <div className="artifact-alerts-empty"><Bell size={30} /><p>{severity === "anomaly" ? "No hay anomalías." : severity === "fault" ? "No hay alertas de falla." : "No hay alertas de salida."}</p></div>}
     <div className="artifact-alerts-list" aria-label="Alertas de salida">
       {page.items.map(({ alert_id, result, created_at }) => {
         const alert = flowOutputAlert(result);

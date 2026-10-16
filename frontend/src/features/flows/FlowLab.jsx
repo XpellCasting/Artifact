@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { ReactFlow, BaseEdge, Background, Controls, Handle, MarkerType, Position, ReactFlowProvider, useNodesState, useReactFlow } from "@xyflow/react";
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, Copy, GitBranch, Maximize2, Play, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
 import "@xyflow/react/dist/style.css";
-import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, edgeLabel, fingerprint, flowPayload, labelNode, removeNode, templates, validateDraft } from "./flow-lab-model.js";
+import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, edgeLabel, fingerprint, flowPayload, labelNode, nextNodeId, removeNode, templates, validateDraft } from "./flow-lab-model.js";
 import "./flow-lab.css";
 import FutureEventsSource from "./FutureEventsSource.jsx";
 import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
@@ -72,7 +72,7 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
   </section>;
 }
 
-function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousModels, replay, upload, uploadBusy, onUpload, onLabelledUpload }) {
+function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousModels, replay, upload, uploadBusy, onLabelledUpload }) {
   const [draft, setDraft] = useState(() => restoreFlowDraft().draft);
   const [savedKey, setSavedKey] = useState(() => restoreFlowDraft().savedKey);
   const [flows, setFlows] = useState([]);
@@ -156,7 +156,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     setDraft(clone(flow)); setSavedKey(isSaved ? fingerprint(flow) : ""); setSelection(null); setSource(""); setTarget(""); setInspecting(false); setMessage(""); setError(""); setLayoutRevision((value) => value + 1);
   }
   function addNode() {
-    const id = `${newType}_${crypto.randomUUID().slice(0, 8)}`;
+    const id = nextNodeId(draft, newType);
     const bounds = canvasRef.current?.getBoundingClientRect();
     const position = bounds ? screenToFlowPosition({ x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 }) : { x: 400, y: 100 };
     change((next) => next.nodes.push({ id, type: newType, position, config: newType === "statistical_focus" ? { evidence_policy: "combine_v1", suspicion_threshold: .6, continuous_method: "residual_focus_v1", signal_policy: "detection_before_suppression" } : newType === "decision" ? { accept: ["positive"], evidence_policy: "combine_v1" } : newType === "merge" ? { mode: "any", evidence_policy: "combine_v1" } : { evidence_policy: "combine_v1" } }));
@@ -214,15 +214,15 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   }, [apiBaseUrl]);
   useEffect(() => { if (activeRun) loadPage(activeRun.run_id, resultNode, 0); return () => { pageRequest.current += 1; }; }, [activeRun, resultNode, loadPage]);
   const visualNodes = useMemo(() => graph.nodes.map((item) => ({ id: item.id, type: "filter", position: item.position || { x: 0, y: 0 }, selected: selection?.id === item.id, deletable: !["input", "output"].includes(item.type), data: { node: item, count: inspecting ? activeRun?.summary?.node_counts?.[item.id] : undefined } })), [graph, selection?.id, inspecting, activeRun?.summary?.node_counts]);
-  const visualEdges = useMemo(() => graph.edges.map((item, index) => ({ ...item, data: { lane: index % 3 }, selected: selection?.id === item.id, type: "routed", markerEnd: { type: MarkerType.ArrowClosed }, label: item.when === undefined ? undefined : edgeLabel(item), labelStyle: { fontSize: 11 }, labelBgPadding: [7, 4], labelBgBorderRadius: 5, labelBgStyle: { fill: "#161d29", fillOpacity: 1 } })), [graph, selection?.id]);
+  const visualEdges = useMemo(() => graph.edges.map((item, index) => ({ ...item, data: { lane: index % 3 }, selected: selection?.id === item.id, type: "routed", markerEnd: { type: MarkerType.ArrowClosed }, label: item.when === undefined ? undefined : edgeLabel(item), labelStyle: { fontSize: 11 }, labelBgPadding: [7, 4], labelBgBorderRadius: 5, labelBgStyle: { fill: "var(--ha-surface)", fillOpacity: 1 } })), [graph, selection?.id]);
   useEffect(() => { setCanvasNodes(visualNodes); }, [visualNodes, setCanvasNodes]);
 
   return <section className="flow-lab" aria-label="Evaluación de flujos">
-    <header className="fl-header"><div><span className="eyebrow">Evaluación causal</span><h2>Evaluación de flujos</h2><p>Diseña el recorrido de los filtros y comprueba qué identifica en los eventos futuros.</p></div><div className="fl-state"><span className={`fl-dot ${inspecting || !dirty ? "is-saved" : ""}`} />{inspecting ? "Inspección de una ejecución" : dirty ? "Cambios sin guardar" : "Todos los cambios guardados"}</div></header>
-    {onSelectHistory && <section className="fl-history-summary" aria-label="Historial de referencia"><div><strong>{historyReady ? "Historial de referencia listo" : "Prepara tu historial de referencia"}</strong><p>{historyReady ? "Los filtros están preparados con el historial seleccionado." : "Elige el historial de Home Assistant o un archivo CSV en el Selector de Historial."}</p></div><button type="button" disabled={busy} onClick={onSelectHistory}>Selector de Historial<ArrowRight size={16} /></button></section>}
+    <header className="fl-header"><div className="fl-state"><span className={`fl-dot ${inspecting || !dirty ? "is-saved" : ""}`} />{inspecting ? "Inspección de una ejecución" : dirty ? "Cambios sin guardar" : "Todos los cambios guardados"}</div></header>
+    {onSelectHistory && <section className="fl-history-summary" aria-label="Historial de referencia"><div><strong>{historyReady ? "Historial de referencia listo" : "Prepara tu historial de referencia"}</strong>{!historyReady && <p>Elige el historial de Home Assistant o un archivo CSV en el Selector de Historial.</p>}</div><button type="button" disabled={busy} onClick={onSelectHistory}>Selector de Historial<ArrowRight size={16} /></button></section>}
     {error && <div role="alert" className="fl-notice fl-error"><AlertTriangle size={18} /><span>{error}</span>{!loaded && <button onClick={() => { setError(""); refresh().catch((e) => setError(e.message)); }}>Reintentar</button>}</div>}
     {message && <div role="status" className="fl-notice"><Check size={16} />{message}</div>}
-    <div className="fl-design-heading"><span className="hs-step">Diseño del flujo</span><h3>Configura el recorrido de los filtros</h3></div>
+    <div className="fl-design-heading"><span className="hs-step">Diseño del flujo</span></div>
     <div className="fl-toolbar">{inspecting ? <>
       <button onClick={() => { setInspecting(false); setSelection(null); }}><ArrowLeft size={16} />Volver al diseño</button><strong>{graph.name}</strong><span className="fl-muted">Configuración de la ejecución · solo lectura</span><button onClick={() => choose({ ...clone(graph), flow_id: null, name: `${graph.name} (copia)` })}><Copy size={16} />Editar una copia</button>
     </> : <>
@@ -238,7 +238,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
         onNodesChange={(changes) => { onCanvasNodesChange(changes); if (inspecting || busy) return; const removed = changes.filter((item) => item.type === "remove").map((item) => item.id); if (removed.length) change((next) => { for (const id of removed) { const updated = removeNode(next, id); next.nodes = updated.nodes; next.edges = updated.edges; } }); }}
         onNodeDragStop={(_, moved) => { if (inspecting || busy) return; change((next) => { const item = next.nodes.find((node) => node.id === moved.id); if (item) item.position = moved.position; }); }}
         onEdgesChange={(changes) => { if (inspecting || busy) return; const removed = changes.filter((item) => item.type === "remove").map((item) => item.id); if (removed.length) change((next) => { next.edges = next.edges.filter((item) => !removed.includes(item.id)); }); }}>
-        <Background gap={22} size={1} color="#334155" /><Controls showInteractive={false} />
+        <Background gap={22} size={1} color="var(--ha-divider)" /><Controls showInteractive={false} />
       </ReactFlow></div>
       <p className="fl-canvas-caption">{inspecting ? "Selecciona un nodo para consultar sus resultados." : "Arrastra los nodos. Conecta sus puntos laterales. Usa la rueda para acercar y arrastra el fondo para desplazarte."}</p>
     </div><aside className="fl-inspector" aria-label="Inspector del flujo"><h3>{node ? labelNode(node) : edge ? "Configurar conexión" : "Inspector"}</h3>
@@ -253,14 +253,14 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
       {!inspecting && <details className="fl-connect"><summary>Conectar mediante formulario</summary><fieldset disabled={busy} className="fl-fields"><label>Desde<select aria-label="Origen de conexión" value={source} onChange={(event) => setSource(event.target.value)}><option value="">Seleccionar…</option>{draft.nodes.filter((item) => item.type !== "output").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><label>Hacia<select aria-label="Destino de conexión" value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Seleccionar…</option>{draft.nodes.filter((item) => item.type !== "input").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><button disabled={!source || !target} onClick={() => addConnection({ source, target })}><GitBranch size={15} />Conectar</button></fieldset></details>}
     </aside></div>
     {!inspecting && <>{!!errors.length && <div className="fl-validation" role="status"><strong>Completa el diseño para ejecutar</strong><ul>{errors.map((text) => <li key={text}>{text}</li>)}</ul></div>}
-      <section className="fl-execution"><div><span className="hs-step">Evaluación</span><h3>Evaluación con eventos futuros</h3>
-        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} error={error} replay={replay} upload={upload} onUpload={onUpload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
+      <section className="fl-execution"><div><span className="hs-step">Evaluación</span>
+        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} error={error} replay={replay} upload={upload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
         {!historyReady && <p className="fl-required">Carga un historial desde el Selector de Historial y espera a que se prepare el detector.</p>}
         <CalibrationReport models={continuousModels} />
         {job && job.mode !== "home_assistant" && <FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} />}
       </div></section>
     </>}
-    <section className="fl-comparison" aria-label="Comparación de conjuntos etiquetados"><h3>Conjuntos etiquetados evaluados</h3><p>Compara las detecciones de cada flujo. La huella identifica el contenido de los eventos: archivos con nombres iguales pueden contener datos diferentes.</p><div className="fl-table-scroll"><table><thead><tr><th>Conjunto · huella</th><th>Flujo · fecha</th><th>Fallas detectadas / total</th><th>Anomalías detectadas / total</th><th>Tipos identificados / etiquetados</th><th>Falsos positivos</th><th>Detalle</th></tr></thead><tbody>{runs.filter(r => r.summary.evaluation?.labelled).map(run => {
+    <section className="fl-comparison" aria-label="Comparación de conjuntos etiquetados"><h3>Conjuntos etiquetados evaluados</h3><div className="fl-table-scroll"><table><thead><tr><th>Conjunto · huella</th><th>Flujo · fecha</th><th>Fallas detectadas / total</th><th>Anomalías detectadas / total</th><th>Tipos identificados / etiquetados</th><th>Falsos positivos</th><th>Detalle</th></tr></thead><tbody>{runs.filter(r => r.summary.evaluation?.labelled).map(run => {
       const groups = run.summary.evaluation.groups;
       const sum = (kind, field) => groups.filter(g => !kind || g.expected === kind).reduce((total, g) => total + (g[field] || 0), 0);
       return <tr key={run.run_id}><td>{run.snapshot.source.filename}<small className="fl-muted"> · {run.snapshot.source.fingerprint.slice(0, 10)}</small></td><td>{run.snapshot.flow.name} · {new Date(run.created_at).toLocaleString()}</td><td>{sum("Falla", "detected")} / {sum("Falla", "total")}</td><td>{sum("anomalia", "detected")} / {sum("anomalia", "total")}</td><td>{sum("Falla", "type_identified")} / {groups.filter(g => g.expected === "Falla" && g.fault_type).reduce((n, g) => n + g.total, 0)}</td><td>{sum(null, "false_positives")}</td><td><button disabled={busy} onClick={() => { setActiveRun(run); setInspecting(true); setResultNode("output"); setSelection(null); }}>Ver resultados</button></td></tr>;

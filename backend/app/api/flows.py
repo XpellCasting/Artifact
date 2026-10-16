@@ -1,7 +1,7 @@
 from __future__ import annotations
 from copy import deepcopy
 from uuid import uuid4
-from typing import Any
+from typing import Any, Literal
 from fastapi import HTTPException, Query, Request
 import app.database.evaluacion_etiquetada as labelled_evaluation
 from app.flow.definitions import default_flow
@@ -65,14 +65,16 @@ def run_flow(flow_id: str, request: FlowRunRequest) -> dict[str, Any]:
         with state.validation_replay_lock:
             if state.historial is None or state.future_baseline_template is None:
                 raise ValueError("Carga el histórico de Desarrollo y espera a que se prepare el detector.")
-            if state.eventos_validacion_ordenados is None:
-                raise ValueError("Carga los eventos futuros o un conjunto etiquetado en Evaluación de flujos.")
+            if state.eventos_validacion_ordenados is None or not state.validation_replay_state.get("labelled"):
+                raise ValueError("Carga un conjunto CSV etiquetado en Evaluación de flujos.")
             development = state.historial.eventos.copy(deep=True)
             future = state.eventos_validacion_ordenados.copy(deep=True)
             entities = state.historial.entidades.copy(deep=True)
             baseline = deepcopy(state.future_baseline_template)
             context_map = deepcopy(state.future_context_map_template or {})
-            truth = labelled_evaluation.read_truth(state._ruta_almacen_resultados_validacion()) if state.validation_replay_state.get("labelled") else []
+            truth = labelled_evaluation.read_truth(state._ruta_almacen_resultados_validacion())
+            if not truth:
+                raise ValueError("No hay etiquetas de referencia disponibles; vuelve a cargar el conjunto etiquetado.")
             filename = state.validation_replay_state.get("filename")
             runner = CausalFlowRunner(deepcopy(state.filtro_estadistico), deepcopy(state.filtro_contextual), state.diagnostic_workbench)
         def evaluate(progress, result_sink):
@@ -144,8 +146,9 @@ def flow_runs(flow_id: str | None = None) -> dict[str, Any]:
 def flow_alerts(
     before_id: int | None = Query(default=None, ge=1),
     limit: int = Query(default=50, ge=1, le=100),
+    severity: Literal["fault", "anomaly"] | None = Query(default=None),
 ) -> dict[str, Any]:
-    return flow_store.alerts(before_id, limit)
+    return flow_store.alerts(before_id, limit, severity)
 
 @router.get("/flow-runs/{run_id}/results", tags=["flow-lab"])
 def flow_run_results(

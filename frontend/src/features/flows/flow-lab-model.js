@@ -8,6 +8,13 @@ export const fingerprint = (flow) => JSON.stringify(flowPayload(flow));
 export const labelNode = (node) => node?.config?.label || NODE_LABELS[node?.type] || node?.id || "Nodo";
 export const edgeLabel = (edge) => edge.when === undefined ? "Todas las señales" : edge.when.map((signal) => SIGNAL_LABELS[signal]).join(" · ");
 
+export function nextNodeId(flow, type) {
+  const usedIds = new Set(flow.nodes.map((node) => node.id));
+  let suffix = 1;
+  while (usedIds.has(`${type}_${suffix}`)) suffix += 1;
+  return `${type}_${suffix}`;
+}
+
 export function validateDraft(flow) {
   if (!flow) return [];
   const errors = [];
