@@ -1,0 +1,5 @@
+# Install the AMD PyTorch wheel matching ROCm/WSL FIRST; see ../WSL2_RX7800XT.md.
+# Deliberately does not pin/install torch: requirements-gat*.txt select CPU/another build.
+torch-geometric==2.8.0.post1
+tzdata==2025.2
+h5py==3.12.1

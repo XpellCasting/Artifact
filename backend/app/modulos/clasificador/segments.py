@@ -53,8 +53,14 @@ def categorical_dtw(left, right, fraction):
 
 def intervals(rows, start, end, resolution, info):
     """Time-weighted summaries; a carry-forward value is not a new reading."""
+    if hasattr(rows, "intervals"):
+        return rows.intervals(start, end, resolution, info)
     rows = sorted((parse_utc(r["timestamp"]), int(r.get("source_row") or 0), str(r["state"]))
                   for r in rows if parse_utc(r["timestamp"]) <= end)
+    return _intervals_from_parsed(rows, start, end, resolution, info)
+
+
+def _intervals_from_parsed(rows, start, end, resolution, info):
     index, latest = 0, None
     while index < len(rows) and rows[index][0] <= start:
         latest = rows[index]
@@ -115,6 +121,8 @@ def fit_spec(events, preprocessor, config, fit_bounds):
                                   "record_rate": [counts[h]/max(1, days) for h in range(24)],
                                   "invalid_rate": [invalid_counts[h]/max(1, days) for h in range(24)],
                                   "fit_start": start.isoformat(), "fit_end": end.isoformat()}
+    from app.modulos.clasificador.event_index import IndexedEventProvider
+    indexed = IndexedEventProvider.from_events(grouped)
     lengths = []
     for scale, (horizon, resolution, candidates) in enumerate(SCALES):
         for candidate in candidates:
@@ -135,7 +143,7 @@ def fit_spec(events, preprocessor, config, fit_bounds):
             for day in chosen:
                 a = start + timedelta(days=day)
                 b = min(a+timedelta(days=1), end)
-                ticks = intervals(rows, a, b, resolution, info)
+                ticks = intervals(indexed.entities[entity], a, b, resolution, info)
                 for w in candidates:
                     for offset in range(0, len(ticks)-w+1, w):
                         values = [tick["state"] for tick in ticks[offset:offset+w] if tick["valid"]]
@@ -162,7 +170,7 @@ def fit_spec(events, preprocessor, config, fit_bounds):
     return result
 
 
-def build_sample(provider, target, preprocessor, graph, config, labels=None):
+def build_sample(provider, target, preprocessor, graph, config, labels=None, *, defer_dtw=False):
     lengths = graph["segment_steps"]
     if len(lengths) != len(SCALES):
         raise ValueError("Se requiere una longitud de segmento para cada escala")
@@ -171,15 +179,21 @@ def build_sample(provider, target, preprocessor, graph, config, labels=None):
     target = parse_utc(target) if isinstance(target, str) else target
     start = target-timedelta(seconds=SCALES[-1][0])
     entities = preprocessor["entity_ids"]
-    rows = provider(start, target, entities)
-    grouped = {key: [] for key in entities}
-    for row in rows:
-        if row["entity_id"] in grouped and parse_utc(row["timestamp"]) <= target:
-            grouped[row["entity_id"]].append(row)
+    if hasattr(provider, "entities"):
+        grouped = {key: provider.entities.get(key, []) for key in entities}
+        provenance = provider.provenance(start, target, entities)
+    else:
+        rows = provider(start, target, entities)
+        grouped = {key: [] for key in entities}
+        for row in rows:
+            if row["entity_id"] in grouped and parse_utc(row["timestamp"]) <= target:
+                grouped[row["entity_id"]].append(row)
+        provenance = sorted({str(r.get("provenance", "")) for r in rows})
     x = [[[0.]*len(FEATURE_NAMES) for _ in entities] for _ in range(3*MAX_SEGMENTS)]
     states = [[0 for _ in entities] for _ in x]
     present = [[False for _ in entities] for _ in x]
     coverage = {}
+    dtw_jobs = []
     zone = ZoneInfo(config.local_timezone)
     for node, entity in enumerate(entities):
         info = preprocessor["entities"][entity]
@@ -223,17 +237,22 @@ def build_sample(provider, target, preprocessor, graph, config, labels=None):
                 x[slot][node] = features
                 states[slot][node] = chunk[-1]["category"] if not numerical else 0
                 present[slot][node] = usable
+            if defer_dtw and config.use_dtw:
+                dtw_jobs.append((scale, node, info["kind"] == "continuous", sequences))
             for i in range(len(chunks)):
                 for j in range(len(chunks)):
                     similarity = float(i == j)
-                    if i != j and config.use_dtw and sequences[i] is not None and sequences[j] is not None:
+                    if i != j and config.use_dtw and not defer_dtw and sequences[i] is not None and sequences[j] is not None:
                         distance = (dtw_distance(sequences[i], sequences[j], config.dtw_band_fraction) if info["kind"] == "continuous"
                                     else categorical_dtw(sequences[i], sequences[j], config.dtw_band_fraction))
                         similarity = 1/(1+distance) if distance is not None else 0.
                     x[scale*MAX_SEGMENTS+i][node][-MAX_SEGMENTS+j] = similarity
     y = [(labels or {}).get(entity, -1) for entity in entities]
-    return {"X": x, "state_ids": states, "node_present": present, "adjacency": graph["adjacency"],
+    result = {"X": x, "state_ids": states, "node_present": present, "adjacency": graph["adjacency"],
             "y": y, "label_mask": [label >= 0 and any(s["usable"] for s in coverage[entity]) for entity, label in zip(entities, y)],
             "metadata": {"target_time": target.isoformat(), "context_start": start.isoformat(), "entity_ids": entities,
                          "architecture_version": ARCHITECTURE, "scale_coverage": coverage,
-                         "input_provenance": sorted({str(r.get("provenance", "")) for r in rows})}}
+                         "input_provenance": provenance}}
+    if defer_dtw:
+        result["_dtw_jobs"] = dtw_jobs
+    return result

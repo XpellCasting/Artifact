@@ -1,0 +1,15 @@
+# Ubuntu 24.04 / Python 3.12 with the AMD ROCm 7.2 wheels documented by AMD.
+# Complete backend profile: use INSTEAD OF requirements.txt and requirements-gat.txt.
+# AMD's WSL guide requires NumPy 1.x; SciPy 1.18 requires NumPy >=2.0.
+numpy==1.26.4
+scipy==1.16.3
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+pandas==3.0.1
+scikit-learn==1.7.2
+focus-cpt==0.1.10
+networkx==3.7
+dtaidistance==2.5.1
+threadpoolctl==3.7.0
+-r requirements-gat-rocm.txt

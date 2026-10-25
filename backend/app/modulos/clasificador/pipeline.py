@@ -4,7 +4,7 @@ from app.config import artifact_directory
 
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from datetime import datetime, timedelta, timezone
 import csv
 import hashlib
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from time import monotonic
 from uuid import uuid4
 
 
@@ -27,7 +28,8 @@ from app.modulos.clasificador.dataset import index_labelled_targets
 from app.modulos.clasificador.features import fit_preprocessor
 from app.modulos.clasificador.temporal import build_causal_sample
 from app.modulos.clasificador.storage import DiskPartition
-from app.modulos.clasificador.storage import PartitionWriter
+from app.modulos.clasificador.compressed_storage import CompressedPartitionWriter as PartitionWriter
+from app.modulos.clasificador.compressed_storage import StorageBudget
 from app.services.csv_etiquetado import labelled_columns
 from app.services.csv_etiquetado import read_label
 from app.modulos.clasificador.catalogo import CATALOG
@@ -185,8 +187,10 @@ def _atomic_json(path: Path, value):
 
 def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: list[str],
                            config: Config, diagnostics_dir: Path, manifest_path: Path,
-                           progress=lambda *_: None) -> dict:
-    """Builds reloadable NPY blocks; inputs are selected by stable source IDs only."""
+                           progress=lambda *_: None, *, probe_samples=None) -> dict:
+    """Builds compressed shared windows; source IDs and scientific config stay stable."""
+    from app.modulos.clasificador.compressed_storage import hdf5
+    hdf5()
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     bounds = partition_bounds(manifest)
     available = {item["source_id"]: item for item in development_sources(manifest_path, review_store)}
@@ -296,6 +300,10 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     provider = _provider(merged_index)
     targets, target_exclusions = index_labelled_targets(all_annotations, provider,
                                                         split_bounds, config)
+    probe_info = None
+    if probe_samples is not None:
+        from app.modulos.clasificador.storage_probe import select_probe_targets, sample_digest
+        targets, probe_info = select_probe_targets(targets, probe_samples)
     exclusions.extend(target_exclusions)
     identifier = uuid4().hex
     root = artifact_directory(diagnostics_dir, "sequences")
@@ -307,16 +315,23 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
     fault_type_entity_windows = {part: defaultdict(Counter) for part in ("train_fit", "dev_tune")}
     fault_type_episodes = {part: defaultdict(lambda: defaultdict(set))
                            for part in ("train_fit", "dev_tune")}
+    preparation_runtime = {}
+    storage_runtime = {}
+    expected = defaultdict(list)
+    budget = StorageBudget(temp_dir)
     try:
         with ExitStack() as stack:
-            supervised = {part: stack.enter_context(PartitionWriter(temp_dir, part))
+            supervised = {part: stack.enter_context(PartitionWriter(temp_dir, part, budget=budget))
                           for part in ("train_fit", "dev_tune")}
             annotations_by_id = {a["annotation_id"]: a for a in all_annotations}
-            for index, target in enumerate(targets):
+            from app.modulos.clasificador.preparation import prepared_targets, options
+            workers, preparation_batch, preparation_device = options()
+            progress(35, f"Preparando secuencias con {workers} procesos; DTW={preparation_device}; lote={preparation_batch}")
+            samples = stack.enter_context(closing(prepared_targets(targets, merged_index, preprocessor,
+                graph, config, temp_dir, preparation_runtime)))
+            preparation_started = monotonic()
+            for index, (target, sample) in enumerate(samples):
                 target_time = parse_utc(target.timestamp)
-                # Each sample supervises the annotated node only. Other nodes are context.
-                sample = build_causal_sample(provider, target_time, preprocessor, graph, config,
-                                             {target.entity_id: target.label})
                 original = annotations_by_id[target.annotation_id]
                 fault_type = original.get("fault_type")
                 if (target.label == LABELS.index("sensor_fault") and fault_type in fault_types):
@@ -335,23 +350,34 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
                     "target_label": target.label, "es_sintetica": bool(original.get("es_sintetica", False)),
                     "label_source": original.get("label_source")})
                 supervised[target.partition].append(sample)
+                if probe_info is not None:
+                    expected[target.partition].append(sample_digest(sample))
                 if index % 25 == 0 or index + 1 == len(targets):
+                    rate = (index + 1) / max(monotonic() - preparation_started, 1e-9)
                     progress(35 + 30 * (index + 1) / max(1, len(targets)),
-                             f"Construyendo secuencias etiquetadas: {index + 1:,} de {len(targets):,}")
+                             f"Construyendo secuencias etiquetadas: {index + 1:,} de {len(targets):,}; {rate:.2f} ventanas/s")
 
             pretrain_support = {"train_fit": Counter(), "dev_tune": Counter()}
 
-            progress(85, "Guardando las secuencias del dataset en disco")
+            progress(85, "Finalizando bloques comprimidos; sin copiar las secuencias")
             partition_counts, label_counts, episode_counts = {}, {}, {}
             for part, writer in supervised.items():
                 partition_counts[part] = writer.count
                 label_counts[part] = dict(writer.labels)
                 episode_counts[part] = {label: len(groups) for label, groups in writer.episodes.items()}
                 writer.finish()
+                storage_runtime[part] = writer.stats()
         _atomic_json(temp_dir / "preprocessor.json", preprocessor)
         progress(95, "Guardando el grafo y la configuración del dataset")
         _atomic_json(temp_dir / "graph.json", graph)
         _atomic_json(temp_dir / "config.json", config.as_dict())
+        if probe_info is not None:
+            for part, hashes in expected.items():
+                with DiskPartition(temp_dir, part) as stored:
+                    if len(stored) != len(hashes) or any(sample_digest(stored[i]) != digest
+                                                       for i, digest in enumerate(hashes)):
+                        raise ValueError("La muestra comprimida difiere de las ventanas originales")
+            probe_info["exact_roundtrip"] = True
         os.replace(temp_dir, final_dir)
     except BaseException:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -386,6 +412,9 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
              "pretrain_counts": {part: sum(counts.values()) for part, counts in pretrain_support.items()},
              "pretrain_support_by_entity": {part: dict(counts) for part, counts in pretrain_support.items()},
              "fault_type_inventory": fault_type_inventory,
+             "preparation_runtime": preparation_runtime,
+             "storage_runtime": storage_runtime,
+             "storage_probe": probe_info,
              "spatial_evidence": graph["spatial_evidence"], "graph_version": graph["graph_version"], "exploratory": False,
              "config": config.as_dict(), "schema_version": config.schema_version}
     progress(98, "Finalizando el registro del dataset")
@@ -395,7 +424,7 @@ def build_sequence_dataset(review_store, source_ids: list[str], annotation_ids: 
 def load_partition(dataset: dict, partition: str):
     """Abre arrays en disco sin convertir la partición completa en listas."""
     directory = Path(dataset["sequence_dir"])
-    if not (directory / f"{partition}_metadata.jsonl").exists():
+    if not (directory / f"{partition}_metadata.jsonl").exists() and not (directory / f"{partition}.h5").exists():
         return []
     return DiskPartition(directory, partition)
 

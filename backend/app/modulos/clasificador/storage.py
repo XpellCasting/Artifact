@@ -207,6 +207,16 @@ class DiskPartition(Sequence):
 
     def __init__(self, directory, prefix):
         directory = Path(directory)
+        self._compressed_file = None
+        if (directory / f"{prefix}.h5").exists():
+            from app.modulos.clasificador.compressed_storage import open_compressed
+            self._compressed_file, self.arrays, self.metadata = open_compressed(directory, prefix)
+            try:
+                self.adjacency = json.loads((directory / "graph.json").read_text(encoding="utf-8"))["adjacency"]
+            except BaseException:
+                self.close()
+                raise
+            return
         fields = FIELDS
         # Labels are small (N per window); keeping them avoids reopening files
         # for every episode count. Feature windows (T*N*F) remain on disk.
@@ -230,6 +240,9 @@ class DiskPartition(Sequence):
             if isinstance(array, FileArray):
                 array.close()
         self.arrays.clear()
+        if self._compressed_file is not None:
+            self._compressed_file.close()
+            self._compressed_file = None
 
     def __enter__(self):
         return self
@@ -258,7 +271,7 @@ class DiskPartition(Sequence):
         indices = [operator.index(index) for index in indices]
         if any(index < 0 or index >= len(self) for index in indices):
             raise IndexError("Índice fuera de la partición")
-        batch = {name: (array.read_rows(indices) if isinstance(array, FileArray)
+        batch = {name: (array.read_rows(indices) if hasattr(array, "read_rows")
                         else array[indices]) for name, array in self.arrays.items()}
         batch["metadata"] = [self.metadata[index] for index in indices]
         batch["adjacency"] = self.adjacency
@@ -416,8 +429,14 @@ def _copy_to_cache(source, target, key, inventory, progress):
 @contextmanager
 def open_training_partitions(dataset, progress=None):
     """Prepares/reuses the bounded cache, then keeps descriptors open for training."""
+    if dataset.get("storage_probe"):
+        raise ValueError("Una muestra de almacenamiento no es un dataset para entrenar")
     original = Path(dataset["sequence_dir"])
     cache_root_value = setting('GAT_SEQUENCE_CACHE_DIR')
+    # Compressed windows already support bounded batch reads. Avoid creating a
+    # second dataset copy, even when a cache was configured for legacy NPYs.
+    if any(original.glob("*.h5")):
+        cache_root_value = None
     cache_warning = None
     selected = original
     key = None
@@ -462,7 +481,7 @@ def open_training_partitions(dataset, progress=None):
     try:
         for prefix in prefixes:
             metadata_path = selected / f"{prefix}_metadata.jsonl"
-            if not metadata_path.exists():
+            if not metadata_path.exists() and not (selected / f"{prefix}.h5").exists():
                 partitions.append([])
                 continue
             partition = DiskPartition(selected, prefix)

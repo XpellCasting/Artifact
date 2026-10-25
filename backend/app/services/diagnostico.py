@@ -572,6 +572,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
             "exploratory": dataset.get("exploratory", False),
             "runtime": metrics.get("runtime"),
             "runtime_parameters": metrics.get("runtime_parameters"),
+            "threshold_search_runtime": metrics.get("threshold_search_runtime"),
             "storage": storage})
         _write(self._path("models", candidate["model_id"]), candidate)
         progress(100, "Entrenamiento completado: candidato listo", phase="completed")

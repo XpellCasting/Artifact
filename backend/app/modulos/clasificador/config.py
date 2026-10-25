@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import math
 import os
+import re
 from pathlib import Path
 from pathlib import PureWindowsPath
 import json
@@ -76,8 +77,9 @@ class Config:
             raise ValueError("Dimensiones de GAT, tasa, paciencia, vecinos o parámetros DTW inválidos")
         if self.max_nodes > 32:
             raise ValueError("El máximo de entidades no puede superar 32")
-        if self.device != "cpu" and not self.device.startswith("cuda"):
-            raise ValueError("Dispositivo inválido")
+        # PyTorch also addresses AMD/HIP devices through the CUDA interface.
+        if not isinstance(self.device, str) or re.fullmatch(r"cpu|cuda(?::[0-9]+)?", self.device) is None:
+            raise ValueError("Dispositivo inválido: usa cpu, cuda o cuda:N (también para AMD/ROCm)")
 
         if not math.isfinite(self.segment_threshold) or not 0 < self.segment_threshold < 1:
             raise ValueError("Umbral DTW inválido")
