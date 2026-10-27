@@ -202,6 +202,12 @@ class FlowStore:
         return {"items": items, "next_before_id": items[-1]["alert_id"] if len(rows) > limit else None,
                 "execution_id": current[0] if current else None}
 
+    def latest_run_id(self) -> str | None:
+        with self._database() as db:
+            # Runs are appended on save. Read the last row without scanning its large JSON columns.
+            row = db.execute("SELECT run_id FROM flow_runs ORDER BY rowid DESC LIMIT 1").fetchone()
+        return row[0] if row else None
+
     def list_runs(self, flow_id: str | None = None) -> list[dict[str, Any]]:
         clause, args = (" WHERE flow_id=?", [flow_id]) if flow_id else ("", [])
         with self._database() as db:

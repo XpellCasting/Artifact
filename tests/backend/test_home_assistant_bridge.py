@@ -42,16 +42,69 @@ class BridgeRegistrationTests(unittest.TestCase):
 
 
 class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_subscription_uses_only_reference_entities_published_by_home_assistant(self):
+        selection = ["sensor.temperature", "light.csv_only", "media_player.csv_only"]
+        requests = []
+        stopped = Event()
+        class Socket:
+            async def send_json(self, message):
+                requests.append(message)
+                data = ([{"entity_id": "sensor.temperature"}, {"entity_id": "sensor.outside_reference"}]
+                        if message["operation"] == "states" else [])
+                self.connection.receive({"type": "result", "request_id": message["request_id"],
+                                         "success": True, "data": data})
+            async def close(self, **kwargs):
+                pass
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
+            socket = Socket()
+            socket.connection = await bridge.attach(socket)
+            try:
+                await asyncio.wait_for(asyncio.to_thread(bridge.listen, selection, lambda event: None,
+                                                        stopped, stopped.set), timeout=3)
+                self.assertEqual([request["operation"] for request in requests], ["states", "subscribe", "unsubscribe"])
+                self.assertEqual(requests[1]["arguments"]["entity_ids"], ["sensor.temperature"])
+                self.assertEqual(selection, ["sensor.temperature", "light.csv_only", "media_player.csv_only"])
+                self.assertFalse(socket.connection.subscriptions)
+            finally:
+                stopped.set()
+                await bridge.close()
+
+    async def test_no_matching_reference_entities_does_not_subscribe_to_unselected_entities(self):
+        requests = []
+        class Socket:
+            async def send_json(self, message):
+                requests.append(message["operation"])
+                self.connection.receive({"type": "result", "request_id": message["request_id"],
+                                         "success": True, "data": [{"entity_id": "sensor.outside_reference"}]})
+            async def close(self, **kwargs):
+                pass
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
+            socket = Socket()
+            socket.connection = await bridge.attach(socket)
+            try:
+                with self.assertRaisesRegex(ValueError, "No hay entidades seleccionadas del historial"):
+                    await asyncio.wait_for(asyncio.to_thread(bridge.listen, ["sensor.csv_only"],
+                                                            lambda event: None, Event()), timeout=3)
+                self.assertEqual(requests, ["states"])
+            finally:
+                await bridge.close()
+
     async def test_5000_entities_use_bounded_subscriptions_and_all_are_removed_on_stop(self):
         connected = Event()
         stopped = Event()
         subscriptions, unsubscribed, received = [], [], []
         class Socket:
             async def send_json(inner, message):
+                if message["operation"] == "states":
+                    inner.connection.receive({"type": "result", "request_id": message["request_id"],
+                                              "success": True, "data": [{"entity_id": entity_id} for entity_id in ids]})
+                    return
                 if message["operation"] == "subscribe":
-                    ids = message["arguments"]["entity_ids"]
-                    self.assertLessEqual(len(ids), 1000)
-                    subscriptions.extend(ids)
+                    subscribed_ids = message["arguments"]["entity_ids"]
+                    self.assertLessEqual(len(subscribed_ids), 1000)
+                    subscriptions.extend(subscribed_ids)
                 else:
                     unsubscribed.append(message["arguments"]["subscription_id"])
                 inner.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": []})
@@ -86,7 +139,8 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
         from app.services.home_assistant_live import HomeAssistantEventSource
         class Socket:
             async def send_json(self, message):
-                self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": []})
+                data = [{"entity_id": "binary_sensor.door"}] if message["operation"] == "states" else []
+                self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": data})
             async def close(self, **kwargs):
                 pass
         async def until(condition):
@@ -133,7 +187,8 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
                 if message["operation"] == "subscribe":
                     sent.set()
                 else:
-                    self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": []})
+                    data = [{"entity_id": "sensor.a"}] if message["operation"] == "states" else []
+                    self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": data})
             async def close(self, **kwargs):
                 pass
         with tempfile.TemporaryDirectory() as folder:

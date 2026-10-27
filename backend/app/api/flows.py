@@ -82,11 +82,16 @@ def run_flow(flow_id: str, request: FlowRunRequest) -> dict[str, Any]:
                                                          result_sink=result_sink)
             snapshot["source"]["filename"] = filename
             return summary, results, snapshot
-        return flow_evaluation_jobs.start(flow_id, evaluate)
+        return flow_evaluation_jobs.start(flow_id, evaluate, flow=flow)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@router.get("/flow-evaluations", tags=["flow-evaluation"])
+def shared_flow_evaluation():
+    return {"job": flow_evaluation_jobs.latest(include_run=False), "latest_run_id": flow_store.latest_run_id()}
+
 
 @router.get("/flow-evaluations/{job_id}", tags=["flow-evaluation"])
 def flow_evaluation_status(job_id: str):
@@ -125,7 +130,7 @@ def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
                                       connection_error=source.error,
                                       reception={**source.status(), "status": "failed" if source.error else "stopped"})
             return summary, results, snapshot
-        return flow_evaluation_jobs.start(flow_id, evaluate, live_source=source)
+        return flow_evaluation_jobs.start(flow_id, evaluate, live_source=source, flow=flow)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
     except ValueError as exc:

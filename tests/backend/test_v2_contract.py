@@ -12,6 +12,46 @@ from app.database.review import ReviewError
 
 
 class SegmentContractTests(unittest.TestCase):
+    def test_saved_run_restores_its_model_after_restart_with_active_or_explicit_selection(self):
+        for source in ("history", "validation_replay", "flow_evaluation"):
+            for explicit in (False, True):
+                with self.subTest(source=source, explicit=explicit), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    service = DiagnosticWorkbench(root)
+                    identifier = "a" * 32
+                    model = {"model_id": identifier, "method": "gat_lstm", "training_count": 10,
+                             "config": {"architecture_version": "gat_lstm_v3_segments_multiscale"}}
+                    service._path("models", identifier).write_text(json.dumps(model), encoding="utf-8")
+                    (service.directory / "weights" / f"{identifier}.pt").write_bytes(b"fixture")
+                    (service.directory / "active.json").write_text(json.dumps({"model_id": identifier}), encoding="utf-8")
+                    model_id = identifier if explicit else None
+                    snapshot = service._run_snapshot_for_model(source, "saved-run", model_id)
+
+                    # Saved runs retain their original model even if local metadata changes.
+                    service._path("models", identifier).write_text(json.dumps({**model, "training_count": 99}), encoding="utf-8")
+                    restarted = DiagnosticWorkbench(root)
+                    self.assertEqual(restarted.window_seconds_for_run(source, "saved-run", model_id), 259200)
+                    restored = restarted._run_snapshot_for_model(source, "saved-run", model_id)
+                    self.assertEqual(restored, snapshot)
+                    self.assertEqual(restored["model"]["training_count"], 10)
+                    with restarted._connect() as connection:
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 1)
+
+    def test_saved_run_rejects_retired_models_with_the_current_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = DiagnosticWorkbench(Path(tmp))
+            for architecture in (None, "gat_lstm_v1", "gat_lstm_v2_shared_type"):
+                with self.subTest(architecture=architecture):
+                    run_id = str(architecture)
+                    config = {} if architecture is None else {"architecture_version": architecture}
+                    snapshot = {"model": {"method": "gat_lstm", "config": config}, "references": []}
+                    with service._connect() as connection:
+                        connection.execute("INSERT INTO runs VALUES (?, ?)",
+                                           (f"history:{run_id}", json.dumps(snapshot)))
+                    with self.assertRaises(ReviewError) as failure:
+                        service.window_seconds_for_run("history", run_id)
+                    self.assertEqual(failure.exception.status_code, 409)
+
     def test_retired_artifacts_cannot_be_selected_or_listed(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = DiagnosticWorkbench(Path(tmp))

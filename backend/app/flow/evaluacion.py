@@ -493,13 +493,13 @@ class FlowEvaluationJobs:
         self.sources = {}
         self.lock = Lock()
 
-    def start(self, flow_id, evaluate, live_source=None):
+    def start(self, flow_id, evaluate, live_source=None, flow=None):
         with self.lock:
             if any(job["status"] == "running" for job in self.jobs.values()):
                 raise ValueError("Ya hay una evaluación de flujos en curso. Espera a que termine.")
             job_id = uuid4().hex
             self.store.begin_alert_execution(job_id)
-            self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "status": "running", "processed": 0, "total": 0, "phase": "preparation", "mode": "home_assistant" if live_source is not None else "csv"}
+            self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "flow": deepcopy(flow), "status": "running", "processed": 0, "total": 0, "phase": "preparation", "mode": "home_assistant" if live_source is not None else "csv"}
             if live_source is not None:
                 self.sources[job_id] = live_source
         recent_completions = deque()
@@ -567,11 +567,22 @@ class FlowEvaluationJobs:
 
     def get(self, job_id):
         with self.lock:
-            payload = deepcopy(self.jobs[job_id])
-            source = self.sources.get(job_id)
-            if source is not None:
-                payload["connection"] = source.status()
-            return payload
+            return self._snapshot(job_id)
+
+    def latest(self, include_run=True):
+        with self.lock:
+            job_id = next(reversed(self.jobs), None)
+            return self._snapshot(job_id, include_run=include_run) if job_id is not None else None
+
+    def _snapshot(self, job_id, include_run=True):
+        job = self.jobs[job_id]
+        payload = deepcopy({key: value for key, value in job.items() if include_run or key != "run"})
+        if not include_run and "run" in job:
+            payload["run_id"] = job["run"]["run_id"]
+        source = self.sources.get(job_id)
+        if source is not None:
+            payload["connection"] = source.status()
+        return payload
 
     def stop(self, job_id):
         with self.lock:
