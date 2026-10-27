@@ -29,7 +29,8 @@ class LiveEventsTests(unittest.TestCase):
         self.start = pd.Timestamp("2026-01-01T00:00:00Z")
 
     def source(self, **changes):
-        return HomeAssistantEventSource("http://ha.local:8123", "secret", self.entities, self.start, **changes)
+        entities = changes.pop("entities", self.entities)
+        return HomeAssistantEventSource("http://ha.local:8123", "secret", entities, self.start, **changes)
 
     def message(self, at, state="on", entity="binary_sensor.door", old="off"):
         return {"type": "event", "event": {"event_type": "state_changed", "data": {
@@ -60,6 +61,28 @@ class LiveEventsTests(unittest.TestCase):
         source.accept(self.message("2026-01-01T00:00:01Z"))
         with self.assertRaisesRegex(ValueError, "ritmo de entrada"):
             source.accept(self.message("2026-01-01T00:00:02Z", state="off", old="on"))
+
+    def test_bridge_default_subscription_preserves_mixed_csv_reference(self):
+        entities = pd.concat([self.entities, pd.DataFrame([
+            {"entity_id": "light.room", "sensor_kind": "binary"},
+            {"entity_id": "media_player.tv", "sensor_kind": "multistate"},
+        ])], ignore_index=True)
+        original = entities.copy(deep=True)
+        source = self.source(entities=entities, bridge=object())
+        self.assertEqual(source.selected, set(entities["entity_id"]))
+        self.assertEqual(set(source.entities), set(entities["entity_id"]))
+        pd.testing.assert_frame_equal(entities, original)
+        source.accept(self.message("2026-01-01T00:00:02Z", "23.4", "sensor.temperature"))
+        self.assertEqual(source.queue.get_nowait()["value"], 23.4)
+        self.assertEqual(source.status()["received"], 1)
+
+    def test_bridge_explicit_selection_keeps_only_selected_reference_entities(self):
+        source = self.source(entity_ids=["sensor.temperature"], bridge=object())
+        self.assertEqual(source.selected, {"sensor.temperature"})
+        source.accept(self.message("2026-01-01T00:00:01Z"))
+        self.assertEqual(source.status()["received"], 0)
+        with self.assertRaisesRegex(ValueError, "historial de referencia"):
+            self.source(entity_ids=["sensor.outside_reference"], bridge=object())
 
     def test_batches_sort_events_and_group_equal_timestamps(self):
         source = self.source()

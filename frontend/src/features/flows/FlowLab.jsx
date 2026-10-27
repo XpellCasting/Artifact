@@ -81,9 +81,14 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const [activeClassifierModelId, setActiveClassifierModelId] = useState(null);
   const [selection, setSelection] = useState(null);
   const [error, setError] = useState("");
+  const [syncError, setSyncError] = useState("");
+  const visibleError = error || syncError;
   const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(() => Boolean(localStorage.getItem("flow-evaluation-job")));
-  const [job, setJob] = useState(() => { const id = localStorage.getItem("flow-evaluation-job"); return id ? { job_id: id, status: "running", processed: 0, total: 0 } : null; });
+  const [pending, setPending] = useState(false);
+  const [synchronized, setSynchronized] = useState(false);
+  const [job, setJob] = useState(null);
+  const executing = job?.status === "running";
+  const busy = pending || !synchronized || executing;
   const [loaded, setLoaded] = useState(false);
   const [newType, setNewType] = useState("statistical_focus");
   const [source, setSource] = useState("");
@@ -99,7 +104,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const [canvasNodes, setCanvasNodes, onCanvasNodesChange] = useNodesState([]);
   const { fitView, screenToFlowPosition } = useReactFlow();
   const canvasRef = useRef(null);
-  const graph = inspecting && activeRun ? activeRun.snapshot.flow : draft;
+  const graph = executing && job.flow ? job.flow : inspecting && activeRun ? activeRun.snapshot.flow : draft;
   const dirty = fingerprint(draft) !== savedKey;
   const errors = useMemo(() => validateDraft(draft), [draft]);
   const node = selection?.kind === "node" ? graph.nodes.find((item) => item.id === selection.id) : null;
@@ -111,8 +116,8 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const refresh = useCallback(async () => {
     const [f, r, models] = await Promise.all([request(apiBaseUrl, "/flows"), request(apiBaseUrl, "/flow-runs"), request(apiBaseUrl, "/diagnostics/classifier-models")]);
     setFlows(f.items || []); setRuns(r.items || []); setClassifierModels(models.models || []); setActiveClassifierModelId(models.active_model_id || null); setLoaded(true);
+    setActiveRun((current) => (r.items || []).find((item) => item.run_id === current?.run_id) || current || r.items?.[0] || null);
   }, [apiBaseUrl]);
-  useEffect(() => { refresh().catch((reason) => setError(reason.message)); }, [refresh]);
   const refreshClassifierModels = useCallback(async () => {
     const models = await request(apiBaseUrl, "/diagnostics/classifier-models");
     setClassifierModels(models.models || []);
@@ -133,16 +138,20 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     };
   }, [refreshClassifierModels]);
   useFlowEvaluationPolling({
-    apiBaseUrl, jobId: job?.job_id,
-    onUpdate: (state) => setJob(state),
-    onConnectionError: (detail) => setJob((current) => current ? { ...current, polling_error: detail } : current),
-    onFailure: (detail) => { setError(detail); setBusy(false); setJob(null); localStorage.removeItem("flow-evaluation-job"); },
+    apiBaseUrl, jobId: job?.job_id, discover: true,
+    onReady: () => { setSynchronized(true); setSyncError(""); },
+    onRunsChanged: () => refresh().catch((reason) => setError(reason.message)),
+    onUpdate: (state) => {
+      if (job?.job_id !== state.job_id) { setSelection(null); setMessage(""); setError(""); setLayoutRevision((value) => value + 1); }
+      setJob(state); setInspecting(false);
+    },
+    onConnectionError: (detail) => { if (!job) setSyncError(detail); setJob((current) => current ? { ...current, polling_error: detail } : current); },
+    onFailure: (detail) => { setError(detail); setJob(null); },
     onComplete: (state) => {
-      localStorage.removeItem("flow-evaluation-job"); setJob(null); setBusy(false);
+      setJob(null);
       setActiveRun(state.run); setInspecting(true); setResultNode("output"); setSelection(null);
       setMessage(state.mode === "home_assistant" ? "Recepción terminada. La ejecución y sus resultados quedaron guardados." : "Evaluación terminada. El gráfico muestra el flujo utilizado con todos los eventos futuros.");
       if (state.warning) setError(state.warning);
-      refresh().catch((reason) => setError(reason.message));
     },
   });
   useEffect(() => { const frame = requestAnimationFrame(() => fitView({ padding: .18, duration: 200, maxZoom: 1 })); return () => cancelAnimationFrame(frame); }, [layoutRevision, inspecting, fitView]);
@@ -178,27 +187,28 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     setDraft(saved); setSavedKey(fingerprint(saved)); return saved;
   }
   async function save() {
-    setBusy(true); setError(""); setMessage("");
-    try { await persist(); await refresh(); setMessage("Flujo guardado."); } catch (reason) { setError(reason.message); } finally { setBusy(false); }
+    setPending(true); setError(""); setMessage("");
+    try { await persist(); await refresh(); setMessage("Flujo guardado."); } catch (reason) { setError(reason.message); } finally { setPending(false); }
   }
   async function execute() {
-    setBusy(true); setError(""); setMessage("");
+    setPending(true); setError(""); setMessage("");
     try {
       // Guardar la configuración visible antes de ejecutar evita usar una versión anterior silenciosamente.
       const saved = dirty || !draft.flow_id ? await persist() : draft;
       const started = await request(apiBaseUrl, `/flows/${saved.flow_id}/runs`, { method: "POST", body: "{}" });
-      localStorage.setItem("flow-evaluation-job", started.job_id); setJob(started);
-    } catch (reason) { setError(reason.message); setBusy(false); }
+      setJob({ ...started, mode: "csv", flow: saved });
+    } catch (reason) { setError(reason.message); }
+    finally { setPending(false); }
   }
   async function startLive(connection) {
-    setBusy(true); setError(""); setMessage("");
+    setPending(true); setError(""); setMessage("");
     try {
       const saved = dirty || !draft.flow_id ? await persist() : draft;
       const started = await request(apiBaseUrl, `/flows/${saved.flow_id}/live/start`, { method: "POST", body: JSON.stringify(connection) });
-      localStorage.setItem("flow-evaluation-job", started.job_id);
-      setJob({ ...started, mode: "home_assistant" });
+      setJob({ ...started, mode: "home_assistant", flow: saved });
       return true;
-    } catch (reason) { setError(reason.message); setBusy(false); return false; }
+    } catch (reason) { setError(reason.message); return false; }
+    finally { setPending(false); }
   }
   async function stopLive() {
     setError("");
@@ -218,12 +228,12 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   useEffect(() => { setCanvasNodes(visualNodes); }, [visualNodes, setCanvasNodes]);
 
   return <section className="flow-lab" aria-label="Evaluación de flujos">
-    <header className="fl-header"><div className="fl-state"><span className={`fl-dot ${inspecting || !dirty ? "is-saved" : ""}`} />{inspecting ? "Inspección de una ejecución" : dirty ? "Cambios sin guardar" : "Todos los cambios guardados"}</div></header>
+    <header className="fl-header"><div className="fl-state"><span className={`fl-dot ${executing || inspecting || !dirty ? "is-saved" : ""}`} />{executing ? "Ejecución sincronizada entre dispositivos" : inspecting ? "Inspección de una ejecución" : dirty ? "Cambios sin guardar" : "Todos los cambios guardados"}</div></header>
     {onSelectHistory && <section className="fl-history-summary" aria-label="Historial de referencia"><div><strong>{historyReady ? "Historial de referencia listo" : "Prepara tu historial de referencia"}</strong>{!historyReady && <p>Elige el historial de Home Assistant o un archivo CSV en el Selector de Historial.</p>}</div><button type="button" disabled={busy} onClick={onSelectHistory}>Selector de Historial<ArrowRight size={16} /></button></section>}
-    {error && <div role="alert" className="fl-notice fl-error"><AlertTriangle size={18} /><span>{error}</span>{!loaded && <button onClick={() => { setError(""); refresh().catch((e) => setError(e.message)); }}>Reintentar</button>}</div>}
+    {visibleError && <div role="alert" className="fl-notice fl-error"><AlertTriangle size={18} /><span>{visibleError}</span>{!loaded && <button onClick={() => { setError(""); refresh().catch((e) => setError(e.message)); }}>Reintentar</button>}</div>}
     {message && <div role="status" className="fl-notice"><Check size={16} />{message}</div>}
     <div className="fl-design-heading"><span className="hs-step">Diseño del flujo</span></div>
-    <div className="fl-toolbar">{inspecting ? <>
+    <div className="fl-toolbar">{executing ? <><strong>{graph.name}</strong><span className="fl-muted">Evaluación en curso · configuración de la ejecución</span></> : inspecting ? <>
       <button onClick={() => { setInspecting(false); setSelection(null); }}><ArrowLeft size={16} />Volver al diseño</button><strong>{graph.name}</strong><span className="fl-muted">Configuración de la ejecución · solo lectura</span><button onClick={() => choose({ ...clone(graph), flow_id: null, name: `${graph.name} (copia)` })}><Copy size={16} />Editar una copia</button>
     </> : <>
       <label className="fl-name">Nombre del flujo<input aria-label="Nombre del flujo" value={draft.name} disabled={busy} onChange={(event) => change((next) => { next.name = event.target.value; })} /></label>
@@ -254,10 +264,10 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     </aside></div>
     {!inspecting && <>{!!errors.length && <div className="fl-validation" role="status"><strong>Completa el diseño para ejecutar</strong><ul>{errors.map((text) => <li key={text}>{text}</li>)}</ul></div>}
       <section className="fl-execution"><div><span className="hs-step">Evaluación</span>
-        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} error={error} replay={replay} upload={upload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
+        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} error={visibleError} replay={replay} upload={upload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
         {!historyReady && <p className="fl-required">Carga un historial desde el Selector de Historial y espera a que se prepare el detector.</p>}
         <CalibrationReport models={continuousModels} />
-        {job && job.mode !== "home_assistant" && <FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} />}
+        {job && job.mode !== "home_assistant" && <>{job.polling_error && <p className="fl-required" role="status">No se pudo consultar el progreso. Se reintentará automáticamente. {job.polling_error}</p>}<FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} /></>}
       </div></section>
     </>}
     <section className="fl-comparison" aria-label="Comparación de conjuntos etiquetados"><h3>Conjuntos etiquetados evaluados</h3><div className="fl-table-scroll"><table><thead><tr><th>Conjunto · huella</th><th>Flujo · fecha</th><th>Fallas detectadas / total</th><th>Anomalías detectadas / total</th><th>Tipos identificados / etiquetados</th><th>Falsos positivos</th><th>Detalle</th></tr></thead><tbody>{runs.filter(r => r.summary.evaluation?.labelled).map(run => {

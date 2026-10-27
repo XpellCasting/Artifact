@@ -33,6 +33,8 @@
 .diagnostic-tabs button:hover { color: var(--ha-text); }
 .diagnostic-panel { border: 1px solid var(--ha-divider); border-radius: 11px; background: var(--ha-surface); padding: 22px; min-width: 0; }
 .diagnostic-panel-title { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 16px; }
+.diagnostic-import-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 14px; }
+@media (max-width: 760px) { .diagnostic-import-controls { grid-template-columns: 1fr; } }
 .diagnostic-help { color: var(--ha-muted); line-height: 1.7; font-size: 12px; margin: 12px 0; }
 .diagnostic-alert, .diagnostic-notice { padding: 13px 16px; line-height: 1.65; border-radius: 8px; font-size: 12px; overflow-wrap: anywhere; }
 .diagnostic-alert { background: var(--ha-surface); border: 1px solid var(--ha-error); color: var(--ha-text); }

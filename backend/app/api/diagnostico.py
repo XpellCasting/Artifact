@@ -1,8 +1,12 @@
 from __future__ import annotations
+import os
+from pathlib import Path
+import tempfile
 from typing import Literal
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from app.database.review import ReviewError
 from app.services.diagnostico import DiagnosticWorkbench
 from app.api.schemas import BuildInput
@@ -25,6 +29,23 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
     @router.get("/classifier-models")
     def classifier_models():
         return translate(workbench.classifier_models)
+
+    @router.post("/models/import")
+    async def import_model(request: Request):
+        from app.modulos.clasificador.transfer import MAX_MODEL_ZIP_BYTES
+        handle, name = tempfile.mkstemp(prefix="model-upload-", suffix=".zip", dir=workbench.review.temporary)
+        path = Path(name)
+        try:
+            size = 0
+            with os.fdopen(handle, "wb") as stream:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > MAX_MODEL_ZIP_BYTES:
+                        raise HTTPException(413, "El ZIP supera el límite de 256 MiB.")
+                    await run_in_threadpool(stream.write, chunk)
+            return await run_in_threadpool(translate, workbench.import_model, path)
+        finally:
+            path.unlink(missing_ok=True)
 
     @router.get("/sources")
     def sources(method: Literal["gat_lstm"] = Query("gat_lstm")):

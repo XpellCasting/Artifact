@@ -1,7 +1,7 @@
 import { request } from "../../shared/api.js";
 import { reviewStatusLabel } from "../review/review-annotations.js";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, ArrowLeft, ArrowRight, BookOpen, Check, Database, Download, FlaskConical, Loader2, Play, RefreshCw, Search, ShieldCheck, Save } from "lucide-react";
+import { Activity, ArrowLeft, ArrowRight, BookOpen, Check, Database, Download, FlaskConical, Loader2, Play, RefreshCw, Search, ShieldCheck, Save, Upload } from "lucide-react";
 import { annotationDiagnosticProblem, diagnosticLabel, DIAGNOSTIC_PARTITIONS as PARTITIONS } from "./diagnostic-data.js";
 import { DEFAULT_SEGMENT_CONFIG, gatContextSeconds, gatDataConfigCompatible, gatSupportStatus, isGatConfigValid } from "./diagnostic-gat.js";
 import { estimateTrainingRemainingSeconds, formatRemainingTime } from "./diagnostic-progress.js";
@@ -80,6 +80,8 @@ export default function DiagnosticWorkspace({ apiBaseUrl = "http://localhost:800
   const [evaluationPartition, setEvaluationPartition] = useState("validation");
   const [busy, setBusy] = useState("");
   const [exporting, setExporting] = useState("");
+  const [modelFile, setModelFile] = useState(null);
+  const modelFileInput = useRef(null);
   const [resultsSource, setResultsSource] = useState("history");
   const [resultsOffset, setResultsOffset] = useState(0);
   const [results, setResults] = useState({ items: [], total: 0, next_offset: null });
@@ -262,6 +264,31 @@ export default function DiagnosticWorkspace({ apiBaseUrl = "http://localhost:800
       annotation_ids: annotationIds, gat_config: gatConfig, injection_ids: [], include_drafts: false }, "gat-build");
   }
 
+  async function importModel() {
+    if (!modelFile || locked) return;
+    if (!modelFile.name.toLowerCase().endsWith(".zip")) {
+      setError("Selecciona un archivo ZIP con los pesos y los metadatos del modelo."); return;
+    }
+    if (modelFile.size > 256 * 1024 ** 2) {
+      setError("El ZIP supera el límite de 256 MiB."); return;
+    }
+    setBusy("import-model"); setError(""); setNotice("");
+    try {
+      const imported = await call("/diagnostics/models/import", {
+        method: "POST", headers: { "Content-Type": "application/zip" }, body: modelFile,
+      });
+      if (!mounted.current) return;
+      setModelId(imported.model_id);
+      setModelFile(null);
+      if (modelFileInput.current) modelFileInput.current.value = "";
+      setNotice(imported.imported_files
+        ? "Modelo importado: pesos, metadatos, grafo y preprocesador disponibles. Puedes activar la versión seleccionada."
+        : "Este modelo ya está importado. Se seleccionó su versión existente.");
+      await refresh();
+    } catch (failure) { if (mounted.current && failure.name !== "AbortError") setError(failure.message); }
+    finally { if (mounted.current) setBusy(""); }
+  }
+
   async function activateModel() {
     if (!selectedModel || locked) return;
     setBusy("activate"); setError(""); setNotice("");
@@ -308,6 +335,16 @@ export default function DiagnosticWorkspace({ apiBaseUrl = "http://localhost:800
     {candidateTrainingJob && !(view === "prepare" && selectedGatDataset) && candidateProgress}
     {job && !candidateTrainingJob && !(datasetBuildJob && view === "prepare") && <section className={`history-load-progress ${job.status === "completed" ? "ready" : ""} ${job.status === "failed" ? "failed" : ""}`} aria-live="polite"><div className="history-load-heading"><span>{job.phase === "training" ? "Entrenamiento GAT-LSTM" : STATE_LABELS[job.status] || job.status}</span><strong>{Math.round(visibleProgress)}%</strong></div><div className="progress-track" role="progressbar" aria-label={job.phase === "training" ? "Avance del entrenamiento GAT-LSTM" : "Avance de la operación"} aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(visibleProgress)}><span style={{ width: `${visibleProgress}%` }} /></div><p>{job.message || "Preparando operación…"}</p><div className="history-load-meta">{job.phase === "training" && <span>Época: {number(job.epoch)} de {number(job.max_epochs)}</span>}{jobElapsedSeconds != null && <span>Transcurrido: {formatRemainingTime(jobElapsedSeconds)}</span>}<span>Restante: {job.status === "completed" ? "0 s" : job.phase === "training" ? trainingRemainingSeconds == null ? "estimando" : `aprox. ${formatRemainingTime(trainingRemainingSeconds)}` : "—"}</span></div>{job.tracking_paused && <button className="diagnostic-button" onClick={() => { setError(""); setJob((value) => ({ ...value, tracking_paused: false })); }}>Reintentar seguimiento</button>}</section>}
     <nav className="diagnostic-tabs" aria-label="Vistas del clasificador">{[["results", "Diagnósticos", Activity], ["prepare", "Preparación del investigador", Database], ["models", "Modelos y evaluación", FlaskConical], ["catalog", "Catálogo y sensores", BookOpen]].map(([key, label, Icon]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView(key)} aria-pressed={view === key}><Icon size={16} />{label}</button>)}</nav>
+
+    {view === "models" && <section className="diagnostic-panel" aria-label="Importar modelo entrenado">
+      <div className="diagnostic-panel-title"><h3>Importar modelo entrenado</h3><Upload size={19} /></div>
+      <p className="diagnostic-help">Selecciona el ZIP con las carpetas weights, models, graphs y preprocessors. Se cargarán los pesos, metadatos, grafo y preprocesador, listos para activar sin volver a entrenar.</p>
+      <div className="diagnostic-import-controls">
+        <label>Archivo del modelo (.zip)<input ref={modelFileInput} type="file" accept=".zip,application/zip,application/x-zip-compressed" disabled={locked} onChange={(event) => setModelFile(event.target.files?.[0] || null)} /></label>
+        <button className="diagnostic-button diagnostic-primary" disabled={locked || !modelFile} onClick={importModel}>{busy === "import-model" ? <Loader2 size={16} className="diagnostic-spin" /> : <Upload size={16} />}{busy === "import-model" ? "Importando modelo…" : "Importar ZIP"}</button>
+      </div>
+      {busy === "import-model" && <p className="diagnostic-help" role="status">Cargando el ZIP y comprobando los pesos y la compatibilidad del modelo…</p>}
+    </section>}
 
     {view === "results" && <section className="diagnostic-panel"><div className="diagnostic-panel-title"><h3>Diagnósticos de las sospechas pendientes</h3><span className="diagnostic-badge">{number(results.total)} resultados</span></div><div className="diagnostic-result-controls"><label>Origen de los resultados<select value={resultsSource} onChange={(event) => { setResultsSource(event.target.value); setResultsOffset(0); }}><option value="history">Histórico y eventos</option><option value="validation_replay">Reproducción de evaluación</option></select></label><button className="diagnostic-button" disabled={resultsLoading} onClick={() => setResultsRefresh((value) => value + 1)}><RefreshCw size={15} />Actualizar diagnósticos</button></div><p className="diagnostic-help">La compatibilidad expresa semejanza con un patrón; no es una probabilidad calibrada ni confirma una avería física. Los casos resueltos como ambientales por F2 conservan su recorrido.</p>{!resultsLoading && results.summary && <div className="diagnostic-evaluation"><span>Lecturas con resultado: <b>{number(results.summary.total)}</b></span><span>Indeterminadas: <b>{number(results.summary.indeterminate)}</b></span><span>Cobertura: <b>{metric(results.summary.coverage)}</b></span>{results.summary.total === 0 && <span>No hay lecturas evaluables; las métricas no se calculan.</span>}{Object.entries(results.summary.indeterminate_by_reason || {}).map(([reason, count]) => <span key={reason}>{reasonLabel(reason)}: <b>{number(count)}</b></span>)}</div>}
       {resultsLoading ? <p className="diagnostic-empty"><Loader2 size={19} className="diagnostic-spin" />Cargando diagnósticos…</p> : !results.items?.length ? <div className="diagnostic-empty"><Activity size={28} /><p>Aún no hay diagnósticos en este origen.</p><span>Ejecuta un flujo que incluya el clasificador, solo o acompañado de otros filtros.</span></div> : <div className="diagnostic-results">{results.items.map((item, index) => <article key={item.diagnosis_id || item.diagnostic_id || item.result_id || `${item.entity_id}:${item.timestamp}:${index}`} className="diagnostic-result"><div className="diagnostic-result-heading"><div><span className="diagnostic-eyebrow">{item.predicted_label === "environmental_anomaly" ? "Anomalía ambiental" : item.predicted_label === "sensor_fault" ? "Falla de sensor detectada" : item.predicted_label === "normal" ? "Normal" : RESULT_LABELS[item.status] || item.status}</span><h4>{item.predicted_label ? diagnosticLabel(item.predicted_label) : item.fault_type ? diagnosticLabel(item.fault_type) : item.status === "no_fault_evidence" ? "Sin patrón de falla concluyente" : "Tipo indeterminado"}</h4><p>{item.entity_id}</p></div>{Number.isFinite(item.confidence) && <div className="diagnostic-compatibility"><span>Confianza de clase</span><strong>{item.confidence.toFixed(2)}</strong><small>{item.confidence_kind === "uncalibrated_softmax" ? "Softmax no calibrado" : "Índice, no probabilidad"}</small></div>}{!Number.isFinite(item.confidence) && Number.isFinite(item.compatibility) && <div className="diagnostic-compatibility"><span>Compatibilidad</span><strong>{item.compatibility.toFixed(2)}</strong><small>Índice, no probabilidad</small></div>}</div><small>{time(item.timestamp)} · modelo {item.model_version || `Catálogo ${item.catalog_version || "—"}`}{item.preprocessor_version && ` · preprocesador ${item.preprocessor_version}`}{item.graph_version && ` · grafo ${item.graph_version}`}</small>{item.input_coverage?.scales ? <div className="diagnostic-tags">{item.input_coverage.scales.map((scale) => <span key={scale.horizon_seconds}>{scale.horizon_seconds / 3600} h · {scale.usable ? "Utilizable" : "Contexto insuficiente"} · estado conocido {metric(scale.known_fraction)}</span>)}</div> : <>{item.input_coverage && <small>Cobertura de datos válidos: {number(item.input_coverage.valid_value_steps)} de {number(item.input_coverage.required_steps)} pasos ({metric(item.input_coverage.valid_value_coverage)}) · vecinos: {number(item.input_coverage.neighbor_ids?.length)}</small>}</>}{item.input_provenance?.length > 0 && <details><summary>Procedencia de las lecturas de entrada</summary><ValuesTable values={{ input_provenance: item.input_provenance, source: item.source, run_id: item.run_id }} /></details>}{item.needs_review && <span className="diagnostic-badge diagnostic-exploratory">Evidencia pendiente de revisión</span>}{item.method === "gat_lstm" && <span className="diagnostic-badge">Tipo de falla: {item.fault_type_status === "not_supported" ? "No disponible en este modelo" : item.fault_type_status === "identified" ? diagnosticLabel(item.fault_type) : item.fault_type_status === "unknown" ? "Tipo indeterminado por respaldo insuficiente" : "No aplicable"}</span>}{item.class_scores && <div className="diagnostic-tags">{Object.entries(item.class_scores).map(([label, score]) => <span key={label}>{diagnosticLabel(label)} <b>{metric(score)}</b></span>)}</div>}<ul className="diagnostic-reasons">{(item.reasons || []).map((reason, reasonIndex) => <li key={reasonIndex}>{typeof reason === "string" ? reasonLabel(reason) : JSON.stringify(reason)}</li>)}</ul><details><summary>Características y referencia utilizadas</summary><h5>Características disponibles al decidir</h5><ValuesTable values={item.features} /><h5>Referencia histórica</h5><ValuesTable values={item.reference} /></details></article>)}</div>}

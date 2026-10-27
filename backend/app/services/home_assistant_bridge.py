@@ -195,6 +195,14 @@ class HomeAssistantBridge:
         entity_ids = list(entity_ids)
         identifiers, queue = [], Queue(maxsize=5000)
         try:
+            states = self._wait(connection, connection.request("states", {}), stop_event=stop_event)
+            if not isinstance(states, list):
+                raise ValueError("Home Assistant no devolvió una lista de entidades válida.")
+            available = {state.get("entity_id") for state in states if isinstance(state, dict)}
+            # The caller supplies the CSV selection; HA only determines which of those it can publish.
+            entity_ids = [entity_id for entity_id in entity_ids if entity_id in available]
+            if not entity_ids:
+                raise ValueError("No hay entidades seleccionadas del historial disponibles en Home Assistant.")
             # Keep compatibility with integrations limiting each subscription to 1000 IDs.
             for index in range(0, len(entity_ids), 1000):
                 if stop_event.is_set():

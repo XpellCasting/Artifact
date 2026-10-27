@@ -33,7 +33,7 @@ class DiagnosticRepository:
             if existing:
                 snapshot = json.loads(existing[0])
                 if snapshot.get("model"):
-                    self._require_v2(snapshot["model"])
+                    self._require_supported(snapshot["model"])
                 return snapshot
             selected = model_id or self._active()
             trained = self._read("models", selected) if selected else None

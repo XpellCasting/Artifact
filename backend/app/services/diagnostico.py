@@ -263,7 +263,18 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
     @staticmethod
     def _model_summary(model):
-        return {key: value for key, value in model.items() if key not in {"model", "training_examples"}}
+        return {key: value for key, value in model.items() if key not in {
+            "model", "training_examples", "training_contexts", "training_sample_ids", "training_groups"}}
+
+    def import_model(self, archive):
+        if importlib.util.find_spec("torch") is None or importlib.util.find_spec("torch_geometric") is None:
+            raise ReviewError("Importar el modelo requiere PyTorch y PyTorch Geometric en la API.", 503)
+        from app.modulos.clasificador.transfer import import_model_zip
+        try:
+            with self.lock:
+                return import_model_zip(archive, self.directory)
+        except FileExistsError as exc:
+            raise ReviewError(str(exc), 409) from exc
 
     def status(self):
         active = self._active()

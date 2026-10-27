@@ -7,11 +7,14 @@ import io
 import json
 import math
 import os
+import pickle
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
+import zipfile
 
 import numpy as np
 
@@ -30,6 +33,9 @@ MAX_JSON_BYTES = 16 * 1024 ** 2
 MAX_FILE_BYTES = 128 * 1024 ** 3
 MAX_TOTAL_BYTES = 256 * 1024 ** 3
 MAX_FILES = 10000
+MAX_MODEL_ZIP_BYTES = 256 * 1024 ** 2
+MAX_MODEL_JSON_BYTES = 128 * 1024 ** 2
+MAX_MODEL_TOTAL_BYTES = 512 * 1024 ** 2
 PARTITIONS = ("train_fit", "dev_tune", "validation", "test", "reserve")
 
 
@@ -48,8 +54,8 @@ def _json_bytes(value):
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
 
 
-def _read_json(path):
-    if path.stat().st_size > MAX_JSON_BYTES:
+def _read_json(path, max_bytes=MAX_JSON_BYTES):
+    if path.stat().st_size > max_bytes:
         raise ValueError(f"JSON demasiado grande: {path.name}")
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -183,27 +189,30 @@ def _validate_dataset(dataset, sequence_dir, dataset_id):
     return preprocessor
 
 
-def _validate_model(directory, model_id, dataset, sequence_dir=None):
-    manifest = _read_json(directory / "models" / f"{model_id}.json")
+def _validate_model(directory, model_id, dataset=None, sequence_dir=None):
+    manifest = _read_json(directory / "models" / f"{model_id}.json", MAX_MODEL_JSON_BYTES)
     config = _config(manifest["config"])
     if (manifest.get("model_id") != model_id or manifest.get("method") != "gat_lstm"
             or manifest.get("schema_version") != config.schema_version
             or manifest.get("architecture_version") != config.architecture_version
-            or manifest.get("dataset_id") != dataset["dataset_id"]
-            or manifest.get("weights_file") != f"{model_id}.pt"
-            or manifest.get("source_hashes") != dataset.get("source_hashes")):
-        raise ValueError("Manifiesto de modelo incompatible con el dataset")
-    built = _config(dataset["config"])
-    for key in ("grid_seconds", "sequence_steps", "feature_window_seconds", "graph_top_k", "max_nodes",
-                "use_entropy", "use_dtw", "architecture_version", "local_timezone", "entity_value_modes", "active_scales"):
-        if getattr(config, key) != getattr(built, key):
-            raise ValueError(f"Configuración de modelo incompatible: {key}")
+            or manifest.get("weights_file") != f"{model_id}.pt"):
+        raise ValueError("Manifiesto de modelo incompatible")
+    if dataset is not None:
+        if (manifest.get("dataset_id") != dataset["dataset_id"]
+                or manifest.get("source_hashes") != dataset.get("source_hashes")):
+            raise ValueError("Manifiesto de modelo incompatible con el dataset")
+        built = _config(dataset["config"])
+        for key in ("grid_seconds", "sequence_steps", "feature_window_seconds", "graph_top_k", "max_nodes",
+                    "use_entropy", "use_dtw", "architecture_version", "local_timezone", "entity_value_modes", "active_scales"):
+            if getattr(config, key) != getattr(built, key):
+                raise ValueError(f"Configuración de modelo incompatible: {key}")
     prep = _read_json(directory / "preprocessors" / f"{model_id}.json")
     graph = _read_json(directory / "graphs" / f"{model_id}.json")
     entities = _contract(prep, graph, config)
-    sequence_dir = sequence_dir if sequence_dir is not None else directory / "sequences" / dataset["dataset_id"]
-    if prep != _read_json(sequence_dir / "preprocessor.json"):
-        raise ValueError("El preprocesador del modelo no pertenece al dataset")
+    if dataset is not None:
+        sequence_dir = sequence_dir if sequence_dir is not None else directory / "sequences" / dataset["dataset_id"]
+        if prep != _read_json(sequence_dir / "preprocessor.json"):
+            raise ValueError("El preprocesador del modelo no pertenece al dataset")
     if manifest.get("graph_version") != graph["graph_version"]:
         raise ValueError("Firma del modelo y del grafo incompatible")
     policy = manifest.get("rejection_policy", {})
@@ -222,6 +231,7 @@ def _validate_model(directory, model_id, dataset, sequence_dir=None):
     expected_kinds = torch.tensor([KIND_TO_ID[prep["entities"][key]["kind"]] for key in entities])
     if not torch.equal(model.kind_ids, expected_kinds):
         raise ValueError("Tipos de entidades incompatibles con los pesos")
+    return manifest
 
 
 def export_bundle(dataset_id, output, *, model_id=None, review_dir=None):
@@ -436,3 +446,113 @@ def import_bundle(archive, *, review_dir=None):
             raise
     return {"dataset_id": dataset_id, "model_id": model_id, "imported_files": len(planned),
             "existing_files": len(existing), "activated": False}
+
+
+def _unpack_model_zip(archive, stage):
+    """Acepta un único modelo completo en las cuatro carpetas de inferencia."""
+    folders = {"models": ".json", "weights": ".pt", "graphs": ".json", "preprocessors": ".json"}
+    with zipfile.ZipFile(archive) as source:
+        members = source.infolist()
+        if len(members) > 8:
+            raise ValueError("El ZIP debe contener un modelo y sus cuatro archivos.")
+        files, seen, identifiers, total = {}, set(), set(), 0
+        for member in members:
+            name = member.filename
+            path = _safe_name(name[:-1] if member.is_dir() else name)
+            if path.as_posix() in seen:
+                raise ValueError("Rutas duplicadas en el ZIP.")
+            seen.add(path.as_posix())
+            kind = stat.S_IFMT(member.external_attr >> 16)
+            if member.flag_bits & 1 or kind not in (0, stat.S_IFDIR if member.is_dir() else stat.S_IFREG):
+                raise ValueError("El ZIP contiene enlaces o archivos cifrados no admitidos.")
+            if member.is_dir():
+                if len(path.parts) != 1 or path.name not in folders:
+                    raise ValueError(f"Carpeta no permitida en el ZIP: {name}")
+                continue
+            if (len(path.parts) != 2 or path.parts[0] not in folders
+                    or path.suffix != folders[path.parts[0]]):
+                raise ValueError(f"Artefacto no permitido en el ZIP: {name}")
+            identifiers.add(_identifier(path.stem))
+            if member.file_size > MAX_MODEL_JSON_BYTES:
+                raise ValueError(f"Archivo demasiado grande: {name}")
+            total += member.file_size
+            files[name] = member
+        if total > MAX_MODEL_TOTAL_BYTES:
+            raise ValueError("El contenido del ZIP supera el tamaño permitido.")
+        if len(identifiers) != 1:
+            raise ValueError("El ZIP debe contener exactamente un modelo.")
+        identifier = identifiers.pop()
+        expected = {f"{folder}/{identifier}{suffix}" for folder, suffix in folders.items()}
+        if set(files) != expected:
+            raise ValueError("Faltan archivos: incluye models, weights, graphs y preprocessors con el mismo ID.")
+        for name, member in files.items():
+            target = stage / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            with source.open(member) as reader, target.open("xb") as writer:
+                while block := reader.read(min(COPY_BYTES, member.file_size - copied + 1)):
+                    copied += len(block)
+                    if copied > member.file_size:
+                        raise ValueError(f"Tamaño ZIP incompatible: {name}")
+                    writer.write(block)
+            if copied != member.file_size:
+                raise ValueError(f"Archivo ZIP incompleto: {name}")
+    return identifier, sorted(expected, key=lambda name: (name.startswith("models/"), name))
+
+
+def import_model_zip(archive, directory):
+    """Importa artefactos de inferencia sin requerir históricos ni secuencias."""
+    archive, directory = Path(archive), Path(directory)
+    if archive.stat().st_size > MAX_MODEL_ZIP_BYTES:
+        raise ValueError("El ZIP supera el límite de 256 MiB.")
+    with tempfile.TemporaryDirectory(prefix="gat-model-import-") as temporary:
+        stage = Path(temporary)
+        try:
+            identifier, names = _unpack_model_zip(archive, stage)
+        except (zipfile.BadZipFile, NotImplementedError, RuntimeError) as exc:
+            raise ValueError("ZIP inválido, corrupto o con compresión no admitida.") from exc
+        try:
+            manifest = _validate_model(stage, identifier)
+            if not isinstance(manifest.get("created_at"), str) or not manifest["created_at"]:
+                raise ValueError("Falta la fecha created_at del modelo.")
+            prep = _read_json(stage / "preprocessors" / f"{identifier}.json")
+            if "entity_ids" in manifest and manifest["entity_ids"] != prep["entity_ids"]:
+                raise ValueError("Las entidades del modelo y del preprocesador no coinciden.")
+        except (KeyError, TypeError, AttributeError, RuntimeError, EOFError, pickle.UnpicklingError) as exc:
+            raise ValueError("Metadatos o pesos incompatibles con el clasificador.") from exc
+
+        planned, existing = [], 0
+        for name in names:
+            source, target = stage / name, artifact_file(directory, name)
+            _regular_target(target)
+            if target.exists():
+                if not target.is_file() or _digest(target) != _digest(source):
+                    raise FileExistsError(f"Ya existe un archivo diferente para este modelo: {name}")
+                existing += 1
+            else:
+                planned.append((source, target))
+        created = []
+        try:
+            # El manifiesto se publica al final, cuando sus dependencias ya existen.
+            for source, target in planned:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(prefix=".gat-model-import-", dir=target.parent, delete=False) as writer:
+                    staged_target = Path(writer.name)
+                    try:
+                        with source.open("rb") as reader:
+                            shutil.copyfileobj(reader, writer, length=COPY_BYTES)
+                    except BaseException:
+                        writer.close()
+                        staged_target.unlink(missing_ok=True)
+                        raise
+                try:
+                    _publish(staged_target, target)
+                    created.append(target)
+                finally:
+                    staged_target.unlink(missing_ok=True)
+        except BaseException:
+            for target in reversed(created):
+                target.unlink(missing_ok=True)
+            raise
+    return {"model_id": identifier, "imported_files": len(planned), "existing_files": existing,
+            "activated": False}
