@@ -120,9 +120,13 @@ def partition_bounds(manifest: dict) -> dict[str, tuple[datetime, datetime | Non
     boundaries = [parse_utc(value) for value in manifest["boundaries"]]
     if boundaries != sorted(boundaries) or len(boundaries) != 4:
         raise ValueError("Límites de partición inválidos")
+    fit_end = (parse_utc(manifest["train_fit_end"]) if manifest.get("train_fit_end")
+               else boundaries[0] + (boundaries[1] - boundaries[0]) * .8)
+    if not boundaries[0] < fit_end < boundaries[1]:
+        raise ValueError("train_fit_end debe quedar dentro de Desarrollo")
     return {
-        "train_fit": (boundaries[0], boundaries[0] + (boundaries[1] - boundaries[0]) * .8),
-        "dev_tune": (boundaries[0] + (boundaries[1] - boundaries[0]) * .8, boundaries[1]),
+        "train_fit": (boundaries[0], fit_end),
+        "dev_tune": (fit_end, boundaries[1]),
         "validation": (boundaries[1], boundaries[2]),
         "test": (boundaries[2], boundaries[3]),
         "reserve": (boundaries[3], None),

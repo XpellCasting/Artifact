@@ -20,7 +20,9 @@ import torch
 from torch.nn import functional as F
 
 from app.modulos.clasificador import LABELS
+from app.modulos.clasificador.balancing import EpisodeBalance, fault_supervision
 from app.modulos.clasificador.evaluation import choose_rejection_policy
+from app.modulos.clasificador.evaluation import metrics as classification_metrics
 from app.modulos.clasificador.storage import iter_partition_batches
 from app.modulos.clasificador.storage import sample_summaries
 from app.modulos.clasificador.checkpoints import (TrainingRun, cpu_state, provenance,
@@ -36,7 +38,7 @@ def resolve_device(requested):
     if not isinstance(requested, str) or not re.fullmatch(r"cuda(?::[0-9]+)?", requested):
         raise ValueError("Dispositivo inválido; usa auto, cpu, cuda o cuda:N")
     if not torch.cuda.is_available():
-        raise ValueError("CUDA no está disponible en PyTorch. Revisa el controlador NVIDIA y la instalación de PyTorch con CUDA; ejecuta scripts/gat_lstm_check.py --device cuda")
+        raise ValueError("CUDA no está disponible en PyTorch. Para AMD/WSL instala PyTorch con ROCm y comprueba torch.version.hip; para NVIDIA revisa el controlador y PyTorch CUDA. Ejecuta scripts/gat_lstm_check.py --device cuda")
     index = int(requested.split(":")[1]) if ":" in requested else torch.cuda.current_device()
     if index >= torch.cuda.device_count():
         raise ValueError(f"GPU cuda:{index} inexistente; hay {torch.cuda.device_count()} dispositivos CUDA")
@@ -80,31 +82,33 @@ def _batches(samples, groups, batch_size):
             yield [samples[index] for index in indices], monotonic() - started
 
 
-def masked_classification_loss(logits, y, mask, class_weights=None, episode_weights=None):
+def masked_classification_loss(logits, y, mask, class_weights=None, episode_weights=None,
+                               *, normalizer=None):
     if not mask.any():
         return None
     safe_targets = y.clamp(min=0)
     loss = F.cross_entropy(logits.reshape(-1, 3), safe_targets.reshape(-1),
                            weight=class_weights, reduction="none").view_as(y)
     if episode_weights is not None:
-        loss = loss * episode_weights.view(-1, 1)
-    return loss[mask].sum() / ((episode_weights.view(-1, 1).expand_as(y)[mask].sum())
+        episode_grid=episode_weights.view(-1,1) if episode_weights.ndim==1 else episode_weights
+        loss = loss * episode_grid
+    if normalizer is not None:
+        if not math.isfinite(normalizer) or normalizer <= 0:
+            raise ValueError("Normalizador de episodios inválido")
+        return loss[mask].sum() / (logits.shape[0] * normalizer)
+    return loss[mask].sum() / ((episode_grid.expand_as(y)[mask].sum())
                                if episode_weights is not None else mask.sum())
 
 
 def class_weights_from_episodes(samples, device="cpu"):
-    by_class = [set() for _ in range(3)]
-    for index, sample in enumerate(sample_summaries(samples)):
-        group = sample["metadata"].get("parent_episode_id", sample["metadata"].get("sample_id", str(index)))
-        for label, active in zip(sample["y"], sample["label_mask"]):
-            if active:
-                by_class[label].add(group)
-    counts = [len(items) for items in by_class]
-    if min(counts) == 0:
-        raise ValueError(f"insufficient_labels: episodios por clase {counts}")
-    weights = [min(5.0, max(counts) / value) for value in counts]
-    average = sum(weights) / 3
-    return torch.tensor([value / average for value in weights], dtype=torch.float32, device=device), counts
+    balance = EpisodeBalance(sample_summaries(samples))
+    return torch.tensor(balance.class_weights, dtype=torch.float32, device=device), balance.episode_support
+
+
+def checkpoint_rank(metrics, dev_loss):
+    recalls = [metrics["per_class"][label]["recall"] or 0.0 for label in LABELS]
+    return (metrics["macro_f1"] if metrics["macro_f1"] is not None else -1.0,
+            min(recalls), -dev_loss)
 
 
 def train_classifier(train_samples, dev_samples, config, category_sizes, entity_kinds,
@@ -143,8 +147,9 @@ def _train_trials(train_samples, dev_samples, config, entity_kinds, progress,
         candidate, scores = _train_segment_classifier(train_samples, dev_samples,
             replace(config, segment_threshold=threshold), entity_kinds, notify, notify_batch,
             run=run, trial=trial+1)
-        rank = (scores.get("dev_macro_f1") or 0., threshold)
-        trials.append({"threshold": threshold, "macro_f1": rank[0]})
+        rank = (*checkpoint_rank(scores["dev_metrics"], scores["best_dev_loss"]), threshold)
+        trials.append({"threshold": threshold, "macro_f1": rank[0],
+                       "min_class_recall": rank[1], "selected_epoch": scores["selected_epoch"]})
         if best is None or rank > best[0]:
             best = (rank, candidate, scores)
     _, model, scores = best
@@ -167,33 +172,30 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     device = resolve_device(config.device)
-    weights, support = class_weights_from_episodes(train_samples, device)
+    balance = EpisodeBalance(sample_summaries(train_samples))
+    weights = torch.tensor(balance.class_weights, dtype=torch.float32, device=device)
+    support = balance.episode_support
     _, dev_support = class_weights_from_episodes(dev_samples, device)
     feature_dim = len(train_samples[0]["X"][0][0])
     if len(entity_kinds) != len(train_samples[0]["X"][0]):
         raise ValueError("Tipos de sensor incompletos para GAT-LSTM por segmentos")
     from app.modulos.clasificador.network_segments import SegmentGATLSTM
     model = SegmentGATLSTM(feature_dim, entity_kinds, config).to(device)
-    episode_key = lambda meta, i: meta.get("parent_episode_id", meta.get("sample_id", str(i)))
-    episode_counts = Counter(episode_key(row["metadata"], i)
-                             for i, row in enumerate(sample_summaries(train_samples)))
     supervised_train = sum(sum(row["label_mask"]) for row in sample_summaries(train_samples))
     supervised_dev = sum(sum(row["label_mask"]) for row in sample_summaries(dev_samples))
-    type_episodes = {fault: set() for fault in FAULT_TYPES}
-    for index, summary in enumerate(sample_summaries(train_samples)):
-        metadata = summary["metadata"]
-        fault = metadata.get("fault_subtype")
-        if metadata.get("target_label") in (LABELS.index("sensor_fault"), "sensor_fault") and fault in type_episodes:
-            type_episodes[fault].add(episode_key(metadata, index))
-    type_support = {fault: len(groups) for fault, groups in type_episodes.items()}
+    def fault_summaries():
+        for summary in sample_summaries(train_samples):
+            supervision=fault_supervision([summary])
+            yield {"y":supervision["y"][0],"label_mask":supervision["label_mask"][0],"metadata":summary["metadata"]}
+    try:
+        type_balance=EpisodeBalance(fault_summaries(),FAULT_TYPES,require_all=False)
+    except ValueError as exc:
+        raise ValueError("insufficient_fault_types: Desarrollo no contiene fallas con tipo conocido") from exc
+    type_support = dict(zip(FAULT_TYPES,type_balance.episode_support))
     supported_types = [fault for fault in FAULT_TYPES if type_support[fault] > 0]
     if not supported_types:
         raise ValueError("insufficient_fault_types: Desarrollo no contiene fallas con tipo conocido")
-    type_weights = torch.tensor([
-        min(5.0, max(type_support.values()) / max(1, type_support[fault]))
-        if type_support[fault] else 0.0 for fault in FAULT_TYPES], dtype=torch.float32, device=device)
-    present_weights = type_weights[type_weights > 0]
-    type_weights = type_weights / present_weights.mean()
+    type_weights=torch.tensor(type_balance.class_weights,dtype=torch.float32,device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     train_batch_count = math.ceil(len(train_samples) / config.batch_size)
     dev_batch_count = math.ceil(len(dev_samples) / config.batch_size)
@@ -221,6 +223,7 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
             "epoch_data_wait_seconds": waiting})
 
     best, best_loss, stale, history = None, float("inf"), 0, []
+    best_rank, selected_epoch = (-1.0, -1.0, -float("inf")), None
     best_dev_records, best_type_records = [], []
     next_epoch = 0
     checkpoint = run.load(trial) if run is not None else None
@@ -231,6 +234,7 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         best, best_loss, stale = checkpoint["best_model"], checkpoint["best_loss"], checkpoint["stale"]
+        best_rank, selected_epoch = tuple(checkpoint["best_rank"]), checkpoint["selected_epoch"]
         history, runtime = checkpoint["history"], checkpoint["runtime"]
         best_dev_records, best_type_records = checkpoint["best_dev_records"], checkpoint["best_type_records"]
         restore_random_state(checkpoint["random_state"], device)
@@ -243,40 +247,32 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
         for batch_index, (batch, waited) in enumerate(_batches(train_samples, groups, config.batch_size)):
             epoch_waiting += waited; runtime["data_wait_seconds"] += waited
             x, states, present, y, mask, adjacency = _tensor_batch(batch, device)
-            metadata = batch["metadata"] if isinstance(batch, dict) else [row["metadata"] for row in batch]
-            fault_y = torch.full_like(y, -1)
-            fault_mask = torch.zeros_like(mask)
-            for row_index, meta in enumerate(metadata):
-                fault = meta.get("fault_subtype")
-                if meta.get("target_label") in (LABELS.index("sensor_fault"), "sensor_fault") and fault in FAULT_TYPES:
-                    node = meta.get("entity_ids", []).index(meta.get("next_entity", "")) if meta.get("next_entity") in meta.get("entity_ids", []) else None
-                    if node is None:
-                        active_nodes = torch.nonzero(mask[row_index], as_tuple=False).flatten()
-                        node = int(active_nodes[0]) if len(active_nodes) else None
-                    if node is not None:
-                        fault_y[row_index, node] = FAULT_TYPES.index(fault)
-                        fault_mask[row_index, node] = True
+            fault_targets=fault_supervision(batch)
+            fault_y=torch.as_tensor(fault_targets["y"],device=device)
+            fault_mask=torch.as_tensor(fault_targets["label_mask"],device=device)
             if not mask.any():
                 report_batch(epoch, "train", batch_index + 1, epoch_started, epoch_waiting)
                 continue
             kind_ids = model.kind_ids.to(device)
             logits, type_logits = model(x, states, adjacency, present, kind_ids)
-            episode = _episode_weights(batch, device, episode_counts)
-            class_loss = masked_classification_loss(logits, y, mask, weights, episode)
+            target_episode_weights = torch.as_tensor(balance.target_weights(batch), device=device)
+            class_loss = masked_classification_loss(logits, y, mask, weights, target_episode_weights,
+                                                     normalizer=balance.normalizer)
             if fault_mask.any():
                 type_loss_all = F.cross_entropy(type_logits.reshape(-1, len(FAULT_TYPES)),
                     fault_y.clamp(min=0).reshape(-1), weight=type_weights, reduction="none").view_as(fault_y)
-                weighted_mask = fault_mask * episode.view(-1, 1)
-                type_loss = (type_loss_all * weighted_mask).sum() / weighted_mask.sum().clamp(min=1)
+                fault_episode_weights=torch.as_tensor(type_balance.target_weights(fault_targets),device=device)
+                weighted_mask=fault_mask*fault_episode_weights
+                type_loss=(type_loss_all*weighted_mask).sum()/(len(x)*type_balance.normalizer)
                 loss = class_loss + type_loss
-                type_total += type_loss.item(); type_count += 1
+                type_total += type_loss.item()*len(x); type_count += 1
             else:
                 loss = class_loss
             if not torch.isfinite(loss):
                 raise FloatingPointError("Pérdida compartida GAT-LSTM no finita")
             optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-            train_total += class_loss.item(); train_count += 1
+            train_total += class_loss.item() * len(x); train_count += len(x)
             report_batch(epoch, "train", batch_index + 1, epoch_started, epoch_waiting)
         if not train_count:
             raise ValueError("insufficient_labels: época sin objetivos")
@@ -323,15 +319,21 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
         if not dev_count:
             raise ValueError("insufficient_labels: dev_tune vacío")
         dev_loss = dev_total / dev_count
+        policy = choose_rejection_policy(dev_records)
+        dev_metrics = classification_metrics(dev_records, policy["threshold"], policy["margin"])
+        rank = checkpoint_rank(dev_metrics, dev_loss)
         duration = monotonic() - epoch_started
         row = {"epoch": epoch + 1, "train_loss": train_total / train_count,
-               "dev_loss": dev_loss, "train_type_loss": type_total / type_count if type_count else None,
+               "dev_loss": dev_loss, "train_type_loss": type_total / train_count if type_count else None,
                "supervised_train": supervised_train, "supervised_dev": supervised_dev,
+               "dev_macro_f1": dev_metrics["macro_f1"],
+               "dev_recall_by_class": {label: dev_metrics["per_class"][label]["recall"] for label in LABELS},
                "duration_seconds": duration, "data_wait_seconds": epoch_waiting}
         history.append(row); runtime["epoch_durations_seconds"].append(duration)
         runtime["batches_per_second"].append(batches_per_epoch / max(duration, 1e-9))
-        if dev_loss < best_loss:
+        if rank > best_rank:
             best_loss, best, stale = dev_loss, cpu_state(model.state_dict()), 0
+            best_rank, selected_epoch = rank, epoch + 1
             best_dev_records, best_type_records = deepcopy(dev_records), deepcopy(type_records)
         else:
             stale += 1
@@ -339,6 +341,7 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
             run.save(trial, {"next_epoch": epoch + 1, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "best_model": best, "best_loss": best_loss,
                 "stale": stale, "history": history, "runtime": runtime,
+                "best_rank": best_rank, "selected_epoch": selected_epoch,
                 "best_dev_records": best_dev_records, "best_type_records": best_type_records,
                 "random_state": random_state(device), "max_epochs": config.max_epochs})
         if progress: progress(row)
@@ -354,10 +357,14 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
     type_validation_recall = {fault: (sum(max(range(len(row["scores"])), key=row["scores"].__getitem__) == index
         for row in best_type_records if row["true_type"] == index) / type_validation_support[fault]
         if type_validation_support[fault] else None) for index, fault in enumerate(FAULT_TYPES)}
-    from app.modulos.clasificador.evaluation import metrics as classification_metrics
     rejection = choose_rejection_policy(best_dev_records)
+    selected_metrics = classification_metrics(best_dev_records, rejection["threshold"], rejection["margin"])
     return model, {"history": history, "best_dev_loss": best_loss,
-        "dev_macro_f1": classification_metrics(best_dev_records, rejection["threshold"], rejection["margin"])["macro_f1"],
+        "dev_macro_f1": selected_metrics["macro_f1"], "dev_metrics": selected_metrics,
+        "balancing": balance.report(), "fault_type_balancing":type_balance.report(), "selected_epoch": selected_epoch,
+        "checkpoint_selection": {"primary": "dev_macro_f1", "tie_breakers": ["min_class_recall", "dev_loss"]},
+        "quality_warnings": [f"zero_dev_recall:{label}" for label in LABELS
+                             if not selected_metrics["per_class"][label]["recall"]],
         "dev_metrics_by_source": {source: classification_metrics(
             [row for row in best_dev_records if row.get("source_id", "unspecified") == source],
             rejection["threshold"], rejection["margin"])
@@ -372,6 +379,8 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
             "recall_by_type": type_validation_recall},
         "runtime": runtime,
         "runtime_parameters": {"device": str(device), "requested_device": config.device,
+            "backend": "rocm" if device.type=="cuda" and torch.version.hip else device.type,
+            "hip_version": torch.version.hip,
             "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
             "cuda_runtime": torch.version.cuda, "batch_size": config.batch_size,
             "omp_num_threads": setting('OMP_NUM_THREADS'),

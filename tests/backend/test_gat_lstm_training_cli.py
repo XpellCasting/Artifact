@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import torch
@@ -71,3 +72,13 @@ class StandaloneWorkflowTests(unittest.TestCase):
         loaded, _, _, manifest = load_candidate(candidate["model_id"], fixture.directory)
         self.assertEqual(next(loaded.parameters()).device.type, "cpu")
         self.assertEqual(manifest["metrics"]["rejection_policy"], candidate["metrics"]["rejection_policy"])
+        export_spec=importlib.util.spec_from_file_location("candidate_zip_cli",
+            Path(__file__).resolve().parents[2]/"scripts/gat_lstm_export_candidate.py")
+        exporter=importlib.util.module_from_spec(export_spec);export_spec.loader.exec_module(exporter)
+        model_zip=fixture.root/"candidate.zip"
+        exporter.export_candidate(candidate["model_id"],fixture.target,model_zip)
+        with zipfile.ZipFile(model_zip) as archive:
+            self.assertEqual(len(archive.namelist()),4)
+            self.assertFalse(any("sequences" in name for name in archive.namelist()))
+            saved=json.loads(archive.read(f"models/{candidate['model_id']}.json"))
+            self.assertEqual(saved["metrics"]["balancing"]["version"],"equal_class_episode_v1")

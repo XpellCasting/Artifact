@@ -518,6 +518,9 @@ class DiagnosticWorkbench(DiagnosticRepository):
         dataset = self._read("datasets", dataset_id)
         if dataset.get("method") != "gat_lstm":
             raise ReviewError("El conjunto seleccionado no fue preparado para GAT-LSTM.")
+        if dataset.get("coverage_requirements",{}).get("all_fault_types_in_train_fit"):
+            from app.modulos.clasificador.training_coverage import require_training_coverage
+            require_training_coverage(dataset)
         config = GATConfig(**(gat_config or dataset["config"]))
         if config.architecture_version == "gat_lstm_v3_segments_multiscale" and importlib.util.find_spec("torch_geometric") is None:
             raise ReviewError("GAT-LSTM por segmentos no está disponible: falta PyTorch Geometric.", 503)
