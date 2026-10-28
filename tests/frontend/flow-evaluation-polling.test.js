@@ -137,7 +137,7 @@ test("completed discovery fetches the saved snapshot only once while continuing 
     const requests = [], completed = [];
     globalThis.fetch = async (url) => {
       requests.push(url);
-      return { ok: true, json: async () => url.endsWith("/done")
+      return { ok: true, json: async () => url.endsWith("/done?compact=true")
         ? { job_id: "done", status: "completed", run: { run_id: "saved", snapshot: { flow: { name: "Shared" } } } }
         : { job: { job_id: "done", status: "completed", run_id: "saved" }, latest_run_id: "saved" } };
     };
@@ -152,7 +152,7 @@ test("completed discovery fetches the saved snapshot only once while continuing 
     await React.act(async () => context.mock.timers.tick(1500));
     assert.equal(completed.length, 1);
     assert.equal(completed[0].run.snapshot.flow.name, "Shared");
-    assert.equal(requests.filter((url) => url === "/api/flow-evaluations/done").length, 1);
+    assert.equal(requests.filter((url) => url === "/api/flow-evaluations/done?compact=true").length, 1);
     assert.equal(requests.filter((url) => url === "/api/flow-evaluations").length, 3);
   } finally {
     if (view) await view.close();

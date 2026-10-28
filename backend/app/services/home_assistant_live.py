@@ -1,24 +1,20 @@
 """Receive state changes, keeping a bounded queue and chronological batches."""
 from __future__ import annotations
 
-import asyncio
-import json
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
-from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 
 from app.services.estados_validos import valid_state
 from app.services.historial.cargar_historial import ESTADOS_ACTIVOS
-from app.services.home_assistant_history import validate_connection
 
 
 class HomeAssistantEventSource:
-    def __init__(self, url, token, entities, development_end, entity_ids=(), bridge=None):
+    def __init__(self, entities, development_end, entity_ids=(), *, bridge):
+        bridge.require_connected()
         self.bridge = bridge
-        self.url, self._token = validate_connection(url, token) if bridge is None else ("", "")
         self.entities = {str(row["entity_id"]): dict(row) for row in entities.to_dict("records")
                          if row.get("sensor_kind") in {"continuous", "binary", "multistate"}}
         selected = set(entity_ids) or set(self.entities)
@@ -90,46 +86,12 @@ class HomeAssistantEventSource:
             self.last_seen[entity_id] = at
             self.stats.update(received=self.sequence, last_event_at=at.isoformat())
 
-    async def _listen(self):
-        from websockets.asyncio.client import connect
-        parsed = urlsplit(self.url)
-        ws_url = urlunsplit(("wss" if parsed.scheme == "https" else "ws", parsed.netloc,
-                            f"{parsed.path}/api/websocket", "", ""))
-        # Redirects are not permitted: the token belongs only to the selected host.
-        class DirectConnection(connect):
-            def process_redirect(self, exc):
-                return exc
-        async with DirectConnection(ws_url, open_timeout=15, close_timeout=2, proxy=None,
-                                    max_size=2 ** 20) as socket:
-            async def receive():
-                return json.loads(await asyncio.wait_for(socket.recv(), timeout=15))
-            if (await receive()).get("type") != "auth_required":
-                raise ValueError("La URL no corresponde a la API WebSocket de Home Assistant.")
-            await socket.send(json.dumps({"type": "auth", "access_token": self._token}))
-            if (await receive()).get("type") != "auth_ok":
-                raise ValueError("Home Assistant rechazó el token. Revisa su vigencia y permisos.")
-            await socket.send(json.dumps({"id": 1, "type": "subscribe_events", "event_type": "state_changed"}))
-            acknowledgement = await receive()
-            if acknowledgement.get("type") != "result" or not acknowledgement.get("success"):
-                raise ValueError("Home Assistant no permitió suscribirse a los cambios de estado.")
-            self._connected()
-            while not self.stop_event.is_set():
-                try:
-                    message = json.loads(await asyncio.wait_for(socket.recv(), timeout=1))
-                except asyncio.TimeoutError:
-                    continue
-                if not self.stop_event.is_set():
-                    self.accept(message)
-
     def _receive(self):
         delay = 1
         try:
             while not self.stop_event.is_set():
                 try:
-                    if self.bridge is not None:
-                        self.bridge.listen(self.selected, self.accept, self.stop_event, on_connected=self._connected)
-                    else:
-                        asyncio.run(self._listen())
+                    self.bridge.listen(self.selected, self.accept, self.stop_event, on_connected=self._connected)
                     if not self.stop_event.is_set():
                         raise ConnectionError("Home Assistant closed the reception")
                 except Exception as exc:
@@ -147,7 +109,6 @@ class HomeAssistantEventSource:
                         break
                     delay = min(30, delay * 2)
         finally:
-            self._token = ""
             with self.lock:
                 self.stats.update(status="stopped", retry_seconds=None)
 

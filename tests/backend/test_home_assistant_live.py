@@ -1,19 +1,17 @@
 import asyncio
 from copy import deepcopy
-import json
 from pathlib import Path
 from queue import Queue
 import tempfile
 from threading import Event, Thread
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from app.database.flows import FlowStore
 from app.flow.evaluacion import CausalFlowRunner, FlowEvaluationJobs
 from app.services.home_assistant_live import HomeAssistantEventSource
-from app.services.home_assistant_history import resolve_connection
 
 
 def flow():
@@ -30,7 +28,7 @@ class LiveEventsTests(unittest.TestCase):
 
     def source(self, **changes):
         entities = changes.pop("entities", self.entities)
-        return HomeAssistantEventSource("http://ha.local:8123", "secret", entities, self.start, **changes)
+        return HomeAssistantEventSource(entities, self.start, bridge=changes.pop("bridge", Mock()), **changes)
 
     def message(self, at, state="on", entity="binary_sensor.door", old="off"):
         return {"type": "event", "event": {"event_type": "state_changed", "data": {
@@ -68,7 +66,7 @@ class LiveEventsTests(unittest.TestCase):
             {"entity_id": "media_player.tv", "sensor_kind": "multistate"},
         ])], ignore_index=True)
         original = entities.copy(deep=True)
-        source = self.source(entities=entities, bridge=object())
+        source = self.source(entities=entities, bridge=Mock())
         self.assertEqual(source.selected, set(entities["entity_id"]))
         self.assertEqual(set(source.entities), set(entities["entity_id"]))
         pd.testing.assert_frame_equal(entities, original)
@@ -77,12 +75,12 @@ class LiveEventsTests(unittest.TestCase):
         self.assertEqual(source.status()["received"], 1)
 
     def test_bridge_explicit_selection_keeps_only_selected_reference_entities(self):
-        source = self.source(entity_ids=["sensor.temperature"], bridge=object())
+        source = self.source(entity_ids=["sensor.temperature"], bridge=Mock())
         self.assertEqual(source.selected, {"sensor.temperature"})
         source.accept(self.message("2026-01-01T00:00:01Z"))
         self.assertEqual(source.status()["received"], 0)
         with self.assertRaisesRegex(ValueError, "historial de referencia"):
-            self.source(entity_ids=["sensor.outside_reference"], bridge=object())
+            self.source(entity_ids=["sensor.outside_reference"], bridge=Mock())
 
     def test_batches_sort_events_and_group_equal_timestamps(self):
         source = self.source()
@@ -115,46 +113,12 @@ class LiveEventsTests(unittest.TestCase):
         self.assertEqual(snapshot["source"]["rows"], 3)
         self.assertEqual(snapshot["source"]["fingerprint"], "live-session")
 
-    def test_websocket_authenticates_and_retries_without_discarding_received_events(self):
-        source = self.source()
-        messages = iter([{"type": "auth_required"}, {"type": "auth_ok"}, {"type": "result", "id": 1, "success": True},
-                         self.message("2026-01-01T00:00:01Z")])
-        sent = []
-        attempts = []
-        class Socket:
-            async def recv(self):
-                try:
-                    return json.dumps(next(messages))
-                except StopIteration:
-                    raise ConnectionError("private handshake data") from None
-            async def send(self, value):
-                sent.append(json.loads(value))
-        class Connection:
-            def __init__(self, uri, **kwargs):
-                self.uri = uri
-            async def __aenter__(self):
-                attempts.append(True)
-                if len(attempts) == 2:
-                    source.stop()
-                return Socket()
-            async def __aexit__(self, *args):
-                return False
-        with patch("websockets.asyncio.client.connect", Connection):
-            source._receive()
-        self.assertEqual(sent[0], {"type": "auth", "access_token": "secret"})
-        self.assertEqual(sent[1]["event_type"], "state_changed")
-        self.assertEqual(source.queue.qsize(), 1)
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(source.status()["interruptions"], 1)
-        self.assertEqual(source.status()["status"], "stopped")
-        self.assertNotIn("private", source.status()["last_error"])
-        self.assertEqual(source._token, "")
-
-    def test_server_token_cannot_be_reused_for_another_url(self):
-        with patch.dict("os.environ", {"HOME_ASSISTANT_URL": "http://ha.local", "HOME_ASSISTANT_TOKEN": "secret"}):
-            self.assertEqual(resolve_connection("", ""), ("http://ha.local", "secret"))
-            with self.assertRaises(ValueError):
-                resolve_connection("http://another.host", "")
+    def test_disconnected_integration_rejects_a_new_source(self):
+        bridge = Mock()
+        bridge.require_connected.side_effect = ValueError("La integración está desconectada.")
+        with self.assertRaisesRegex(ValueError, "desconectada"):
+            self.source(bridge=bridge)
+        bridge.listen.assert_not_called()
 
     def test_missing_classifier_model_blocks_start_with_an_actionable_notice(self):
         from app.services.diagnostico import DiagnosticWorkbench
@@ -213,6 +177,9 @@ class LiveEventsTests(unittest.TestCase):
         from app.services.diagnostico import DiagnosticWorkbench
         connected = Event()
         class Bridge:
+            def require_connected(self):
+                pass
+
             def listen(self, entities, accept, stop_event, on_connected):
                 on_connected()
                 connected.set()
@@ -258,6 +225,9 @@ class LiveEventsTests(unittest.TestCase):
         attempts = []
         message = self.message("2026-01-01T00:00:01Z")
         class Bridge:
+            def require_connected(self):
+                pass
+
             def listen(self, entities, accept, stop_event, on_connected):
                 attempts.append(True)
                 on_connected()
@@ -281,86 +251,18 @@ class LiveEventsTests(unittest.TestCase):
             source.stop()
             receiver.join(2)
         self.assertFalse(receiver.is_alive())
-        self.assertEqual(source._token, "")
         disconnected = self.source()
         retrying = Event()
         def fail():
             retrying.set()
             raise ConnectionError("private transport details")
-        with patch.object(disconnected, "_listen", side_effect=fail):
+        with patch.object(disconnected.bridge, "listen", side_effect=lambda *args, **kwargs: fail()):
             receiver = Thread(target=disconnected._receive)
             receiver.start()
             self.assertTrue(retrying.wait(2))
             disconnected.stop()
             receiver.join(2)
             self.assertFalse(receiver.is_alive())
-
-
-class LocalWebSocketTests(unittest.IsolatedAsyncioTestCase):
-    async def test_real_websocket_client_reconnects_and_receives_changes_until_stopped(self):
-        from websockets.asyncio.server import serve
-        entities = pd.DataFrame([{"entity_id": "binary_sensor.door", "sensor_kind": "binary"}])
-        attempts = []
-        async def server(socket):
-            attempts.append(True)
-            index = len(attempts)
-            await socket.send(json.dumps({"type": "auth_required"}))
-            self.assertEqual(json.loads(await socket.recv()), {"type": "auth", "access_token": "local-test-token"})
-            await socket.send(json.dumps({"type": "auth_ok"}))
-            self.assertEqual(json.loads(await socket.recv())["event_type"], "state_changed")
-            await socket.send(json.dumps({"type": "result", "id": 1, "success": True}))
-            await socket.send(json.dumps({"type": "event", "event": {"event_type": "state_changed", "data": {
-                "entity_id": "binary_sensor.door", "old_state": {"state": "off" if index == 1 else "on"},
-                "new_state": {"state": "on" if index == 1 else "off", "last_changed": f"2026-01-01T00:00:0{index}Z"}}}}))
-            if index == 1:
-                await socket.close()
-            else:
-                await socket.wait_closed()
-        async with serve(server, "127.0.0.1", 0) as listener:
-            port = listener.sockets[0].getsockname()[1]
-            source = HomeAssistantEventSource(f"http://127.0.0.1:{port}", "local-test-token", entities,
-                                               pd.Timestamp("2026-01-01T00:00:00Z"))
-            def consume():
-                groups = []
-                for item in source.batches():
-                    groups.append(item)
-                    if sum(len(batch) for _, batch in groups) >= 2:
-                        source.stop()
-                return groups
-            try:
-                batches = await asyncio.wait_for(asyncio.to_thread(consume), timeout=8)
-            finally:
-                source.stop()
-        self.assertEqual(sum(len(batch) for _, batch in batches), 2)
-        self.assertEqual(batches[0][1].iloc[0]["state"], "on")
-        self.assertEqual(source.status()["reconnections"], 1)
-        self.assertEqual(source.status()["status"], "stopped")
-        self.assertEqual(source._token, "")
-
-    async def test_authentication_failure_remains_visible_and_waits_for_manual_stop(self):
-        from websockets.asyncio.server import serve
-        async def server(socket):
-            await socket.send(json.dumps({"type": "auth_required"}))
-            await socket.recv()
-            await socket.send(json.dumps({"type": "auth_invalid"}))
-        async with serve(server, "127.0.0.1", 0) as listener:
-            source = HomeAssistantEventSource(f"http://127.0.0.1:{listener.sockets[0].getsockname()[1]}", "invalid-test-token",
-                pd.DataFrame([{"entity_id": "binary_sensor.door", "sensor_kind": "binary"}]), pd.Timestamp("2026-01-01T00:00:00Z"))
-            reception = asyncio.create_task(asyncio.to_thread(lambda: list(source.batches())))
-            try:
-                for _ in range(200):
-                    if source.status()["last_error"]:
-                        break
-                    await asyncio.sleep(.01)
-                self.assertFalse(reception.done())
-                self.assertEqual(source.status()["status"], "reconnecting")
-                self.assertIn("rechazó el token", source.status()["last_error"])
-            finally:
-                source.stop()
-            batches = await asyncio.wait_for(reception, timeout=3)
-        self.assertEqual(batches, [])
-        self.assertIsNone(source.error)
-        self.assertNotIn("invalid-test-token", json.dumps(source.status()))
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ test("segment models retain 72-hour context without requiring minute reports", (
   assert.equal(gatDataConfigCompatible({...DEFAULT_SEGMENT_CONFIG,local_timezone:"UTC"},{config:DEFAULT_SEGMENT_CONFIG}),false);
 });
 
-test("new templates explicitly opt into common evidence composition", () => {
-  for (const flow of templates()) for (const node of flow.nodes) assert.equal(node.config.evidence_policy,"combine_v1");
+test("new templates compose filter evidence and preserve logical gate results", () => {
+  for (const flow of templates()) for (const node of flow.nodes) {
+    assert.equal(node.config.evidence_policy, ["merge", "decision"].includes(node.type) ? "independent" : "combine_v1");
+  }
 });

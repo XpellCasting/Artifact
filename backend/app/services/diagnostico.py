@@ -121,8 +121,9 @@ class DiagnosticRunSession:
             self.references.setdefault(str(reference["entity_id"]), []).append((end, reference))
         for values in self.references.values(): values.sort(key=lambda item: item[0])
         self.events, self.event_heads, self.seen, self.pending = {}, {}, set(), []
-        self.sensor_profiles = ({item["entity_id"]: item for item in workbench._list("sensors")
-                                 if item.get("status") == "available"}
+        self.sensor_profiles = ({**workbench.sensor_profiles_for_run(self.snapshot["run_id"]),
+                                 **{item["entity_id"]: item for item in workbench._list("sensors")
+                                    if item.get("status") == "available"}}
                                 if (self.snapshot.get("model") or {}).get("method") == "gat_lstm" else {})
         self.last_flush = time.monotonic(); self.stats = {
             "snapshot_loads": 1, "event_rows": 0, "buffered_event_rows": 0,
@@ -130,6 +131,32 @@ class DiagnosticRunSession:
             "gat_candidates": 0, "gat_samples": 0, "gat_sample_rejections": 0,
             "gat_sample_ms": 0.0, "gat_inferences": 0, "gat_inference_ms": 0.0,
         }
+
+    def prepare_sensor_profiles(self, frame, before):
+        """Freeze calibration from the selected history before replay starts."""
+        if self.gat_snapshot is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+            return
+        from app.modulos.clasificador.profiles import build_sensor_profile
+        from app.modulos.clasificador.temporal import CausalInputError
+        _, prep, _, manifest = self.gat_snapshot
+        config = GATConfig(**manifest["config"])
+        known = set(prep["entity_ids"]) | set(self.sensor_profiles)
+        kinds = {info["kind"] for info in prep["entities"].values()}
+        time_column = "timestamp_dt" if "timestamp_dt" in frame else "timestamp" if "timestamp" in frame else "last_changed"
+        selected = frame[~frame["entity_id"].isin(known)].copy()
+        selected["_profile_time"] = pd.to_datetime(selected[time_column], utc=True, errors="coerce")
+        selected = selected[selected["_profile_time"] < before]
+        for entity, group in selected.groupby("entity_id", sort=False):
+            rows = [{"entity_id": str(entity), "timestamp": row["_profile_time"].isoformat(),
+                     "state": str(row.get("state", "")), "sensor_kind": row.get("sensor_kind")}
+                    for row in group.to_dict("records")]
+            try:
+                self.sensor_profiles[str(entity)] = build_sensor_profile(
+                    rows, str(entity), before, config, kinds)
+            except CausalInputError:
+                # The runtime reports why this entity cannot yet be evaluated.
+                continue
+        self.workbench.save_sensor_profiles_for_run(self.snapshot["run_id"], self.sensor_profiles)
 
     def add_events(self, frame, *, events_sorted=False):
         if not isinstance(frame, pd.DataFrame) or frame.empty: return
@@ -151,6 +178,7 @@ class DiagnosticRunSession:
             self.events.setdefault(entity, []).append((at, {
                 "entity_id": entity, "timestamp": at.isoformat(),
                 "state": str(row.get("state", "")), "source_row": source_row,
+                "sensor_kind": row.get("sensor_kind"),
                 "provenance": {"source": self.source, "run_id": self.run_id}}))
             self.stats["event_rows"] += 1
             self.stats["buffered_event_rows"] += 1
@@ -724,9 +752,10 @@ class DiagnosticWorkbench(DiagnosticRepository):
         preprocessor = gat_snapshot[1]
         entities = preprocessor["entity_ids"]
         sensor_profiles = (session.sensor_profiles if session is not None else
-                           {item["entity_id"]: item for item in self._list("sensors")
-                            if item.get("status") == "available"})
-        event_index = {}
+                           {**self.sensor_profiles_for_run(snapshot["run_id"]),
+                            **{item["entity_id"]: item for item in self._list("sensors")
+                               if item.get("status") == "available"}})
+        known_profile_ids = set(sensor_profiles)
         if session is not None:
             session.add_events(events)
             provider = session.events_between
@@ -746,6 +775,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
                             source_row = ordinal
                         values.append((row["_diag_time"], {"entity_id": str(entity),
                             "timestamp": row["_diag_time"].isoformat(), "state": str(row.get("state", "")),
+                            "sensor_kind": row.get("sensor_kind"),
                             "source_row": source_row, "provenance": {"source": source, "run_id": run_id}}))
                     rows_by_entity[str(entity)] = values
             def provider(start, end, requested):
@@ -758,13 +788,16 @@ class DiagnosticWorkbench(DiagnosticRepository):
                     right = bisect_right(values, end, key=lambda pair: pair[0])
                     found.extend(row for _, row in values[left:right])
                 return found
-        enriched, decisions = [], []
+        enriched, decisions = {}, []
         prediction_cache = {}
-        for context in contextual_results:
+        def context_order(pair):
+            at = pd.to_datetime(pair[1].get("timestamp"), utc=True, errors="coerce")
+            return (pd.isna(at), at.value if not pd.isna(at) else 0, pair[0])
+        for context_index, context in sorted(enumerate(contextual_results), key=context_order):
             item = deepcopy(context)
             if item.get("routing", {}).get("terminal"):
                 item.pop("diagnosis", None); item.pop("diagnosis_mode", None)
-                enriched.append(item)
+                enriched[context_index] = item
                 continue
             entity_id, timestamp = str(item.get("entity_id", "")), str(item.get("timestamp", ""))
             try:
@@ -772,9 +805,9 @@ class DiagnosticWorkbench(DiagnosticRepository):
                     session.stats["gat_candidates"] += 1
                 result = predict_at(gat_snapshot, provider, entity_id, timestamp, sensor_profiles,
                                     metrics=session.stats if session is not None else None,
-                                    prediction_cache=prediction_cache)
+                                    prediction_cache=prediction_cache, sensor_kind=item.get("sensor_kind"))
                 target_us, _ = parse_time(timestamp)
-                if source != "history" and trained.get("training_end"):
+                if source != "history" and entity_id in entities and trained.get("training_end"):
                     if target_us <= parse_time(trained["training_end"])[0]:
                         result.update(status="indeterminate", predicted_label=None, confidence=0.0,
                                       class_scores={}, needs_review=True,
@@ -798,7 +831,10 @@ class DiagnosticWorkbench(DiagnosticRepository):
                 ).encode()).hexdigest()[:32]
             item["diagnosis"] = result
             item["diagnosis_mode"] = "active_model"
-            enriched.append(item); decisions.append(result)
+            enriched[context_index] = item
+            decisions.append(result)
+        self.save_sensor_profiles_for_run(snapshot["run_id"], {
+            entity: profile for entity, profile in sensor_profiles.items() if entity not in known_profile_ids})
         if session is not None:
             session.queue(decisions)
         elif decisions:
@@ -806,7 +842,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
                 connection.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)",
                     [(r["diagnosis_id"], snapshot["run_id"], source, r["entity_id"], r["timestamp"], _canonical(r))
                      for r in decisions])
-        return enriched
+        return [enriched[index] for index in range(len(contextual_results))]
 
     def enrich_contextual(self, statistical_results, contextual_results, events=None, source="history", run_id="default", session=None):
         if session is not None and (session.source != source or session.run_id != run_id):

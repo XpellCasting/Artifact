@@ -80,14 +80,22 @@ HACS instala únicamente la integración.
    **Artifact-Alertas** también queda disponible en la barra lateral.
 
 Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
-La conexión permite elegir históricos y recibir eventos sin introducir un token
-de Home Assistant en Artifact. La consulta de históricos requiere Recorder activo.
+La integración es la única conexión de Artifact con Home Assistant para consultar
+sensores, importar históricos y recibir eventos en directo. No se introducen URL
+ni tokens de Home Assistant en Artifact. El puente conserva su token interno y
+la integración conserva la dirección del servidor Artifact. La consulta de
+históricos requiere Recorder activo. Solo se pueden iniciar consultas o sesiones
+cuando la conexión está **Conectada**; la interfaz también muestra **Comprobando
+conexión**, **Integración no configurada** y **Desconectada**.
 Las direcciones `localhost` de los ejemplos de instalación sirven para abrir
 Artifact desde el mismo equipo donde se ejecuta.
 
-HACS actualiza la integración. Para actualizar la aplicación, con el código
-actualizado ejecutar `docker compose up -d --build api web` desde el repositorio
-y recargar la integración y la página del navegador.
+Actualizar primero la integración mediante HACS a la versión 0.4.0 o posterior y
+recargarla. Después, con el código actualizado, ejecutar
+`docker compose up -d --build api web` desde el repositorio y recargar el navegador.
+Los históricos y vínculos guardados se conservan; no es necesario volver a
+emparejar. Una integración anterior todavía entrega el catálogo plano, con un
+aviso de que los metadatos de áreas no están disponibles.
 
 ### Alternativa: instalación local sin Docker
 
@@ -147,6 +155,45 @@ Git LFS. Si el arranque informa que el paquete está ausente o incompleto, ejecu
    evidencias de cada lectura. Los módulos estadístico, contextual y de análisis
    y etiquetado permiten explorar los resultados y revisar los datos.
 
+Los sensores de Home Assistant empiezan sin seleccionar. Las áreas con sensores
+compatibles aparecen en paneles inicialmente cerrados; **Sin área asignada** se
+muestra como una lista independiente. El área asignada a la entidad tiene
+prioridad sobre la de su dispositivo, siguiendo las
+[reglas de Home Assistant](https://www.home-assistant.io/docs/organizing/areas/).
+La búsqueda incluye nombre, `entity_id` y área, sin distinguir mayúsculas ni
+tildes, y se combina con los filtros de área, dominio, tipo y selección.
+Cada lista muestra 50 sensores por página. Las acciones de resultados y de un
+área afectan a todas las coincidencias, incluidas las otras páginas; **Activar
+todos** y **Desactivar todos** afectan al catálogo completo. Plegar paneles,
+buscar o cambiar de página conserva la selección. Desde 500 seleccionados se
+muestra una advertencia de coste de preparación. CSV conserva su selección
+inicial completa.
+
+Consultar sensores no descarga históricos ni prepara filtros. Al confirmar se
+importan únicamente los `entity_ids` elegidos, que forman una única referencia
+estadística y contextual, incluidas las relaciones entre áreas. Si se corta una
+sesión en directo ya iniciada, se reintenta la conexión hasta detenerla y guardar.
+
+El contrato de `POST /history/home-assistant/entities` recibe `start`, `end` y
+opcionalmente `entity_ids`, y devuelve `entities`, `entity_count`, `source` y
+`areas_available`. Con metadatos disponibles, cada entidad incluye `area_id` y
+`area_name` (ambos nulos cuando no tiene área); con metadatos desconocidos esos
+campos se omiten. El puente consulta los registros una sola vez y entrega el
+catálogo con la operación `entity_catalog` en bloques de hasta 500 entidades.
+`POST /history/home-assistant/prepare` y `/history/home-assistant/import/start`
+requieren `entity_ids` no vacíos. `POST /flows/{flow_id}/live/start` recibe solo
+`entity_ids` opcionales, limitados a la referencia activa. Estas solicitudes
+rechazan los campos antiguos `url`, `token` y `connection_mode` con HTTP 422.
+`GET /history/home-assistant/config` devuelve únicamente `bridge_configured` y
+`bridge_connected`. Docker Compose ya no utiliza variables de conexión directa
+a Home Assistant; el vínculo existente continúa en `storage/home_assistant_bridge.json`.
+
+Cada nombre identifica un flujo guardado. Si se intenta guardar otro flujo con
+el mismo nombre, se carga el existente sin crear otra copia ni reemplazar su
+diseño. Las mayúsculas y los espacios adicionales no crean nombres distintos.
+Si esto ocurre al iniciar una evaluación, revisar el flujo cargado y volver a
+iniciarla. Los nombres que ya estaban repetidos muestran el guardado más reciente.
+
 Los CSV de lecturas deben incluir `entity_id` (sensor), `state` (valor o estado)
 y `last_changed` (fecha y hora, preferiblemente con zona horaria). Los conjuntos
 etiquetados incluyen además `es_sintetica`, `tipo` y `tipo_falla`; sus etiquetas
@@ -169,14 +216,31 @@ cada lectura utiliza solo la información disponible hasta ese instante.
 | Estadístico FOCuS | Detecta desviaciones respecto del comportamiento histórico. Usa FOCuS sobre residuos en sensores continuos, FOCuS Bernoulli en binarios y reglas para sensores de varios estados. |
 | Contextual | Contrasta una lectura con sensores relacionados para comprobar si el contexto respalda o contradice su comportamiento. |
 | Clasificador | Usa el modelo GAT-LSTM preentrenado para distinguir comportamiento normal, anomalía ambiental y posible falla del sensor. Puede devolver un resultado indeterminado cuando la evidencia es insuficiente. |
-| Unión | Reúne las evidencias de distintas ramas y combina sus señales según el modo «cualquiera» (O) o «todas» (Y). |
-| Decisión | Compara la señal recibida con las seleccionadas en su configuración y permite dirigir las lecturas por distintas ramas. |
+| Unión | Aplica una función lógica a los resultados de una misma lectura: «cualquiera positiva» (O) o «todas positivas» (Y). Conserva las evidencias de cada filtro. |
+| Decisión | Evalúa si la señal recibida cumple la condición seleccionada. Devuelve positiva para verdadero y sin señal para falso; seleccionar solo «Sin señal» permite negar una señal evaluable (NO). |
 | Salida | Reúne los resultados finales y conserva el recorrido de evidencias de cada lectura. |
 
 Las señales son `positive` (señal positiva), `negative` (sin señal) y `unknown`
 (no evaluable). Las conexiones pueden dejar pasar todas o solo algunas de ellas.
 Una sospecha indica que conviene revisar la lectura; el diagnóstico expresa
 compatibilidad con un patrón de falla.
+
+Unión y Decisión conservan su resultado lógico aunque las evidencias diagnósticas
+discrepen. Una entrada ausente o no evaluable representa un valor desconocido:
+en O basta un verdadero; en Y basta un falso para resolver el resultado. Si no
+puede resolverse, la señal permanece no evaluable. Decisión conserva ese valor
+desconocido salvo que se seleccione explícitamente como condición verdadera.
+Las conexiones determinan qué resultados pasan a cada rama.
+
+Para comparar los tres filtros, las plantillas incluyen O, `A Y B Y C` y
+`(A O B) Y C`, donde A es Estadístico FOCuS, B es Contextual y C es Clasificador.
+Se pueden encadenar uniones y decisiones para construir otras fórmulas. En la
+Salida, el resultado lógico determina la detección usada en las métricas:
+falso produce «Sin alerta» y desconocido produce «Indeterminado». Un verdadero
+produce una sospecha o un diagnóstico respaldado por las evidencias. El análisis
+diagnóstico combinado se conserva por separado y no sustituye el valor lógico.
+Si después de una compuerta se ejecuta otro filtro, ese filtro calcula una nueva
+evaluación con la política de evidencias seleccionada.
 
 ## Añadir nuevos nodos
 

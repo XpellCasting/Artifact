@@ -66,9 +66,25 @@ class CsvFlowRequirementTests(unittest.TestCase):
         self.runtime.state.validation_replay_state = {}
         self.runtime.state.eventos_validacion_ordenados = None
         with patch.object(self.api_module, "HomeAssistantEventSource") as source:
-            response = self.client.post("/flows/flow/live/start", json={"connection_mode": "integration"})
+            response = self.client.post("/flows/flow/live/start", json={})
         self.assertEqual(response.status_code, 200)
         self.assertIs(self.runtime.flow_evaluation_jobs.start.call_args.kwargs["live_source"], source.return_value)
+
+    def test_live_rejects_legacy_fields_before_starting_a_job(self):
+        for field, value in (("url", "http://ha.local"), ("token", "secret"), ("connection_mode", "integration")):
+            response = self.client.post("/flows/flow/live/start", json={field: value})
+            self.assertEqual(response.status_code, 422, response.text)
+        self.runtime.flow_evaluation_jobs.start.assert_not_called()
+
+    def test_live_start_requires_the_link_before_creating_a_job(self):
+        for message in ("Integración no configurada", "La integración está desconectada"):
+            self.runtime.home_assistant_bridge.require_connected.side_effect = ValueError(message)
+            with patch.object(self.api_module, "HomeAssistantEventSource") as source:
+                response = self.client.post("/flows/flow/live/start", json={})
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn(message, response.json()["detail"])
+            source.assert_not_called()
+        self.runtime.flow_evaluation_jobs.start.assert_not_called()
 
 
 class RecoverFlowLabelsTests(unittest.TestCase):

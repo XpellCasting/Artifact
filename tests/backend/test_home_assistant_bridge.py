@@ -6,7 +6,7 @@ from threading import Event
 import unittest
 from unittest.mock import patch
 
-from app.services.home_assistant_bridge import HomeAssistantBridge, BridgeConnection, BridgeUnavailable
+from app.services.home_assistant_bridge import HomeAssistantBridge, BridgeConnection, BridgeUnavailable, BridgeOperationUnsupported
 
 
 class BridgeRegistrationTests(unittest.TestCase):
@@ -40,8 +40,51 @@ class BridgeRegistrationTests(unittest.TestCase):
                 bridge.history_transport("/history/period/2026-01-01T00%3A00%3A00%2B00%3A00?end_time=2026-01-02T00%3A00%3A00%2B00%3A00&filter_entity_id=sensor.a%2Csensor.b")
                 self.assertEqual(request.call_args.args, ("history", {"start": "2026-01-01T00:00:00+00:00", "end": "2026-01-02T00:00:00+00:00", "entity_ids": ["sensor.a", "sensor.b"]}))
 
+    def test_old_integration_falls_back_to_states_only_for_unsupported_operation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
+            rows = [{"entity_id": "sensor.a"}]
+            with patch.object(bridge, "request", side_effect=[BridgeOperationUnsupported("old integration"), rows]) as request:
+                self.assertEqual(bridge.entity_catalog(), {"entities": rows, "areas_available": False})
+                self.assertEqual([call.args[0] for call in request.call_args_list], ["entity_catalog", "states"])
+            with patch.object(bridge, "request", side_effect=BridgeUnavailable("disconnected")) as request:
+                with self.assertRaises(BridgeUnavailable):
+                    bridge.entity_catalog()
+                self.assertEqual(request.call_count, 1)
+
+    def test_missing_and_disconnected_link_have_distinct_notices(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
+            with self.assertRaisesRegex(BridgeUnavailable, "no configurada"):
+                bridge.require_connected()
+            bridge.register("integration", "x" * 32)
+            with self.assertRaisesRegex(BridgeUnavailable, "desconectada"):
+                bridge.require_connected()
+
 
 class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chunked_catalog_preserves_metadata_and_legacy_errors_are_identified(self):
+        class Socket:
+            async def send_json(self, message):
+                identifier = message["request_id"]
+                if message["operation"] == "entity_catalog":
+                    for index in range(10):
+                        connection.receive({"type": "result_chunk", "request_id": identifier, "items": [
+                            {"entity_id": f"sensor.entity_{index * 500 + offset}", "area_id": None, "area_name": None}
+                            for offset in range(500)]})
+                    connection.receive({"type": "result", "request_id": identifier, "success": True,
+                                        "data": {"areas_available": True}})
+                else:
+                    connection.receive({"type": "result", "request_id": identifier, "success": False,
+                                        "error": "La operación solicitada no está permitida."})
+        connection = BridgeConnection(Socket())
+        result = await connection.request("entity_catalog", {})
+        self.assertTrue(result["areas_available"])
+        self.assertEqual(len(result["entities"]), 5000)
+        self.assertEqual(result["entities"][-1]["entity_id"], "sensor.entity_4999")
+        with self.assertRaises(BridgeOperationUnsupported):
+            await connection.request("unknown", {})
+
     async def test_subscription_uses_only_reference_entities_published_by_home_assistant(self):
         selection = ["sensor.temperature", "light.csv_only", "media_player.csv_only"]
         requests = []
@@ -153,7 +196,7 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
             bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
             first_socket = Socket()
             first = first_socket.connection = await bridge.attach(first_socket)
-            source = HomeAssistantEventSource("", "", pd.DataFrame([
+            source = HomeAssistantEventSource(pd.DataFrame([
                 {"entity_id": "binary_sensor.door", "sensor_kind": "binary"}]),
                 pd.Timestamp("2026-01-01T00:00:00Z"), bridge=bridge)
             reception = asyncio.create_task(asyncio.to_thread(lambda: list(source.batches())))

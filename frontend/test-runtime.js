@@ -1,7 +1,6 @@
 import { createServer as createViteServer } from "vite";
 import { fileURLToPath } from "node:url";
 import React, { act } from "react";
-import { createRoot } from "react-dom/client";
 import { JSDOM } from "jsdom";
 export { default as React } from "react";
 export { renderToString, renderToStaticMarkup } from "react-dom/server";
@@ -22,6 +21,8 @@ export async function renderInteractive(Component, props) {
     Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
   }
   const container = dom.window.document.getElementById("test");
+  // React detects input event support when the client module first loads.
+  const { createRoot } = await import("react-dom/client");
   const root = createRoot(container);
   await act(async () => root.render(React.createElement(Component, props)));
   return {

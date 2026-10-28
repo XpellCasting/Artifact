@@ -32,7 +32,7 @@ export function useFlowEvaluationPolling({ apiBaseUrl, jobId, discover = false, 
           }
           if (state?.status === "completed" && !state.run && handledTerminal !== `${state.job_id}:${state.status}`) {
             // Large saved snapshots are fetched once, rather than on every discovery poll.
-            state = await request(apiBaseUrl, `/flow-evaluations/${state.job_id}`, { cache: "no-store" });
+            state = await request(apiBaseUrl, `/flow-evaluations/${state.job_id}?compact=true`, { cache: "no-store" });
           }
         } else state = payload;
       } catch (reason) {

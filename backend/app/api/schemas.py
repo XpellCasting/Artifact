@@ -1,4 +1,4 @@
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from typing import Any, Literal
 from app.modulos.estadistico.episodios import DEFAULT_QUIET_SECONDS
 from app.services.application_common import DEFAULT_SUSPICION_THRESHOLD, MIN_SUSPICION_THRESHOLD, MAX_SUSPICION_THRESHOLD
@@ -13,18 +13,12 @@ class AnalyzeRequest(BaseModel):
 
 class HomeAssistantHistoryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    url: str = Field(default="", max_length=2048)
-    token: SecretStr = Field(default=SecretStr(""), max_length=4096)
-    connection_mode: Literal["auto", "integration", "manual"] = "auto"
     start: AwareDatetime
     end: AwareDatetime
     entity_ids: list[str] = Field(default_factory=list, max_length=10000)
 
 class HomeAssistantLiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    url: str = Field(default="", max_length=2048)
-    token: SecretStr = Field(default=SecretStr(""), max_length=4096)
-    connection_mode: Literal["auto", "integration", "manual"] = "auto"
     entity_ids: list[str] = Field(default_factory=list, max_length=10000)
 
 class HistorySelectionRequest(BaseModel):

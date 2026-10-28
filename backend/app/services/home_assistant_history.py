@@ -2,64 +2,29 @@
 from __future__ import annotations
 
 import csv
-import json
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.parse import quote, urlencode
 
 
 SUPPORTED_DOMAINS = {"sensor", "binary_sensor", "switch", "input_boolean", "select", "input_select"}
 ENTITY_ID = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
 
 
-def resolve_connection(url: str, token: str) -> tuple[str, str]:
-    configured_url = os.environ.get("HOME_ASSISTANT_URL", "http://homeassistant.local:8123").strip().rstrip("/")
-    url = url.strip().rstrip("/") or configured_url
-    if not token and url != configured_url:
-        raise ValueError("Introduce un token para esta URL de Home Assistant.")
-    return url, token or os.environ.get("HOME_ASSISTANT_TOKEN", "")
-
-
-def validate_connection(url: str, token: str) -> tuple[str, str]:
-    url = url.strip().rstrip("/")
-    parsed = urlsplit(url)
-    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-            or parsed.username or parsed.password or parsed.query or parsed.fragment):
-        raise ValueError("Introduce una URL HTTP(S) de Home Assistant sin credenciales ni parámetros.")
-    try:
-        parsed.port
-    except ValueError as exc:
-        raise ValueError("El puerto de Home Assistant no es válido.") from exc
-    token = token.strip()
-    if not token or any(character.isspace() for character in token):
-        raise ValueError("Introduce un token de acceso de larga duración de Home Assistant.")
-    return url, token
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # A redirect must never forward the user's bearer token to another host.
-        return None
-
-
 @dataclass
 class HomeAssistantHistorySource:
-    url: str
-    token: str = field(repr=False)
     start: datetime
     end: datetime
     entity_ids: list[str] = field(default_factory=list)
     transport: Callable | None = field(default=None, repr=False)
+    catalog_transport: Callable | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.transport is None:
-            self.url, self.token = validate_connection(self.url, self.token)
+            raise ValueError("La integración de Home Assistant es necesaria para consultar el historial.")
         if self.start.tzinfo is None or self.end.tzinfo is None:
             raise ValueError("Las fechas deben incluir su zona horaria.")
         self.start = self.start.astimezone(timezone.utc)
@@ -74,38 +39,14 @@ class HomeAssistantHistorySource:
             raise ValueError("Selecciona entidades sensor, binary_sensor, switch, input_boolean, select o input_select válidas.")
 
     def _get(self, path: str):
-        if self.transport is not None:
-            return self.transport(path)
-        request = Request(f"{self.url}/api{path}", headers={
-            "Authorization": f"Bearer {self.token}", "Accept": "application/json",
-        })
-        try:
-            with build_opener(NoRedirect()).open(request, timeout=60) as response:
-                return json.load(response)
-        except HTTPError as exc:
-            if exc.code in {401, 403}:
-                raise ValueError("Home Assistant rechazó el token. Revisa su vigencia y permisos.") from None
-            if exc.code == 404:
-                raise ValueError("No se encontró la API de historial. Revisa la URL y la integración History de Home Assistant.") from None
-            raise ValueError(f"Home Assistant no pudo entregar el historial (HTTP {exc.code}).") from None
-        except (URLError, TimeoutError, OSError):
-            raise ValueError("No se pudo conectar con Home Assistant. Comprueba la URL y el acceso desde el servidor de Artifact.") from None
-        except (ValueError, UnicodeError):
-            raise ValueError("Home Assistant no devolvió una respuesta JSON válida.") from None
+        return self.transport(path)
 
     def export_csv(self, destination: Path, report: Callable[[str, float, str], None]) -> int:
         report("connecting_home_assistant", 1, "Conectando con Home Assistant")
         # Explicit IDs also allow importing entities that are no longer in /states.
         entity_ids = self.entity_ids
         if not entity_ids:
-            states = self._get("/states")
-            if not isinstance(states, list):
-                raise ValueError("Home Assistant no devolvió una lista de entidades válida.")
-            entity_ids = sorted({item["entity_id"] for item in states
-                                 if isinstance(item, dict) and ENTITY_ID.fullmatch(item.get("entity_id", ""))
-                                 and item["entity_id"].split(".", 1)[0] in SUPPORTED_DOMAINS})
-        if not entity_ids:
-            raise ValueError("No hay entidades compatibles para importar desde Home Assistant.")
+            raise ValueError("Activa al menos un sensor antes de importar el historial.")
         batches = [entity_ids[index:index + 50] for index in range(0, len(entity_ids), 50)]
         days = max(1, (self.end - self.start + timedelta(days=1) - timedelta(microseconds=1)).days)
         total_requests = days * len(batches)
@@ -163,10 +104,21 @@ class HomeAssistantHistorySource:
 
     def discover_entities(self):
         from app.services.tipos_entidad import infer_kind
-        states = self._get("/states")
+        metadata = self.catalog_transport() if self.catalog_transport else {"entities": self._get("/states")}
+        if not isinstance(metadata, dict):
+            raise ValueError("Home Assistant no devolvió un catálogo válido.")
+        states = metadata.get("entities")
         if not isinstance(states, list):
             raise ValueError("Home Assistant no devolvió una lista de entidades válida.")
         catalog = {}
+        areas_available = metadata.get("areas_available") is True
+        # A partial response cannot safely distinguish unknown and unassigned areas.
+        areas_available = areas_available and all(
+            not isinstance(item, dict) or "area_id" in item and "area_name" in item
+            and (item["area_id"] is None and item["area_name"] is None
+                 or isinstance(item["area_id"], str) and bool(item["area_id"])
+                 and isinstance(item["area_name"], str) and bool(item["area_name"]))
+            for item in states)
         for item in states:
             if not isinstance(item, dict):
                 continue
@@ -180,6 +132,9 @@ class HomeAssistantHistorySource:
                 "unit_of_measurement": attributes.get("unit_of_measurement", ""),
                 "sensor_kind": infer_kind(entity_id, [item.get("state", "")], domain=domain,
                     unit=attributes.get("unit_of_measurement", ""), device_class=attributes.get("device_class", ""))}
+            if areas_available:
+                catalog[entity_id].update(area_id=item["area_id"], area_name=item["area_name"])
         if not catalog:
             raise ValueError("No hay sensores compatibles para seleccionar en Home Assistant.")
-        return {"source": "home_assistant", "entities": [catalog[key] for key in sorted(catalog)], "entity_count": len(catalog)}
+        return {"source": "home_assistant", "entities": [catalog[key] for key in sorted(catalog)],
+                "entity_count": len(catalog), "areas_available": areas_available}

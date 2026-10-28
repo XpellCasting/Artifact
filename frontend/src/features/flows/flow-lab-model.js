@@ -8,6 +8,13 @@ export const fingerprint = (flow) => JSON.stringify(flowPayload(flow));
 export const labelNode = (node) => node?.config?.label || NODE_LABELS[node?.type] || node?.id || "Nodo";
 export const edgeLabel = (edge) => edge.when === undefined ? "Todas las señales" : edge.when.map((signal) => SIGNAL_LABELS[signal]).join(" · ");
 
+export function defaultNodeConfig(type) {
+  if (type === "statistical_focus") return { evidence_policy: "combine_v1", suspicion_threshold: .6, continuous_method: "residual_focus_v1", signal_policy: "detection_before_suppression" };
+  if (type === "merge") return { mode: "any", evidence_policy: "independent" };
+  if (type === "decision") return { accept: ["positive"], evidence_policy: "independent" };
+  return { evidence_policy: "combine_v1" };
+}
+
 export function nextNodeId(flow, type) {
   const usedIds = new Set(flow.nodes.map((node) => node.id));
   let suffix = 1;
@@ -63,7 +70,7 @@ export function removeNode(flow, id) {
 }
 
 export function templates() {
-  const make = (name, types, edges) => ({ name, nodes: types.map(([id, type, x, y]) => ({ id, type, position: { x, y }, config: type === "statistical_focus" ? { evidence_policy: "combine_v1", suspicion_threshold: .6, continuous_method: "residual_focus_v1", signal_policy: "detection_before_suppression" } : type === "merge" ? { mode: "any", evidence_policy: "combine_v1" } : type === "decision" ? { accept: ["positive"], evidence_policy: "combine_v1" } : { evidence_policy: "combine_v1" } })), edges: edges.map(([source, target, when]) => ({ id: `${source}-${target}`, source, target, ...(when ? { when } : {}) })) });
+  const make = (name, types, edges) => ({ name, nodes: types.map(([id, type, x, y]) => ({ id, type, position: { x, y }, config: defaultNodeConfig(type) })), edges: edges.map(([source, target, when]) => ({ id: `${source}-${target}`, source, target, ...(when ? { when } : {}) })) });
   const serial = (name, filters) => {
     const chain = ["input", ...filters, "output"];
     return make(name, chain.map((id, index) => [id, id, index * 260, 80]), chain.slice(1).map((id, index) => [chain[index], id]));
@@ -73,12 +80,19 @@ export function templates() {
     ["input", "statistical_focus"], ["statistical_focus", "contextual", ["positive", "unknown"]], ["statistical_focus", "output", ["negative"]],
     ["contextual", "classifier", ["positive", "unknown"]], ["contextual", "output", ["negative"]], ["classifier", "output"],
   ].map(([source, target, when]) => ({ id: `${source}-${target}`, source, target, ...(when ? { when } : {}) }));
+  const parallel = make("Tres filtros en paralelo", [["input", "input", 0, 180], ["statistical", "statistical_focus", 280, 0], ["contextual", "contextual", 280, 180], ["classifier", "classifier", 280, 360], ["merge", "merge", 560, 180], ["output", "output", 840, 180]], [["input", "statistical"], ["input", "contextual"], ["input", "classifier"], ["statistical", "merge"], ["contextual", "merge"], ["classifier", "merge"], ["merge", "output"]]);
+  const parallelAll = clone(parallel);
+  parallelAll.name = "Tres filtros: A Y B Y C";
+  parallelAll.nodes.find(node => node.type === "merge").config.mode = "all";
+  const composed = make("Tres filtros: (A O B) Y C", [["input", "input", 0, 180], ["statistical", "statistical_focus", 280, 0], ["contextual", "contextual", 280, 180], ["classifier", "classifier", 560, 360], ["any", "merge", 560, 90], ["all", "merge", 840, 180], ["output", "output", 1120, 180]], [["input", "statistical"], ["input", "contextual"], ["input", "classifier"], ["statistical", "any"], ["contextual", "any"], ["any", "all"], ["classifier", "all"], ["all", "output"]]);
+  composed.nodes.find(node => node.id === "all").config.mode = "all";
   return [reference,
-    make("Tres filtros en paralelo", [["input", "input", 0, 180], ["statistical", "statistical_focus", 280, 0], ["contextual", "contextual", 280, 180], ["classifier", "classifier", 280, 360], ["merge", "merge", 560, 180], ["output", "output", 840, 180]], [["input", "statistical"], ["input", "contextual"], ["input", "classifier"], ["statistical", "merge"], ["contextual", "merge"], ["classifier", "merge"], ["merge", "output"]]),
+    parallel,
     serial("Solo estadístico FOCuS", ["statistical_focus"]),
     serial("Solo contextual", ["contextual"]), serial("Solo clasificador", ["classifier"]),
     serial("Estadístico y clasificador", ["statistical_focus", "classifier"]), serial("Contextual antes del estadístico", ["contextual", "statistical_focus", "classifier"]),
     make("Decisión sobre el estadístico", [["input", "input", 0, 80], ["statistical", "statistical_focus", 260, 80], ["decision", "decision", 520, 80], ["classifier", "classifier", 780, 0], ["output", "output", 1040, 80]], [["input", "statistical"], ["statistical", "decision"], ["decision", "classifier", ["positive"]], ["decision", "output", ["negative", "unknown"]], ["classifier", "output"]]),
     serial("Flujo vacío", []),
+    parallelAll, composed,
   ];
 }

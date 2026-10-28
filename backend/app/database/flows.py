@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
+import unicodedata
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
@@ -10,6 +11,15 @@ from app.flow.definitions import _json, _now, validate_flow
 
 ALERT_DECISIONS = {"fault_compatible", "environmental", "suspicion"}
 ALERT_SEVERITIES = {"fault": ("fault_compatible",), "anomaly": ("environmental", "suspicion")}
+
+
+def _flow_name(value):
+    return " ".join(unicodedata.normalize("NFC", str(value or "Flujo sin nombre")).split()) or "Flujo sin nombre"
+
+
+def _flow_name_key(value):
+    return _flow_name(value).casefold()
+
 
 class FlowStore:
     def __init__(self, path: Path) -> None:
@@ -24,6 +34,23 @@ class FlowStore:
                 CREATE TABLE IF NOT EXISTS flow_runs (
                     run_id TEXT PRIMARY KEY, flow_id TEXT NOT NULL, snapshot TEXT NOT NULL, summary TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS flow_run_display (
+                    run_id TEXT PRIMARY KEY, flow_id TEXT NOT NULL, snapshot TEXT NOT NULL, summary TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS flow_run_display_date ON flow_run_display(created_at DESC);
+                CREATE INDEX IF NOT EXISTS flow_run_display_flow ON flow_run_display(flow_id,created_at DESC);
+                CREATE TRIGGER IF NOT EXISTS flow_run_display_insert AFTER INSERT ON flow_runs BEGIN
+                    INSERT INTO flow_run_display VALUES
+                        (NEW.run_id,NEW.flow_id,json_remove(NEW.snapshot,'$.diagnostic_snapshots'),NEW.summary,NEW.created_at);
+                END;
+                CREATE TRIGGER IF NOT EXISTS flow_run_display_update AFTER UPDATE ON flow_runs BEGIN
+                    DELETE FROM flow_run_display WHERE run_id=OLD.run_id;
+                    INSERT INTO flow_run_display VALUES
+                        (NEW.run_id,NEW.flow_id,json_remove(NEW.snapshot,'$.diagnostic_snapshots'),NEW.summary,NEW.created_at);
+                END;
+                CREATE TRIGGER IF NOT EXISTS flow_run_display_delete AFTER DELETE ON flow_runs BEGIN
+                    DELETE FROM flow_run_display WHERE run_id=OLD.run_id;
+                END;
                 CREATE TABLE IF NOT EXISTS flow_results (
                     run_id TEXT NOT NULL, node_id TEXT NOT NULL, observation_id TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY (run_id, node_id, observation_id)
@@ -40,6 +67,10 @@ class FlowStore:
                     id INTEGER PRIMARY KEY CHECK (id=1), execution_id TEXT NOT NULL
                 );
             """)
+            # Backfill once for existing installations; full audit snapshots remain in flow_runs.
+            db.execute("""INSERT INTO flow_run_display
+                SELECT run_id,flow_id,json_remove(snapshot,'$.diagnostic_snapshots'),summary,created_at
+                FROM flow_runs WHERE run_id NOT IN (SELECT run_id FROM flow_run_display)""")
             if import_alerts:
                 db.execute("""INSERT OR IGNORE INTO flow_alerts
                     (execution_id,observation_id,flow_id,run_id,created_at,payload)
@@ -77,15 +108,37 @@ class FlowStore:
         if not checked["valid"]:
             raise ValueError("; ".join(checked["errors"]))
         flow_id = uuid4().hex
-        item = {"flow_id": flow_id, "name": str(payload.get("name") or "Flujo sin nombre"), "nodes": payload["nodes"], "edges": payload["edges"]}
+        item = {"flow_id": flow_id, "name": _flow_name(payload.get("name")), "nodes": payload["nodes"], "edges": payload["edges"]}
         with self._database() as db:
+            # Serialize lookup and insert across devices, including separate API processes.
+            db.execute("BEGIN IMMEDIATE")
+            existing = self._find_name(db, item["name"])
+            if existing:
+                return {**existing, "loaded_existing": True}
             db.execute("INSERT INTO flows VALUES (?,?,?,?)", (flow_id, item["name"], _json(item), _now()))
         return item
 
+    @staticmethod
+    def _find_name(db, name):
+        key = _flow_name_key(name)
+        for flow_id, saved_name in db.execute("SELECT flow_id,name FROM flows ORDER BY updated_at DESC,rowid DESC"):
+            if _flow_name_key(saved_name) == key:
+                payload, updated = db.execute("SELECT payload,updated_at FROM flows WHERE flow_id=?", (flow_id,)).fetchone()
+                return {**json.loads(payload), "updated_at": updated}
+        return None
+
     def list(self) -> list[dict[str, Any]]:
         with self._database() as db:
-            rows = db.execute("SELECT payload,updated_at FROM flows ORDER BY updated_at DESC").fetchall()
-        return [{**json.loads(payload), "updated_at": updated} for payload, updated in rows]
+            rows = db.execute("SELECT payload,updated_at FROM flows ORDER BY updated_at DESC,rowid DESC").fetchall()
+        # Older duplicate IDs remain readable by saved runs and previously opened browsers.
+        items, names = [], set()
+        for payload, updated in rows:
+            item = json.loads(payload)
+            key = _flow_name_key(item.get("name"))
+            if key not in names:
+                names.add(key)
+                items.append({**item, "updated_at": updated})
+        return items
 
     def get(self, flow_id: str) -> dict[str, Any]:
         with self._database() as db:
@@ -99,9 +152,15 @@ class FlowStore:
         checked = validate_flow(payload)
         if not checked["valid"]:
             raise ValueError("; ".join(checked["errors"]))
-        item = {"flow_id": flow_id, "name": str(payload.get("name") or "Flujo sin nombre"), "nodes": payload["nodes"], "edges": payload["edges"]}
+        item = {"flow_id": flow_id, "name": _flow_name(payload.get("name")), "nodes": payload["nodes"], "edges": payload["edges"]}
         updated_at = _now()
         with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM flows WHERE flow_id=?", (flow_id,)).fetchone():
+                raise KeyError(flow_id)
+            existing = self._find_name(db, item["name"])
+            if existing and existing["flow_id"] != flow_id:
+                return {**existing, "loaded_existing": True}
             db.execute("UPDATE flows SET name=?,payload=?,updated_at=? WHERE flow_id=?", (item["name"], _json(item), updated_at, flow_id))
         return {**item, "updated_at": updated_at}
 
@@ -208,10 +267,11 @@ class FlowStore:
             row = db.execute("SELECT run_id FROM flow_runs ORDER BY rowid DESC LIMIT 1").fetchone()
         return row[0] if row else None
 
-    def list_runs(self, flow_id: str | None = None) -> list[dict[str, Any]]:
+    def list_runs(self, flow_id: str | None = None, *, compact: bool = False) -> list[dict[str, Any]]:
         clause, args = (" WHERE flow_id=?", [flow_id]) if flow_id else ("", [])
+        table = "flow_run_display" if compact else "flow_runs"
         with self._database() as db:
-            rows = db.execute("SELECT run_id,flow_id,snapshot,summary,created_at FROM flow_runs" + clause + " ORDER BY created_at DESC", args).fetchall()
+            rows = db.execute(f"SELECT run_id,flow_id,snapshot,summary,created_at FROM {table}" + clause + " ORDER BY created_at DESC", args).fetchall()
         return [{"run_id": row[0], "flow_id": row[1], "snapshot": json.loads(row[2]), "summary": json.loads(row[3]), "created_at": row[4]} for row in rows]
 
     def results(self, run_id: str, node_id: str = "output", offset: int = 0, limit: int = 100) -> dict[str, Any]:

@@ -97,24 +97,28 @@ def intervals(rows, start, end, resolution, info):
     return ticks
 
 
+def fit_hourly_profile(rows, start, end, local_timezone):
+    zone = ZoneInfo(local_timezone)
+    known_start = max(start, min((parse_utc(r["timestamp"]) for r in rows), default=end))
+    days = int((end-known_start).total_seconds() // 86400)
+    counts = Counter(parse_utc(r["timestamp"]).astimezone(zone).hour for r in rows)
+    invalid_counts = Counter(parse_utc(r["timestamp"]).astimezone(zone).hour for r in rows if not valid_state(r["state"]))
+    return {"available": days >= 14 and bool(rows),
+            "record_rate": [counts[h]/max(1, days) for h in range(24)],
+            "invalid_rate": [invalid_counts[h]/max(1, days) for h in range(24)],
+            "fit_start": start.isoformat(), "fit_end": end.isoformat()}
+
+
 def fit_spec(events, preprocessor, config, fit_bounds):
     """Fit segmentation and hourly profiles on train_fit only."""
     start, end = fit_bounds
-    zone = ZoneInfo(config.local_timezone)
     grouped = {key: [] for key in preprocessor["entity_ids"]}
     for row in events:
         if row["entity_id"] in grouped and start <= parse_utc(row["timestamp"]) < end:
             grouped[row["entity_id"]].append(row)
     for entity, rows in grouped.items():
         info = preprocessor["entities"][entity]
-        known_start = max(start, min((parse_utc(r["timestamp"]) for r in rows), default=end))
-        days = int((end-known_start).total_seconds() // 86400)
-        counts = Counter(parse_utc(r["timestamp"]).astimezone(zone).hour for r in rows)
-        invalid_counts = Counter(parse_utc(r["timestamp"]).astimezone(zone).hour for r in rows if not valid_state(r["state"]))
-        info["hourly_profile"] = {"available": days >= 14 and bool(rows),
-                                  "record_rate": [counts[h]/max(1, days) for h in range(24)],
-                                  "invalid_rate": [invalid_counts[h]/max(1, days) for h in range(24)],
-                                  "fit_start": start.isoformat(), "fit_end": end.isoformat()}
+        info["hourly_profile"] = fit_hourly_profile(rows, start, end, config.local_timezone)
     lengths = []
     for scale, (horizon, resolution, candidates) in enumerate(SCALES):
         for candidate in candidates:

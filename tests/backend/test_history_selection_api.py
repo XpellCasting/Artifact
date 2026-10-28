@@ -27,11 +27,11 @@ class HistorySelectionApiTests(unittest.TestCase):
         self.service.estado_carga_real = Mock(return_value={"job_id": "preparation-job", "status": "queued"})
         self.service.iniciar_importacion_home_assistant = Mock(return_value={"job_id": "home-assistant-job"})
         self.bridge = Mock()
-        self.bridge.status.return_value = {"bridge_connected": True}
-        self.bridge.history_transport.return_value = [
+        self.bridge.status.return_value = {"bridge_configured": True, "bridge_connected": True}
+        self.bridge.entity_catalog.return_value = {"areas_available": False, "entities": [
             {"entity_id": "sensor.temperature", "state": "20", "attributes": {"unit_of_measurement": "°C"}},
             {"entity_id": "binary_sensor.door", "state": "off"},
-        ]
+        ]}
         runtime = ModuleType("app.services.runtime")
         runtime.state, runtime.home_assistant_bridge, runtime.history_candidates = self.service, self.bridge, self.candidates
         spec = importlib.util.spec_from_file_location("isolated_history_selection_api", Path(__file__).parents[2] / "backend/app/api/history.py")
@@ -67,11 +67,12 @@ class HistorySelectionApiTests(unittest.TestCase):
         self.assertIn("sensor.b", self.service.real_history_path.read_text())
 
     def test_home_assistant_catalog_is_read_only_and_only_explicit_selection_starts_import(self):
-        payload = {"connection_mode": "integration", "start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z"}
+        payload = {"start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z"}
         preview = self.client.post("/history/home-assistant/entities", json=payload)
         self.assertEqual(preview.status_code, 200, preview.text)
         self.assertEqual(preview.json()["entity_count"], 2)
-        self.bridge.history_transport.assert_called_once_with("/states")
+        self.bridge.entity_catalog.assert_called_once_with()
+        self.bridge.history_transport.assert_not_called()
         self.service.iniciar_importacion_home_assistant.assert_not_called()
         rejected = self.client.post("/history/home-assistant/prepare", json=payload)
         self.assertEqual(rejected.status_code, 400)
@@ -88,6 +89,52 @@ class HistorySelectionApiTests(unittest.TestCase):
         self.assertEqual(list(self.candidates.directory.iterdir()), [])
         self.assertEqual(self.service.real_history_path.read_text(), self.original)
         self.service._crear_job_carga.assert_not_called()
+
+    def test_import_and_prepare_reject_empty_selection_without_creating_jobs(self):
+        payload = {"start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z", "entity_ids": []}
+        for path in ("prepare", "import/start"):
+            response = self.client.post(f"/history/home-assistant/{path}", json=payload)
+            self.assertEqual(response.status_code, 400, response.text)
+        self.service.iniciar_importacion_home_assistant.assert_not_called()
+        self.bridge.entity_catalog.assert_not_called()
+
+    def test_old_credentials_are_rejected_and_config_contains_only_link_status(self):
+        self.assertEqual(self.client.get("/history/home-assistant/config").json(),
+                         {"bridge_configured": True, "bridge_connected": True})
+        payload = {"start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z", "entity_ids": ["sensor.a"]}
+        for field, value in (("url", "http://ha.local"), ("token", "secret"), ("connection_mode", "integration")):
+            for path in ("entities", "prepare", "import/start"):
+                with self.subTest(field=field, path=path):
+                    response = self.client.post(f"/history/home-assistant/{path}", json={**payload, field: value})
+                    self.assertEqual(response.status_code, 422, response.text)
+        self.service.iniciar_importacion_home_assistant.assert_not_called()
+        self.bridge.entity_catalog.assert_not_called()
+
+    def test_disconnect_blocks_catalog_and_import_until_reconnected(self):
+        payload = {"start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z", "entity_ids": ["sensor.temperature"]}
+        for message in ("Integración no configurada", "La integración está desconectada"):
+            self.bridge.require_connected.side_effect = ValueError(message)
+            for path in ("entities", "prepare", "import/start"):
+                response = self.client.post(f"/history/home-assistant/{path}", json=payload)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn(message, response.json()["detail"])
+        self.service.iniciar_importacion_home_assistant.assert_not_called()
+        self.bridge.entity_catalog.assert_not_called()
+        self.bridge.require_connected.side_effect = None
+        self.assertEqual(self.client.post("/history/home-assistant/entities", json=payload).status_code, 200)
+        self.assertEqual(self.client.post("/history/home-assistant/prepare", json=payload).status_code, 200)
+
+    def test_catalog_returns_assigned_and_unassigned_metadata(self):
+        self.bridge.entity_catalog.return_value = {"areas_available": True, "entities": [
+            {"entity_id": "sensor.temperature", "state": "20", "area_id": "kitchen", "area_name": "Cocina"},
+            {"entity_id": "binary_sensor.door", "state": "off", "area_id": None, "area_name": None}]}
+        response = self.client.post("/history/home-assistant/entities", json={
+            "start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["areas_available"])
+        self.assertEqual(response.json()["entities"][1]["area_name"], "Cocina")
+        self.assertIsNone(response.json()["entities"][0]["area_id"])
+        self.service.iniciar_importacion_home_assistant.assert_not_called()
 
 
 if __name__ == "__main__":

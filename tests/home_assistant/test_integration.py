@@ -325,6 +325,83 @@ async def test_bridge_reads_states_using_hass_and_preserves_rpc_chunk_order(hass
 
 
 @pytest.mark.asyncio
+async def test_catalog_resolves_entity_override_device_inheritance_and_missing_registrations(hass, endpoint, session, monkeypatch):
+    from homeassistant.helpers import area_registry, device_registry, entity_registry
+    for key in ("direct", "inherited", "override", "unassigned", "unregistered", "missing_device"):
+        hass.states.async_set(f"sensor.{key}", "20")
+    hass.states.async_set("light.unsupported", "on")
+    entities = {
+        "sensor.direct": SimpleNamespace(area_id="kitchen", device_id=None),
+        "sensor.inherited": SimpleNamespace(area_id=None, device_id="device"),
+        "sensor.override": SimpleNamespace(area_id="kitchen", device_id="device"),
+        "sensor.unassigned": SimpleNamespace(area_id=None, device_id=None),
+        "sensor.missing_device": SimpleNamespace(area_id=None, device_id="missing"),
+    }
+    getters = []
+    for module, name, index in (
+        (entity_registry, "entities", entities),
+        (device_registry, "devices", {"device": SimpleNamespace(area_id="living")}),
+        (area_registry, "areas", {"kitchen": SimpleNamespace(name="Cocina"), "living": SimpleNamespace(name="Salón")}),
+    ):
+        getter = Mock(return_value=SimpleNamespace(**{name: index}))
+        monkeypatch.setattr(module, "async_get", getter)
+        getters.append(getter)
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        catalog = await asyncio.to_thread(bridge.entity_catalog)
+        assert catalog["areas_available"] is True
+        rows = {row["entity_id"]: row for row in catalog["entities"]}
+        assert len(rows) == 6
+        assert rows["sensor.direct"]["area_name"] == "Cocina"
+        assert rows["sensor.inherited"]["area_id"] == "living"
+        assert rows["sensor.override"]["area_id"] == "kitchen"
+        assert all(rows[f"sensor.{key}"]["area_id"] is None for key in ("unassigned", "unregistered", "missing_device"))
+        for getter in getters:
+            getter.assert_called_once_with(hass)
+    finally:
+        await integration.async_close()
+
+
+@pytest.mark.asyncio
+async def test_catalog_reads_real_empty_registries_and_keeps_no_areas_distinct_from_unavailable(hass, endpoint, session, monkeypatch):
+    from homeassistant.helpers import area_registry, device_registry, entity_registry
+    await area_registry.async_load(hass)
+    await device_registry.async_load(hass)
+    await entity_registry.async_load(hass)
+    hass.states.async_set("sensor.unregistered", "20")
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        catalog = await asyncio.to_thread(bridge.entity_catalog)
+        assert catalog["areas_available"] is True
+        assert catalog["entities"][0]["area_id"] is None
+        assert catalog["entities"][0]["area_name"] is None
+        monkeypatch.setattr(area_registry, "async_get", Mock(side_effect=RuntimeError("unavailable")))
+        catalog = await asyncio.to_thread(bridge.entity_catalog)
+        assert catalog["areas_available"] is False
+        assert "area_id" not in catalog["entities"][0]
+    finally:
+        await integration.async_close()
+
+
+@pytest.mark.asyncio
+async def test_catalog_chunks_5000_entities_without_history_queries(hass, monkeypatch):
+    from homeassistant.helpers import area_registry, device_registry, entity_registry
+    for module, attribute in ((area_registry, "areas"), (device_registry, "devices"), (entity_registry, "entities")):
+        monkeypatch.setattr(module, "async_get", Mock(return_value=SimpleNamespace(**{attribute: {}})))
+    for index in range(5000):
+        hass.states.async_set(f"sensor.entity_{index}", str(index))
+    integration = ArtifactBridge(hass, make_entry("http://artifact.local"), None)
+    queue = asyncio.Queue()
+    await integration._command({"request_id": "catalog", "operation": "entity_catalog"}, queue, None)
+    chunks = []
+    while not queue.empty():
+        chunks.append(queue.get_nowait())
+    assert [len(chunk["items"]) for chunk in chunks[:-1]] == [500] * 10
+    assert chunks[-1] == {"type": "result", "request_id": "catalog", "success": True, "data": {"areas_available": True}}
+    assert chunks[-2]["items"][-1]["entity_id"] == "sensor.entity_4999"
+
+
+@pytest.mark.asyncio
 async def test_bridge_queries_recorder_in_executor_without_a_rest_token(hass, endpoint, session, monkeypatch):
     from homeassistant.components import recorder
     from homeassistant.components.recorder import history

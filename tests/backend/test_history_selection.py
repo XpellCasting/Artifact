@@ -91,7 +91,7 @@ class HistorySelectionTests(unittest.TestCase):
         ids = [f"sensor.temperature_{i}" for i in range(5000)]
         request = HomeAssistantHistoryRequest(start=start, end=end, entity_ids=ids)
         self.assertEqual(len(request.entity_ids), 5000)
-        source = HomeAssistantHistorySource("http://ha.local", "private-token", start, end, [])
+        source = HomeAssistantHistorySource(start, end, transport=Mock())
         states = [{"entity_id": key, "state": "20", "attributes": {"friendly_name": key, "unit_of_measurement": "°C"}} for key in ids]
         states.append({"entity_id": "automation.example", "state": "on"})
         with patch.object(source, "_get", return_value=states) as get:

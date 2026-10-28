@@ -4,10 +4,9 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
-from urllib.error import HTTPError, URLError
 
 from app.api.schemas import HomeAssistantHistoryRequest
-from app.services.home_assistant_history import HomeAssistantHistorySource, NoRedirect
+from app.services.home_assistant_history import HomeAssistantHistorySource
 from app.services.history import ServicesHistoryMixin
 from app.services.historial.cargar_historial import CargadorHistorial
 
@@ -22,7 +21,7 @@ class HomeAssistantHistoryTests(unittest.TestCase):
 
     def source(self, **overrides):
         return HomeAssistantHistorySource(**{
-            "url": "http://homeassistant.local:8123", "token": "private-token",
+            "transport": Mock(),
             "start": self.start, "end": self.end, "entity_ids": ["sensor.temperature"], **overrides,
         })
 
@@ -50,16 +49,12 @@ class HomeAssistantHistoryTests(unittest.TestCase):
         self.assertEqual(loaded.metadatos["source_type"], "real")
         self.assertEqual(loaded.metadatos["history_origin"], "home_assistant")
 
-    def test_auto_discovery_filters_compatible_domains_and_empty_period_is_rejected(self):
+    def test_empty_selection_never_discovers_or_downloads_history(self):
         source = self.source(entity_ids=[])
-        with patch.object(source, "_get", side_effect=[[
-            {"entity_id": "sensor.temperature"}, {"entity_id": "binary_sensor.door"}, {"entity_id": "light.kitchen"},
-        ], [], []]) as get:
-            with self.assertRaisesRegex(ValueError, "No hay lecturas"):
-                source.export_csv(self.path, lambda *args: None)
-        self.assertEqual(get.call_args_list[0].args[0], "/states")
-        self.assertIn("binary_sensor.door%2Csensor.temperature", get.call_args_list[1].args[0])
-        self.assertNotIn("light.kitchen", str(get.call_args_list))
+        with self.assertRaisesRegex(ValueError, "Activa al menos"):
+            source.export_csv(self.path, lambda *args: None)
+        source.transport.assert_not_called()
+        self.assertFalse(self.path.exists())
 
     def test_explicit_entities_can_import_removed_entities_without_states(self):
         source = self.source()
@@ -68,35 +63,38 @@ class HomeAssistantHistoryTests(unittest.TestCase):
             source.export_csv(self.path, lambda *args: None)
         self.assertTrue(all("/history/period/" in call.args[0] for call in get.call_args_list))
 
-    def test_invalid_urls_dates_and_entities_are_rejected(self):
-        for changes in ({"url": "file:///private"}, {"url": "http://user:password@host"},
-                        {"url": "http://host/?token=private"}, {"token": ""}, {"token": "bad\ntoken"},
-                        {"end": self.start}, {"start": self.start.replace(tzinfo=None)},
+    def test_invalid_dates_entities_and_missing_integration_are_rejected(self):
+        for changes in ({"transport": None}, {"end": self.start},
+                        {"start": self.start.replace(tzinfo=None)},
                         {"entity_ids": ["light.kitchen"]}, {"entity_ids": ["sensor.x&token=bad"]}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.source(**changes)
 
-    def test_credentials_are_redacted_and_schema_requires_timezone(self):
-        self.assertNotIn("private-token", repr(self.source()))
-        request = HomeAssistantHistoryRequest(token="private-token", start=self.start, end=self.end)
-        self.assertNotIn("private-token", repr(request))
+    def test_schema_rejects_direct_connection_fields_and_requires_timezone(self):
+        for field, value in (("url", "http://ha.local"), ("token", "private-token"), ("connection_mode", "integration")):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                HomeAssistantHistoryRequest(start=self.start, end=self.end, **{field: value})
         with self.assertRaises(ValueError):
             HomeAssistantHistoryRequest(start="2026-01-01T00:00", end=self.end)
 
-    def test_http_errors_are_actionable_without_returning_credentials(self):
-        source = self.source()
-        for code, message in ((401, "rechazó el token"), (404, "API de historial"), (500, "HTTP 500")):
-            opener = Mock()
-            opener.open.side_effect = HTTPError("http://private", code, "private-token", {}, None)
-            with patch("app.services.home_assistant_history.build_opener", return_value=opener):
-                with self.assertRaisesRegex(ValueError, message) as raised:
-                    source._get("/states")
-                self.assertNotIn("private-token", str(raised.exception))
-        opener.open.side_effect = URLError("private-token")
-        with patch("app.services.home_assistant_history.build_opener", return_value=opener):
-            with self.assertRaisesRegex(ValueError, "No se pudo conectar"):
-                source._get("/states")
-        self.assertIsNone(NoRedirect().redirect_request(None, None, 302, "", {}, "http://another-host"))
+    def test_catalog_preserves_area_metadata_and_legacy_catalog_is_explicitly_unknown(self):
+        rows = [{"entity_id": "sensor.temperature", "state": "20", "area_id": "kitchen", "area_name": "Cocina"},
+                {"entity_id": "binary_sensor.door", "state": "off", "area_id": None, "area_name": None},
+                {"entity_id": "light.room", "state": "on", "area_id": None, "area_name": None}]
+        catalog = Mock(return_value={"entities": rows, "areas_available": True})
+        source = self.source(catalog_transport=catalog)
+        preview = source.discover_entities()
+        self.assertTrue(preview["areas_available"])
+        self.assertEqual(preview["entity_count"], 2)
+        self.assertEqual(preview["entities"][1]["area_name"], "Cocina")
+        self.assertIsNone(preview["entities"][0]["area_id"])
+        source.transport.assert_not_called()
+        catalog.return_value = {"entities": rows, "areas_available": False}
+        preview = source.discover_entities()
+        self.assertFalse(preview["areas_available"])
+        self.assertTrue(all("area_id" not in row for row in preview["entities"]))
+        catalog.return_value = {"entities": [{"entity_id": "sensor.a", "state": "1"}], "areas_available": True}
+        self.assertFalse(source.discover_entities()["areas_available"])
 
     def test_failed_download_preserves_existing_csv_and_removes_temporary_file(self):
         self.path.write_text("existing history", encoding="utf-8")

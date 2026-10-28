@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { ReactFlow, BaseEdge, Background, Controls, Handle, MarkerType, Position, ReactFlowProvider, useNodesState, useReactFlow } from "@xyflow/react";
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, Copy, GitBranch, Maximize2, Play, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
 import "@xyflow/react/dist/style.css";
-import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, edgeLabel, fingerprint, flowPayload, labelNode, nextNodeId, removeNode, templates, validateDraft } from "./flow-lab-model.js";
+import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, defaultNodeConfig, edgeLabel, fingerprint, flowPayload, labelNode, nextNodeId, removeNode, templates, validateDraft } from "./flow-lab-model.js";
 import "./flow-lab.css";
 import FutureEventsSource from "./FutureEventsSource.jsx";
 import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
@@ -11,7 +11,7 @@ import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
 const PRESETS = templates();
 const PAGE_SIZE = 50;
 const DRAFT_STORAGE_KEY = "flow-lab-selected-draft-v1";
-const DESCRIPTIONS = { input: "Lecturas del histórico seleccionado", statistical_focus: "Cambios secuenciales en residuos", contextual: "Coherencia entre entidades", classifier: "Compatibilidad con patrones", merge: "Reúne las evidencias de las ramas", decision: "Distribuye según la señal recibida", output: "Resultado final por lectura" };
+const DESCRIPTIONS = { input: "Lecturas del histórico seleccionado", statistical_focus: "Cambios secuenciales en residuos", contextual: "Coherencia entre entidades", classifier: "Compatibilidad con patrones", merge: "Combina señales con lógica O / Y", decision: "Evalúa una condición lógica sobre la señal", output: "Resultado final por lectura" };
 function restoreFlowDraft() {
   try {
     const saved = JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY) || "null");
@@ -23,10 +23,11 @@ function restoreFlowDraft() {
 }
 function FilterNode({ data, selected }) {
   const disabled = data.node.config?.enabled === false;
+  const description = data.node.type === "merge" ? (data.node.config?.mode === "all" ? "Y · Todas las ramas positivas" : "O · Cualquiera de las ramas positiva") : DESCRIPTIONS[data.node.type];
   return <div className={`fl-node fl-node-${data.node.type} ${selected ? "is-selected" : ""} ${disabled ? "is-disabled" : ""}`}>
     {data.node.type !== "input" && <Handle type="target" position={Position.Left} />}
     <span className="fl-node-kind">{NODE_LABELS[data.node.type]}</span><strong>{labelNode(data.node)}</strong>
-    <span className="fl-node-detail">{disabled ? "Omitido · deja pasar la entrada" : DESCRIPTIONS[data.node.type]}</span>
+    <span className="fl-node-detail">{disabled ? "Omitido · deja pasar la entrada" : description}</span>
     {data.count !== undefined && <span className="fl-node-count">{data.count.toLocaleString()} lecturas</span>}
     {data.node.type !== "output" && <Handle type="source" position={Position.Right} />}
   </div>;
@@ -77,6 +78,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const [savedKey, setSavedKey] = useState(() => restoreFlowDraft().savedKey);
   const [flows, setFlows] = useState([]);
   const [runs, setRuns] = useState([]);
+  const [runsLoaded, setRunsLoaded] = useState(false);
   const [classifierModels, setClassifierModels] = useState([]);
   const [activeClassifierModelId, setActiveClassifierModelId] = useState(null);
   const [selection, setSelection] = useState(null);
@@ -100,6 +102,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const [resultBusy, setResultBusy] = useState(false);
   const [selectedResult, setSelectedResult] = useState(null);
   const pageRequest = useRef(0);
+  const refreshRequest = useRef(0);
   const [layoutRevision, setLayoutRevision] = useState(0);
   const [canvasNodes, setCanvasNodes, onCanvasNodesChange] = useNodesState([]);
   const { fitView, screenToFlowPosition } = useReactFlow();
@@ -114,9 +117,21 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     catch { /* La edición sigue disponible en memoria si el navegador no admite almacenamiento local. */ }
   }, [draft, savedKey]);
   const refresh = useCallback(async () => {
-    const [f, r, models] = await Promise.all([request(apiBaseUrl, "/flows"), request(apiBaseUrl, "/flow-runs"), request(apiBaseUrl, "/diagnostics/classifier-models")]);
-    setFlows(f.items || []); setRuns(r.items || []); setClassifierModels(models.models || []); setActiveClassifierModelId(models.active_model_id || null); setLoaded(true);
-    setActiveRun((current) => (r.items || []).find((item) => item.run_id === current?.run_id) || current || r.items?.[0] || null);
+    const revision = ++refreshRequest.current;
+    const current = () => revision === refreshRequest.current;
+    await Promise.all([
+      request(apiBaseUrl, "/flows").then((f) => { if (current()) setFlows(f.items || []); }),
+      request(apiBaseUrl, "/flow-runs?compact=true").then((r) => {
+        if (!current()) return;
+        setRuns(r.items || []);
+        setRunsLoaded(true);
+        setActiveRun((active) => (r.items || []).find((item) => item.run_id === active?.run_id) || active || r.items?.[0] || null);
+      }),
+      request(apiBaseUrl, "/diagnostics/classifier-models").then((models) => {
+        if (current()) { setClassifierModels(models.models || []); setActiveClassifierModelId(models.active_model_id || null); }
+      }),
+    ]);
+    if (current()) setLoaded(true);
   }, [apiBaseUrl]);
   const refreshClassifierModels = useCallback(async () => {
     const models = await request(apiBaseUrl, "/diagnostics/classifier-models");
@@ -168,7 +183,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     const id = nextNodeId(draft, newType);
     const bounds = canvasRef.current?.getBoundingClientRect();
     const position = bounds ? screenToFlowPosition({ x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 }) : { x: 400, y: 100 };
-    change((next) => next.nodes.push({ id, type: newType, position, config: newType === "statistical_focus" ? { evidence_policy: "combine_v1", suspicion_threshold: .6, continuous_method: "residual_focus_v1", signal_policy: "detection_before_suppression" } : newType === "decision" ? { accept: ["positive"], evidence_policy: "combine_v1" } : newType === "merge" ? { mode: "any", evidence_policy: "combine_v1" } : { evidence_policy: "combine_v1" } }));
+    change((next) => next.nodes.push({ id, type: newType, position, config: defaultNodeConfig(newType) }));
     setSelection({ kind: "node", id });
   }
   function addConnection({ source: origin, target: destination }) {
@@ -183,18 +198,33 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     setSelection(null);
   }
   async function persist() {
-    const saved = await request(apiBaseUrl, draft.flow_id ? `/flows/${draft.flow_id}` : "/flows", { method: draft.flow_id ? "PUT" : "POST", body: JSON.stringify(flowPayload(draft)) });
-    setDraft(saved); setSavedKey(fingerprint(saved)); return saved;
+    const { loaded_existing: loadedExisting = false, ...saved } = await request(apiBaseUrl, draft.flow_id ? `/flows/${draft.flow_id}` : "/flows", { method: draft.flow_id ? "PUT" : "POST", body: JSON.stringify(flowPayload(draft)) });
+    setDraft(saved); setSavedKey(fingerprint(saved));
+    if (loadedExisting) {
+      setSelection(null); setSource(""); setTarget(""); setInspecting(false); setLayoutRevision((value) => value + 1);
+      setMessage(`Ya existe un flujo llamado «${saved.name}». Se cargó el guardado.`);
+    }
+    return { flow: saved, loadedExisting };
+  }
+  async function prepareExecution() {
+    if (!dirty && draft.flow_id) return draft;
+    const saved = await persist();
+    if (saved.loadedExisting) {
+      setMessage(`Ya existe un flujo llamado «${saved.flow.name}». Se cargó el guardado. Revisa el diseño y vuelve a iniciar la evaluación.`);
+      await refresh();
+      return null;
+    }
+    return saved.flow;
   }
   async function save() {
     setPending(true); setError(""); setMessage("");
-    try { await persist(); await refresh(); setMessage("Flujo guardado."); } catch (reason) { setError(reason.message); } finally { setPending(false); }
+    try { const saved = await persist(); await refresh(); if (!saved.loadedExisting) setMessage("Flujo guardado."); } catch (reason) { setError(reason.message); } finally { setPending(false); }
   }
   async function execute() {
     setPending(true); setError(""); setMessage("");
     try {
-      // Guardar la configuración visible antes de ejecutar evita usar una versión anterior silenciosamente.
-      const saved = dirty || !draft.flow_id ? await persist() : draft;
+      const saved = await prepareExecution();
+      if (!saved) return;
       const started = await request(apiBaseUrl, `/flows/${saved.flow_id}/runs`, { method: "POST", body: "{}" });
       setJob({ ...started, mode: "csv", flow: saved });
     } catch (reason) { setError(reason.message); }
@@ -203,7 +233,8 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   async function startLive(connection) {
     setPending(true); setError(""); setMessage("");
     try {
-      const saved = dirty || !draft.flow_id ? await persist() : draft;
+      const saved = await prepareExecution();
+      if (!saved) return false;
       const started = await request(apiBaseUrl, `/flows/${saved.flow_id}/live/start`, { method: "POST", body: JSON.stringify(connection) });
       setJob({ ...started, mode: "home_assistant", flow: saved });
       return true;
@@ -254,10 +285,10 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     </div><aside className="fl-inspector" aria-label="Inspector del flujo"><h3>{node ? labelNode(node) : edge ? "Configurar conexión" : "Inspector"}</h3>
       {node ? <fieldset disabled={busy || inspecting} className="fl-fields"><span className="fl-muted">{DESCRIPTIONS[node.type]}</span><label>Nombre visible<input value={node.config?.label || ""} placeholder={NODE_LABELS[node.type]} onChange={(event) => configure({ label: event.target.value })} /></label>
         {["statistical_focus", "contextual", "classifier"].includes(node.type) && <label className="fl-check"><input type="checkbox" checked={node.config?.enabled !== false} onChange={(event) => configure({ enabled: event.target.checked })} />Filtro activado</label>}
-        <label>Uso de evidencias<select value={node.config?.evidence_policy || "legacy"} onChange={(event) => configure({ evidence_policy: event.target.value })}><option value="legacy">Comportamiento guardado</option><option value="independent">Evaluación propia</option><option value="combine_v1">Evaluación propia y combinada</option></select><span className="fl-hint">Recibe las evidencias de sus predecesores y conserva su procedencia.</span></label>{node.type === "statistical_focus" && <><label>Umbral para binarios y multivalor<input type="number" min="0.01" max="0.99" step="0.01" value={node.config?.suspicion_threshold ?? .6} onChange={(event) => configure({ suspicion_threshold: Number(event.target.value) })} /></label><p><strong>Continuos:</strong> FOCuS sobre residuos normalizados</p><span className="fl-hint">Combina FOCuS con canales puntual, energía y constancia. Un aviso puede originarse en cualquiera de ellos; no confirma un tipo de falla.</span></>}
+        {["merge", "decision"].includes(node.type) ? <p className="fl-hint">El resultado lógico determina la señal enviada. Las evidencias de los filtros se conservan para consultar su diagnóstico.</p> : <label>Uso de evidencias<select value={node.config?.evidence_policy || "legacy"} onChange={(event) => configure({ evidence_policy: event.target.value })}><option value="legacy">Comportamiento guardado</option><option value="independent">Evaluación propia</option><option value="combine_v1">Evaluación propia y combinada</option></select><span className="fl-hint">Recibe las evidencias de sus predecesores y conserva su procedencia.</span></label>}{node.type === "statistical_focus" && <><label>Umbral para binarios y multivalor<input type="number" min="0.01" max="0.99" step="0.01" value={node.config?.suspicion_threshold ?? .6} onChange={(event) => configure({ suspicion_threshold: Number(event.target.value) })} /></label><p><strong>Continuos:</strong> FOCuS sobre residuos normalizados</p><span className="fl-hint">Combina FOCuS con canales puntual, energía y constancia. Un aviso puede originarse en cualquiera de ellos; no confirma un tipo de falla.</span></>}
         {node.type === "classifier" && <label>Modelo<select aria-label="Modelo del clasificador" value={node.config?.model_id || ""} onChange={(event) => configure({ model_id: event.target.value || null })}>{node.config?.model_id && !classifierModels.some((item) => item.model_id === node.config.model_id) && <option value={node.config.model_id} disabled>Versión no disponible · selecciona otro modelo</option>}<option value="">Modelo activo{activeClassifierModelId ? ` · ${activeClassifierModelId.slice(0, 12)}` : " · ninguno"}</option>{classifierModels.map((model) => <option key={model.model_id} value={model.model_id}>{model.architecture_version === "gat_lstm_v3_segments_multiscale" ? "GAT-LSTM segmentos" : "GAT-LSTM v2"} · {model.model_id.slice(0, 12)}{model.active ? " (activo)" : ""}</option>)}</select><span className="fl-hint">La elección queda guardada en este nodo. “Modelo activo” usa el seleccionado en Diagnóstico.</span></label>}
-        {node.type === "merge" && <label>Señal de la unión<select value={node.config?.mode || "any"} onChange={(event) => configure({ mode: event.target.value })}><option value="any">Cualquiera positiva (O)</option><option value="all">Todas positivas (Y)</option></select><span className="fl-hint">La evidencia conserva su origen. Una rama no evaluada no cuenta como respaldo.</span></label>}
-        {node.type === "decision" && <><Signals legend="Resultado verdadero cuando recibe" value={node.config?.accept || ["positive"]} onChange={(accept) => configure({ accept })} /><p className="fl-hint">Verdadero produce señal positiva; falso, sin señal. Una entrada no evaluable permanece desconocida salvo que la selecciones explícitamente.</p></>}
+        {node.type === "merge" && <label>Función lógica<select value={node.config?.mode || "any"} onChange={(event) => configure({ mode: event.target.value })}><option value="any">Cualquiera positiva (O)</option><option value="all">Todas positivas (Y)</option></select><span className="fl-hint">Combina los resultados de una misma lectura. Una rama ausente cuenta como no evaluable. Puedes encadenar uniones para comparar fórmulas como (A O B) Y C.</span></label>}
+        {node.type === "decision" && <><Signals legend="Resultado verdadero cuando recibe" value={node.config?.accept || ["positive"]} onChange={(accept) => configure({ accept })} /><p className="fl-hint">Verdadero produce señal positiva; falso, sin señal. Selecciona solo «Sin señal» para negar una señal evaluable (NO). Una entrada no evaluable permanece desconocida salvo que la selecciones explícitamente. Configura en cada conexión qué resultados pueden pasar.</p></>}
         {!["input", "output"].includes(node.type) && <button className="fl-danger" onClick={deleteSelection}><Trash2 size={15} />Eliminar nodo y conexiones</button>}
       </fieldset> : edge ? <fieldset disabled={busy || inspecting} className="fl-fields"><p className="fl-route">{labelNode(graph.nodes.find((item) => item.id === edge.source))}<ArrowRight size={15} />{labelNode(graph.nodes.find((item) => item.id === edge.target))}</p><Signals value={edge.when || SIGNALS} onChange={(when) => change((next) => { next.edges.find((item) => item.id === edge.id).when = when; })} /><button className="fl-danger" onClick={deleteSelection}><Trash2 size={15} />Eliminar conexión</button></fieldset> : <p className="fl-muted">Selecciona un filtro o una conexión para ver y editar sus propiedades.</p>}
       {!inspecting && <details className="fl-connect"><summary>Conectar mediante formulario</summary><fieldset disabled={busy} className="fl-fields"><label>Desde<select aria-label="Origen de conexión" value={source} onChange={(event) => setSource(event.target.value)}><option value="">Seleccionar…</option>{draft.nodes.filter((item) => item.type !== "output").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><label>Hacia<select aria-label="Destino de conexión" value={target} onChange={(event) => setTarget(event.target.value)}><option value="">Seleccionar…</option>{draft.nodes.filter((item) => item.type !== "input").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><button disabled={!source || !target} onClick={() => addConnection({ source, target })}><GitBranch size={15} />Conectar</button></fieldset></details>}
@@ -276,7 +307,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
       return <tr key={run.run_id}><td>{run.snapshot.source.filename}<small className="fl-muted"> · {run.snapshot.source.fingerprint.slice(0, 10)}</small></td><td>{run.snapshot.flow.name} · {new Date(run.created_at).toLocaleString()}</td><td>{sum("Falla", "detected")} / {sum("Falla", "total")}</td><td>{sum("anomalia", "detected")} / {sum("anomalia", "total")}</td><td>{sum("Falla", "type_identified")} / {groups.filter(g => g.expected === "Falla" && g.fault_type).reduce((n, g) => n + g.total, 0)}</td><td>{sum(null, "false_positives")}</td><td><button disabled={busy} onClick={() => { setActiveRun(run); setInspecting(true); setResultNode("output"); setSelection(null); }}>Ver resultados</button></td></tr>;
     })}</tbody></table></div>{!runs.some(r => r.summary.evaluation?.labelled) && <p className="fl-muted">Carga un conjunto etiquetado y evalúa un flujo para comenzar la comparación.</p>}</section>
     <section className="fl-results" aria-label="Resultados de flujos"><div className="fl-results-toolbar"><h3>Ejecuciones</h3><label>Consultar<select aria-label="Ejecución guardada" value={activeRun?.run_id || ""} disabled={busy} onChange={(event) => { const run = runs.find((item) => item.run_id === event.target.value); if (run) { setActiveRun(run); setInspecting(true); setResultNode("output"); setSelection(null); setError(""); setMessage(""); setLayoutRevision((value) => value + 1); } }}><option value="">Seleccionar ejecución…</option>{runs.map((run) => <option key={run.run_id} value={run.run_id}>{run.snapshot?.flow?.name} · {run.snapshot.source?.filename || "Histórico"} · {new Date(run.created_at).toLocaleString()}</option>)}</select></label><button disabled={busy} aria-label="Actualizar ejecuciones" onClick={() => refresh().catch((e) => setError(e.message))}><RotateCcw size={16} /></button></div>
-      {!activeRun ? <div className="fl-empty"><GitBranch size={28} /><strong>Tu primera ejecución aparecerá aquí</strong><p>Guarda un flujo y ejecútalo para revisar el recorrido y la evidencia.</p></div> : <>
+      {!activeRun ? <div className="fl-empty"><GitBranch size={28} /><strong>{runsLoaded ? "Tu primera ejecución aparecerá aquí" : "Cargando ejecuciones guardadas…"}</strong><p>{runsLoaded ? "Guarda un flujo y ejecútalo para revisar el recorrido y la evidencia." : "Consultando las pruebas realizadas."}</p></div> : <>
         <p><strong>{activeRun.snapshot.source?.filename || "Ejecución anterior"}</strong> · {activeRun.snapshot.execution_mode === "causal_live" ? "Eventos de Home Assistant · evaluación en directo" : activeRun.snapshot.execution_mode === "causal_future" ? "Eventos futuros · evaluación causal" : "Análisis retrospectivo anterior"} · {activeRun.snapshot.baseline_id ? `Base ${activeRun.snapshot.baseline_id.slice(0, 16)}` : "Base sin procedencia registrada"}</p>
         <CalibrationReport models={Object.assign({}, ...Object.values(activeRun.snapshot.baseline_provenance?.continuous_models || {}))} />
         {activeRun.snapshot.baseline_provenance?.continuous_models && <p className="fl-muted">Entrenamiento completado · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => model.eligible).length} sensores preparados · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => !model.eligible).length} no evaluables</p>}
@@ -285,7 +316,11 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
         <StatisticalLabelReport reports={activeRun.summary.statistical_evaluation} version={activeRun.summary.statistical_evaluation_version} />
         <div className="fl-result-controls"><label>Resultados del nodo<select aria-label="Nodo de resultados" value={resultNode} onChange={(event) => setResultNode(event.target.value)}><option value="output">Salida final</option>{activeRun.snapshot.flow.nodes.filter((item) => item.id !== "output").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><span className="fl-muted">{resultBusy ? "Cargando resultados…" : `${page.total ? page.offset + 1 : 0}–${page.offset + page.items.length} de ${page.total}`}</span><button disabled={resultBusy || page.offset === 0} onClick={() => loadPage(activeRun.run_id, resultNode, Math.max(0, page.offset - PAGE_SIZE))}><ArrowLeft size={15} />Anterior</button><button disabled={resultBusy || page.next_offset === null} onClick={() => loadPage(activeRun.run_id, resultNode, page.next_offset)}>Siguiente<ArrowRight size={15} /></button></div>
         <div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Fecha y hora UTC</th><th>Resultado</th><th>Etiqueta y detección</th><th>Evidencia</th></tr></thead><tbody>{page.items.map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{item.timestamp}</td><td>{DECISIONS[item.final_decision] || SIGNAL_LABELS[item.signal] || "No evaluable"}</td><td>{item.evaluation ? `${item.evaluation.expected} · ${EVALUATION_LABELS[item.evaluation.outcome]}${item.evaluation.type_identified ? " · Tipo identificado" : ""}` : "—"}</td><td><button onClick={() => setSelectedResult(item)}>Ver {item.evidence?.length || 0} etapas</button></td></tr>)}</tbody></table>{!resultBusy && !page.items.length && <p className="fl-empty-row">Este nodo no recibió lecturas en la ejecución.</p>}</div>
-        {selectedResult && <div className="fl-evidence"><h4>Recorrido de {selectedResult.entity_id}</h4>{selectedResult.own_evaluation && <p>Evaluación propia: {selectedResult.own_evaluation.label} · Combinada: {selectedResult.combined_evaluation?.label}{selectedResult.combined_evaluation?.conflict ? " · Conflicto entre evidencias" : ""}</p>}<p className="fl-muted">{selectedResult.timestamp}</p>{(selectedResult.evidence || []).map((entry, index) => <details key={`${entry.node_id}-${index}`}><summary>{labelNode(activeRun.snapshot.flow.nodes.find((item) => item.id === entry.node_id))} · {SIGNAL_LABELS[entry.signal]} · {entry.status === "omitted" ? "Filtro omitido" : entry.status}</summary><pre>{JSON.stringify({ propia: entry.own_evaluation, evidencias_utilizadas: entry.used_evidence_ids, datos: entry.data }, null, 2)}</pre></details>)}</div>}
+        {selectedResult && <div className="fl-evidence"><h4>Recorrido de {selectedResult.entity_id}</h4>
+          {selectedResult.logical_evaluation && <p>Resultado lógico del flujo: {SIGNAL_LABELS[selectedResult.logical_evaluation.signal]}</p>}
+          {selectedResult.own_evaluation && <p>Evaluación propia: {selectedResult.own_evaluation.label} · Combinada: {selectedResult.combined_evaluation?.label}{selectedResult.combined_evaluation?.conflict ? " · Conflicto entre evidencias" : ""}</p>}
+          <p className="fl-muted">{selectedResult.timestamp}</p>{(selectedResult.evidence || []).map((entry, index) => <details key={`${entry.node_id}-${index}`}><summary>{labelNode(activeRun.snapshot.flow.nodes.find((item) => item.id === entry.node_id))} · {SIGNAL_LABELS[entry.signal]} · {entry.status === "omitted" ? "Filtro omitido" : entry.status}</summary><pre>{JSON.stringify({ propia: entry.own_evaluation, evidencias_utilizadas: entry.used_evidence_ids, datos: entry.data }, null, 2)}</pre></details>)}
+        </div>}
       </>}
     </section>
   </section>;

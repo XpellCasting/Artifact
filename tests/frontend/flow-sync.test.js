@@ -25,14 +25,23 @@ test("the workspace follows a remote run and its graph, preserves the local draf
     const run = { run_id: "persisted", created_at: "2026-01-01T00:00:00Z", snapshot: { flow, source: { filename: "prueba.csv" } },
       summary: { candidate_count: 10, output_count: 3 } };
     let shared = { job: null, latest_run_id: "persisted" }, runs = [run];
+    let releaseRuns, releaseModels, firstRuns = true, firstModels = true;
+    const runsReady = new Promise((resolve) => { releaseRuns = resolve; });
+    const modelsReady = new Promise((resolve) => { releaseModels = resolve; });
     const requests = [];
     globalThis.fetch = async (url) => {
       requests.push(url);
       let payload;
       if (url === "/api/flow-evaluations") payload = shared;
       else if (url === "/api/flows") payload = { items: [flow] };
-      else if (url === "/api/flow-runs") payload = { items: runs };
-      else if (url === "/api/diagnostics/classifier-models") payload = { models: [] };
+      else if (url === "/api/flow-runs?compact=true") {
+        if (firstRuns) { firstRuns = false; await runsReady; }
+        payload = { items: runs };
+      }
+      else if (url === "/api/diagnostics/classifier-models") {
+        if (firstModels) { firstModels = false; await modelsReady; }
+        payload = { models: [] };
+      }
       else if (url === "/api/history/home-assistant/config") payload = {};
       else if (url.startsWith("/api/flow-runs/")) payload = { items: [], total: 0, offset: 0, next_offset: null };
       else assert.fail(`Unexpected request: ${url}`);
@@ -44,9 +53,13 @@ test("the workspace follows a remote run and its graph, preserves the local draf
     }
     context.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
     view = await renderInteractive(Host, {});
+    assert.ok(view.container.querySelector('select[aria-label="Abrir flujo guardado"] option[value="remote-flow"]'), "saved flows appear while runs and models are still loading");
+    assert.match(view.container.textContent, /Cargando ejecuciones guardadas/);
+    await React.act(async () => releaseRuns());
     assert.doesNotMatch(view.container.textContent, /Tu primera ejecución aparecerá aquí/);
     assert.match(view.container.querySelector('[aria-label="Resultados de flujos"]').textContent, /prueba.csv/);
     assert.ok(requests.some((url) => url.startsWith("/api/flow-runs/persisted/results")));
+    await React.act(async () => releaseModels());
     shared.job = { job_id: "remote-job", status: "running", mode: "csv", phase: "evaluation", flow, processed: 4, total: 10 };
     await React.act(async () => context.mock.timers.tick(1500));
     assert.match(view.container.textContent, /Ejecución sincronizada entre dispositivos/);

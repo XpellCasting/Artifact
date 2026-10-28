@@ -1,32 +1,22 @@
 import React, { useEffect, useState } from "react";
 import { AlertTriangle, FileSpreadsheet, House, Loader2, Play, Radio, Square } from "lucide-react";
-import { useHomeAssistantConnection } from "../history/use-home-assistant-connection.js";
+import { homeAssistantConnectionLabel, useHomeAssistantConnection } from "../history/use-home-assistant-connection.js";
 import { DECISIONS } from "./flow-lab-model.js";
 
 export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload = canRun, dirty, job, error, replay, upload, onLabelledUpload, onEvaluate, onStartLive, onStopLive }) {
   const [source, setSource] = useState("csv");
-  const [url, setUrl] = useState("http://homeassistant.local:8123");
-  const [configuredUrl, setConfiguredUrl] = useState("");
-  const [tokenConfigured, setTokenConfigured] = useState(false);
-  const [token, setToken] = useState("");
   const [entities, setEntities] = useState("");
   const connection = useHomeAssistantConnection(apiBaseUrl);
-  const integration = Boolean(connection?.bridge_configured || connection?.bridge_connected);
+  const connected = Boolean(connection?.bridge_connected);
   const live = job?.mode === "home_assistant" && job?.status === "running";
   const stopping = live && ["stopping", "saving"].includes(job?.phase);
-  const configured = tokenConfigured && url.trim().replace(/\/$/, "") === configuredUrl.replace(/\/$/, "");
-  useEffect(() => {
-    if (connection?.url) {
-      setUrl(connection.url); setConfiguredUrl(connection.url); setTokenConfigured(connection.token_configured);
-    }
-  }, [connection?.url, connection?.token_configured]);
   useEffect(() => { if (live) setSource("home_assistant"); }, [live]);
 
   async function start(event) {
     event.preventDefault();
-    const started = await onStartLive({ ...(integration ? { connection_mode: "integration", url: "", token: "" } : { url: url.trim(), token: token.trim() }),
+    if (!connected || busy || !canRun || live) return;
+    await onStartLive({
       entity_ids: entities.split(/[,\s]+/).map((value) => value.trim()).filter(Boolean) });
-    if (started) setToken("");
   }
 
   return <div className="fl-future-source" aria-label="Origen de los eventos futuros">
@@ -42,10 +32,8 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
     </div> : <form className="fl-live-form" onSubmit={start}>
       <p>Recibe los cambios de las entidades del historial de referencia y evalúalos a medida que llegan. La recepción permanece activa aunque no lleguen eventos y reintenta la conexión si se corta. Al detenerla se guarda la ejecución.</p>
       {!live && <fieldset disabled={busy}>
-        {integration ? <div className="fl-live-status" role="status"><House size={18} /><strong>{connection.bridge_connected ? "Conectado mediante la integración de Home Assistant" : "Esperando la conexión de Home Assistant"}</strong></div> : <details open={!configured || undefined}><summary>Conexión con Home Assistant{configured ? " · configurada en el servidor" : ""}</summary><div className="fl-live-fields">
-          <label>URL de Home Assistant<input type="url" required value={url} onChange={(event) => setUrl(event.target.value)} /></label>
-          <label>Token de acceso<input type="password" autoComplete="off" required={!configured} value={token} onChange={(event) => setToken(event.target.value)} placeholder={configured ? "Se usará el token configurado" : "Token de larga duración"} /></label>
-        </div></details>}
+        <div className="fl-live-status" role="status"><House size={18} /><strong>{homeAssistantConnectionLabel(connection)}</strong></div>
+        {!connected && <p className="fl-hint">Configura la integración Artifact en Home Assistant y comprueba su conexión para iniciar la recepción.</p>}
         <label>Entidades (opcional)<input value={entities} onChange={(event) => setEntities(event.target.value)} placeholder="sensor.temperatura, binary_sensor.puerta" /><span className="fl-hint">Deja vacío para recibir todas las entidades compatibles del historial de referencia.</span></label>
       </fieldset>}
       {live ? <>
@@ -58,7 +46,7 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
         {job.connection?.late > 0 && <p className="fl-required">{job.connection.late} eventos llegaron fuera de orden y quedaron fuera de la evaluación.</p>}
         <button type="button" disabled={stopping} onClick={onStopLive}>{stopping ? <Loader2 size={16} /> : <Square size={16} />}{stopping ? "Guardando ejecución…" : "Detener recepción y guardar"}</button>
         {!!job.recent_results?.length && <div className="fl-table-scroll"><table aria-label="Últimos resultados en directo"><thead><tr><th>Entidad</th><th>Fecha y hora</th><th>Resultado</th></tr></thead><tbody>{job.recent_results.slice(-20).map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{new Date(item.timestamp).toLocaleString()}</td><td>{DECISIONS[item.final_decision] || "Sin conclusión"}</td></tr>)}</tbody></table></div>}
-      </> : <button className="fl-primary" type="submit" disabled={busy || !canRun || (integration && !connection.bridge_connected)}><Radio size={16} />{dirty ? "Guardar e iniciar recepción" : "Iniciar recepción"}</button>}
+      </> : <button className="fl-primary" type="submit" disabled={busy || !canRun || !connected}><Radio size={16} />{dirty ? "Guardar e iniciar recepción" : "Iniciar recepción"}</button>}
     </form>}
     {error && <div className="fl-notice fl-error" role="alert"><AlertTriangle size={18} /><span>{error}</span></div>}
   </div>;

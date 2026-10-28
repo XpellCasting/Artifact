@@ -5,7 +5,7 @@ import { createServer, renderInteractive } from "../../frontend/test-runtime.js"
 test("CSV accepts only labelled uploads, while live events start without an uploaded CSV", async () => {
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ url: "http://ha.local:8123", token_configured: true }) });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ bridge_configured: true, bridge_connected: true }) });
   let view;
   try {
     const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
@@ -23,10 +23,10 @@ test("CSV accepts only labelled uploads, while live events start without an uplo
     assert.equal(view.container.querySelector("button").disabled, true);
     await view.event(view.container.querySelectorAll('input[type="radio"]')[1], "click");
     assert.equal(view.container.querySelectorAll('input[type="file"]').length, 0);
-    assert.equal(view.container.querySelector('input[type="password"]').required, false);
+    assert.equal(view.container.querySelector('input[type="password"]'), null);
     assert.equal(view.container.querySelector('button[type="submit"]').disabled, false);
     await view.event(view.container.querySelector("form"), "submit");
-    assert.deepEqual(connection, { url: "http://ha.local:8123", token: "", entity_ids: [] });
+    assert.deepEqual(connection, { entity_ids: [] });
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });
 
@@ -53,7 +53,7 @@ test("CSV evaluation requires reference labels, including previously uploaded fi
 test("restored live reception displays results and keeps stop enabled while the flow is busy", async () => {
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ url: "http://ha.local:8123", token_configured: true }) });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ bridge_configured: true, bridge_connected: true }) });
   let view;
   try {
     const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
@@ -84,14 +84,14 @@ test("restored live reception displays results and keeps stop enabled while the 
 test("live reception requires a prepared reference and a valid flow", async () => {
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ url: "http://ha.local:8123", token_configured: false }) });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ bridge_configured: false, bridge_connected: false }) });
   let view;
   try {
     const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
     view = await renderInteractive(Source, { apiBaseUrl: "/api", canRun: false });
     await view.event(view.container.querySelectorAll('input[type="radio"]')[1], "click");
     assert.equal(view.container.querySelector('button[type="submit"]').disabled, true);
-    assert.equal(view.container.querySelector('input[type="password"]').required, true);
+    assert.equal(view.container.querySelector('input[type="password"]'), null);
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });
 
@@ -112,8 +112,8 @@ test("live events use the integration automatically and wait for it when disconn
       assert.equal(view.container.querySelector('button[type="submit"]').disabled, !connected);
       if (connected) {
         await view.event(view.container.querySelector("form"), "submit");
-        assert.deepEqual(started, { connection_mode: "integration", url: "", token: "", entity_ids: [] });
-      } else assert.match(view.container.textContent, /Esperando la conexión/);
+        assert.deepEqual(started, { entity_ids: [] });
+      } else assert.match(view.container.textContent, /Desconectada/);
       await view.close(); view = undefined;
     }
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { templates, validateDraft, connect, removeNode, fingerprint, clone, nextNodeId } from "../../frontend/src/features/flows/flow-lab-model.js";
+import { templates, validateDraft, connect, defaultNodeConfig, removeNode, fingerprint, clone, nextNodeId } from "../../frontend/src/features/flows/flow-lab-model.js";
 
 test("adding multiple nodes preserves distinct IDs in a restored flow without browser cryptography", () => {
   const previousCrypto = Object.getOwnPropertyDescriptor(globalThis, "crypto");
@@ -26,6 +26,22 @@ test("adding multiple nodes preserves distinct IDs in a restored flow without br
 
 test("all researcher templates are valid graphs", () => {
   for (const flow of templates()) assert.deepEqual(validateDraft(flow), [], flow.name);
+});
+
+test("logical nodes and comparison templates use their own logical result", () => {
+  assert.equal(defaultNodeConfig("merge").mode, "any");
+  assert.deepEqual(defaultNodeConfig("decision").accept, ["positive"]);
+  for (const flow of templates()) {
+    for (const node of flow.nodes.filter(node => ["merge", "decision"].includes(node.type))) {
+      assert.equal(node.config.evidence_policy, "independent", flow.name);
+    }
+  }
+  const all = templates().find(flow => flow.name === "Tres filtros: A Y B Y C");
+  assert.equal(all.nodes.find(node => node.type === "merge").config.mode, "all");
+  const composed = templates().find(flow => flow.name === "Tres filtros: (A O B) Y C");
+  assert.equal(composed.nodes.find(node => node.id === "any").config.mode, "any");
+  assert.equal(composed.nodes.find(node => node.id === "all").config.mode, "all");
+  assert.ok(composed.edges.some(edge => edge.source === "any" && edge.target === "all"));
 });
 test("only FOCuS is offered and retired methods cannot be saved", () => {
   const all = templates();

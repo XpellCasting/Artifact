@@ -100,10 +100,16 @@ class ArtifactBridge:
         operation = message.get("operation")
         arguments = message.get("arguments") or {}
         try:
+            result = []
             if operation == "states":
                 rows = [state.as_dict() for state in self.hass.states.async_all() if state.domain in DOMAINS]
                 for index in range(0, len(rows), 500):
                     await queue.put({"type": "result_chunk", "request_id": identifier, "items": rows[index:index + 500]})
+            elif operation == "entity_catalog":
+                rows, areas_available = self._entity_catalog()
+                for index in range(0, len(rows), 500):
+                    await queue.put({"type": "result_chunk", "request_id": identifier, "items": rows[index:index + 500]})
+                result = {"areas_available": areas_available}
             elif operation == "history":
                 from homeassistant.components.recorder import get_instance
                 from homeassistant.components.recorder.history import get_significant_states
@@ -141,12 +147,35 @@ class ArtifactBridge:
                     cancel()
             else:
                 raise ValueError("La operación solicitada no está permitida.")
-            await queue.put({"type": "result", "request_id": identifier, "success": True, "data": []})
+            await queue.put({"type": "result", "request_id": identifier, "success": True, "data": result})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             error = str(exc) if isinstance(exc, ValueError) else "Home Assistant no pudo completar la consulta."
             await queue.put({"type": "result", "request_id": identifier, "success": False, "error": error})
+
+    def _entity_catalog(self):
+        """Resolve entity overrides and device inheritance once, without per-sensor I/O."""
+        rows = [dict(state.as_dict()) for state in self.hass.states.async_all() if state.domain in DOMAINS]
+        try:
+            from homeassistant.helpers import area_registry, device_registry, entity_registry
+            entities = entity_registry.async_get(self.hass).entities
+            devices = device_registry.async_get(self.hass).devices
+            areas = area_registry.async_get(self.hass).areas
+            assignments = []
+            for row in rows:
+                entity = entities.get(row["entity_id"])
+                device = devices.get(entity.device_id) if entity and entity.device_id else None
+                area_id = (entity.area_id if entity else None) or (device.area_id if device else None)
+                # An unresolved reference is unknown metadata, not an unassigned entity.
+                area_name = areas[area_id].name if area_id else None
+                assignments.append((area_id, area_name))
+        except Exception:
+            _LOGGER.debug("Area metadata is unavailable for the Artifact catalog", exc_info=True)
+            return rows, False
+        for row, (area_id, area_name) in zip(rows, assignments):
+            row.update(area_id=area_id, area_name=area_name)
+        return rows, True
 
     @staticmethod
     def _entities(arguments):

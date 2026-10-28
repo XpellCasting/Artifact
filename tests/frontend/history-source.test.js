@@ -36,7 +36,7 @@ test("flow evaluation opens first and links to the separate history selector", a
 test("a CSV is inspected first and only confirmed active sensors are prepared", async () => {
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch, previousXhr = globalThis.XMLHttpRequest;
-  globalThis.fetch = fakeFetch({ url: "http://ha.local:8123", token_configured: false });
+  globalThis.fetch = fakeFetch({ bridge_configured: false, bridge_connected: false });
   const uploaded = [];
   globalThis.XMLHttpRequest = class {
     upload = {};
@@ -77,20 +77,22 @@ test("Home Assistant discovery precedes import and confirmation preserves timezo
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch;
   const calls = [];
-  globalThis.fetch = fakeFetch({ url: "http://ha.local:8123", token_configured: true }, calls);
+  globalThis.fetch = fakeFetch({ bridge_configured: true, bridge_connected: true }, calls);
   let view;
   try {
     const { default: Source } = await server.ssrLoadModule("/src/features/history/HistorySource.jsx");
     let imported;
     view = await renderInteractive(Source, { apiBaseUrl: "/api", onImport: async (payload) => { imported = payload; return true; } });
-    assert.equal(view.container.querySelector('input[type="password"]').required, false);
+    assert.equal(view.container.querySelector('input[type="password"]'), null);
     await view.event(view.container.querySelector("form"), "submit");
     assert.equal(imported, undefined);
     assert.equal(calls.filter((call) => call.url.endsWith("/entities")).length, 1);
-    assert.match(view.container.textContent, /2 de 2 sensores activos/);
+    assert.match(view.container.textContent, /0 de 2 sensores activos/);
+    assert.equal(button(view, "Preparar filtros con").disabled, true);
+    await view.event(button(view, "Activar todos"), "click");
     await view.event(button(view, "Preparar filtros con"), "click");
-    assert.equal(imported.url, "http://ha.local:8123");
-    assert.equal(imported.token, "");
+    assert.equal(imported.url, undefined);
+    assert.equal(imported.token, undefined);
     assert.deepEqual(imported.entity_ids, entities.map((row) => row.entity_id));
     assert.ok(imported.start.endsWith("Z") && imported.end.endsWith("Z"));
     assert.ok(new Date(imported.start) < new Date(imported.end));
@@ -125,10 +127,12 @@ test("the native connection discovers sensors without asking for a URL or token"
     assert.equal(view.container.querySelector('input[type="password"]'), null);
     await view.event(view.container.querySelector("form"), "submit");
     assert.equal(imported, undefined);
+    await view.event(view.container.querySelector('input[aria-label="Analizar sensor.temperature"]'), "click");
     await view.event(button(view, "Preparar filtros con"), "click");
-    assert.equal(imported.connection_mode, "integration");
-    assert.equal(imported.url, "");
-    assert.equal(imported.token, "");
+    assert.equal(imported.connection_mode, undefined);
+    assert.equal(imported.url, undefined);
+    assert.equal(imported.token, undefined);
+    assert.deepEqual(imported.entity_ids, ["sensor.temperature"]);
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });
 

@@ -16,11 +16,21 @@ class NodeHandlers:
             item = deepcopy(item)
             for entry in item.get("evidence", []):
                 entry.setdefault("module_type", getattr(self, "_evidence_nodes", {}).get(entry.get("node_id"), {}).get("type", "unknown"))
-            return append_evidence(item, node_id, node.get("type", "unknown"), signal, status, data,
-                                   policy, getattr(self, "execution_id", ""))
-        result = deepcopy(item)
-        result["signal"] = signal
-        result["evidence"] = [*result.get("evidence", []), {"node_id": node_id, "signal": signal, "status": status, "data": data}]
+            result = append_evidence(item, node_id, node.get("type", "unknown"), signal, status, data,
+                                     policy, getattr(self, "execution_id", ""))
+        else:
+            result = deepcopy(item)
+            result["signal"] = signal
+            result["evidence"] = [*result.get("evidence", []), {"node_id": node_id, "signal": signal, "status": status, "data": data}]
+        kind = node.get("type")
+        if kind in {"merge", "decision"} or (kind == "output" and item.get("logical_evaluation")):
+            # Evidence remains available for diagnosis, but cannot change a logical gate's value.
+            result["signal"] = signal
+            result["logical_evaluation"] = {"node_id": node_id, "signal": signal}
+        elif status == "omitted":
+            result["signal"] = signal
+        else:
+            result.pop("logical_evaluation", None)
         return result
     def _statistical(self, node_id: str, incoming: list[dict[str, Any]], events: pd.DataFrame, entities: pd.DataFrame, config: dict[str, Any]) -> list[dict[str, Any]]:
         if not incoming:
@@ -136,6 +146,10 @@ class NodeHandlers:
                 signal = "positive" if "positive" in signals else "negative" if signals and all(value == "negative" for value in signals) else "unknown"
             base = deepcopy(items[0])
             base["evidence"] = merge_evidence(items)
+            if mode == "output":
+                logical = next((item["logical_evaluation"] for item in items if item.get("logical_evaluation")), None)
+                if logical:
+                    base["logical_evaluation"] = deepcopy(logical)
             output.append(self._with_evidence(base, node_id, signal, f"merge_{mode}", {"signals": signals, "missing_branches": missing}))
         return output
     def _decision(self, node_id: str, incoming: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -143,6 +157,13 @@ class NodeHandlers:
         return [self._with_evidence(item, node_id, "positive" if item.get("signal") in accepted else "negative" if item.get("signal") in {"positive", "negative"} else "unknown", "decision", {"accepted": sorted(accepted)}) for item in incoming]
     @staticmethod
     def _final_decision(item: dict[str, Any]) -> str:
+        if item.get("logical_evaluation"):
+            if item.get("signal") == "negative":
+                return "no_alert"
+            if item.get("signal") != "positive":
+                return "indeterminate"
+            label = item.get("combined_evaluation", {}).get("label")
+            return {"sensor_fault": "fault_compatible", "environmental_anomaly": "environmental"}.get(label, "suspicion")
         if item.get("evidence_policy") == "combine_v1":
             label = item.get("combined_evaluation", {}).get("label", "indeterminate")
             return {"sensor_fault": "fault_compatible", "environmental_anomaly": "environmental",

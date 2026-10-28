@@ -246,6 +246,10 @@ class CausalFlowRunner(FlowRunner):
                     if ((session.snapshot.get("model") or {}).get("method") == "gat_lstm"
                             and session.gat_snapshot is None):
                         raise ValueError("No se pudo cargar el modelo del filtro clasificador. Comprueba sus archivos y dependencias, selecciona otro modelo o desactiva ese filtro.")
+                    if hasattr(session, "prepare_sensor_profiles"):
+                        reference_end = (ordered["timestamp_dt"].min() if not ordered.empty
+                                         else development["timestamp_dt"].max() + pd.Timedelta(microseconds=1))
+                        session.prepare_sensor_profiles(development, reference_end)
                     session.add_events(available)
                     self.diagnostic_sessions[node["id"]] = session
         if contextual_nodes:
@@ -565,18 +569,22 @@ class FlowEvaluationJobs:
         Thread(target=work, daemon=True).start()
         return {"job_id": job_id, "status": "running"}
 
-    def get(self, job_id):
+    def get(self, job_id, *, compact=False):
         with self.lock:
-            return self._snapshot(job_id)
+            return self._snapshot(job_id, compact=compact)
 
     def latest(self, include_run=True):
         with self.lock:
             job_id = next(reversed(self.jobs), None)
             return self._snapshot(job_id, include_run=include_run) if job_id is not None else None
 
-    def _snapshot(self, job_id, include_run=True):
+    def _snapshot(self, job_id, include_run=True, compact=False):
         job = self.jobs[job_id]
-        payload = deepcopy({key: value for key, value in job.items() if include_run or key != "run"})
+        payload = {key: value for key, value in job.items() if include_run or key != "run"}
+        if compact and "run" in payload:
+            run = payload["run"]
+            payload["run"] = {**run, "snapshot": {key: value for key, value in run["snapshot"].items() if key != "diagnostic_snapshots"}}
+        payload = deepcopy(payload)
         if not include_run and "run" in job:
             payload["run_id"] = job["run"]["run_id"]
         source = self.sources.get(job_id)

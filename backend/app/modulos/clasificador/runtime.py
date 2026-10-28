@@ -21,8 +21,8 @@ def load_snapshot(directory: str, model_id: str):
 
 
 def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=None, metrics=None,
-               prediction_cache=None):
-    """Un snapshot cargado una vez por ejecución; no aprende ni recalcula el grafo."""
+               prediction_cache=None, sensor_kind=None):
+    """Pesos congelados; calibra entradas nuevas con el pasado disponible."""
     model, preprocessor, graph, manifest = snapshot
     from app.modulos.clasificador.config import Config
     config = Config(**manifest["config"])
@@ -42,9 +42,26 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
     if newly_onboarded:
         profile = (sensor_profiles or {}).get(entity_id)
         if not profile or profile.get("status") != "available":
-            return reject("incompatible_entity")
-        if parse_utc(timestamp) <= parse_utc(profile["reference_end"]):
+            from app.modulos.clasificador.profiles import profile_from_past
+            try:
+                profile = profile_from_past(event_provider, entity_id, parse_utc(timestamp), config,
+                    {info["kind"] for info in preprocessor["entities"].values()}, sensor_kind)
+            except CausalInputError as exc:
+                return reject(exc.reason)
+            if sensor_profiles is not None:
+                sensor_profiles[entity_id] = profile
+        if (parse_utc(timestamp) <= parse_utc(profile["reference_end"])
+                or (profile.get("available_from")
+                    and parse_utc(timestamp) < parse_utc(profile["available_from"]))):
             return reject("reference_not_prior_to_target")
+        base["onboarding"] = {"reference_start": profile.get("reference_start"),
+            "reference_end": profile["reference_end"], "reference_rows": profile.get("reference_rows"),
+            "available_from": profile.get("available_from"),
+            "policy": profile.get("onboarding_policy", "reviewed_normal_reference_v1"),
+            "reference_origin": profile.get("reference_origin", "reviewed_normal_interval"),
+            "normality_verified": profile.get("normality_verified", True),
+            "sensor_kind": profile.get("sensor_kind", profile["entity"]["kind"]),
+            "input_kind": profile["entity"]["kind"], "compatible_neighbors": 0}
         info = profile["entity"]
         preprocessor = {**preprocessor, "entity_ids": [entity_id], "entities": {entity_id: info},
                         "entity_kinds": {entity_id: info["kind"]}}
@@ -142,7 +159,4 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
             "class_scores": dict(zip(LABELS, scores)), "needs_review": choice is None,
             "input_provenance": sample["metadata"].get("input_provenance", []),
             "reasons": reasons,
-            "input_coverage": coverage,
-            **({"onboarding": {"reference_end": sensor_profiles[entity_id]["reference_end"],
-                                "policy": graph["onboarding_policy"], "compatible_neighbors": len(graph["entity_ids"]) - 1}}
-               if newly_onboarded else {})}
+            "input_coverage": coverage}

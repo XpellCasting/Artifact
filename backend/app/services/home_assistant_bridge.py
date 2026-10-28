@@ -19,6 +19,10 @@ class BridgeUnavailable(ValueError):
     pass
 
 
+class BridgeOperationUnsupported(BridgeUnavailable):
+    pass
+
+
 class BridgeConnection:
     def __init__(self, socket):
         self.socket = socket
@@ -33,7 +37,7 @@ class BridgeConnection:
             raise BridgeUnavailable("La integración de Home Assistant está desconectada.")
         identifier = uuid4().hex
         future = self.loop.create_future()
-        self.pending[identifier] = {"future": future, "items": [], "groups": {}}
+        self.pending[identifier] = {"future": future, "items": [], "groups": {}, "operation": operation}
         try:
             async with self.send_lock:
                 await self.socket.send_json({"type": "request", "request_id": identifier,
@@ -63,9 +67,15 @@ class BridgeConnection:
                 pending["items"].extend(message.get("items", []))
         elif kind == "result":
             if not message.get("success"):
-                pending["future"].set_exception(BridgeUnavailable(message.get("error") or "Home Assistant no pudo completar la consulta."))
+                error = message.get("error") or "Home Assistant no pudo completar la consulta."
+                # Older integrations do not advertise capabilities; recognize only their
+                # explicit unsupported-operation reply, never a timeout or disconnect.
+                error_type = BridgeOperationUnsupported if error == "La operación solicitada no está permitida." else BridgeUnavailable
+                pending["future"].set_exception(error_type(error))
             else:
-                data = (list(pending["groups"].values()) if pending["groups"] else
+                data = ({**(message.get("data") or {}), "entities": pending["items"]}
+                        if pending["operation"] == "entity_catalog" else
+                        list(pending["groups"].values()) if pending["groups"] else
                         pending["items"] if pending["items"] else message.get("data"))
                 pending["future"].set_result(data)
 
@@ -151,8 +161,13 @@ class HomeAssistantBridge:
         with self.lock:
             connection = self.connection
         if connection is None or not connection.connected:
+            if not self.status()["bridge_configured"]:
+                raise BridgeUnavailable("Integración no configurada. Añade Artifact en las integraciones de Home Assistant.")
             raise BridgeUnavailable("La integración de Home Assistant está desconectada. Comprueba que esté cargada y que Artifact sea accesible.")
         return connection
+
+    def require_connected(self):
+        self._connection()
 
     @staticmethod
     def _wait(connection, coroutine, timeout=125, stop_event=None):
@@ -179,6 +194,12 @@ class HomeAssistantBridge:
     def request(self, operation, arguments):
         connection = self._connection()
         return self._wait(connection, connection.request(operation, arguments))
+
+    def entity_catalog(self):
+        try:
+            return self.request("entity_catalog", {})
+        except BridgeOperationUnsupported:
+            return {"entities": self.request("states", {}), "areas_available": False}
 
     def history_transport(self, path):
         from urllib.parse import parse_qs, unquote, urlsplit

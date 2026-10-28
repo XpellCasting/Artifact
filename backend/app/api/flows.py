@@ -10,7 +10,6 @@ from app.flow.evaluacion import CausalFlowRunner
 from fastapi import APIRouter
 from app.api.schemas import FlowRunRequest, HomeAssistantLiveRequest
 from app.services.home_assistant_live import HomeAssistantEventSource
-from app.services.home_assistant_history import resolve_connection
 from app.services.runtime import state, flow_store, flow_evaluation_jobs, home_assistant_bridge
 router = APIRouter()
 
@@ -94,15 +93,16 @@ def shared_flow_evaluation():
 
 
 @router.get("/flow-evaluations/{job_id}", tags=["flow-evaluation"])
-def flow_evaluation_status(job_id: str):
+def flow_evaluation_status(job_id: str, compact: bool = False):
     try:
-        return flow_evaluation_jobs.get(job_id)
+        return flow_evaluation_jobs.get(job_id, compact=compact)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="La evaluación no está disponible; el servicio pudo reiniciarse. Las ejecuciones terminadas siguen guardadas.") from exc
 
 @router.post("/flows/{flow_id}/live/start", tags=["flow-evaluation"])
 def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
     try:
+        home_assistant_bridge.require_connected()
         flow = flow_store.get(flow_id)
         require_classifier_models(flow)
         with state.validation_replay_lock:
@@ -113,12 +113,8 @@ def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
             baseline = deepcopy(state.future_baseline_template)
             context_map = deepcopy(state.future_context_map_template or {})
             runner = CausalFlowRunner(deepcopy(state.filtro_estadistico), deepcopy(state.filtro_contextual), state.diagnostic_workbench)
-        integration = request.connection_mode == "integration" or (
-            request.connection_mode == "auto" and home_assistant_bridge.status()["bridge_connected"]
-            and not request.url and not request.token.get_secret_value())
-        url, token = ("", "") if integration else resolve_connection(request.url, request.token.get_secret_value())
-        source = HomeAssistantEventSource(url, token, entities, development["timestamp_dt"].max(), request.entity_ids,
-                                          bridge=home_assistant_bridge if integration else None)
+        source = HomeAssistantEventSource(entities, development["timestamp_dt"].max(), request.entity_ids,
+                                          bridge=home_assistant_bridge)
         def evaluate(progress, result_sink):
             summary, results, snapshot = runner.evaluate(
                 flow, development, development.iloc[:0].copy(), entities, context_map, baseline,
@@ -144,8 +140,8 @@ def stop_live_flow(job_id: str):
         raise HTTPException(status_code=404, detail="La recepción ya no está disponible.") from exc
 
 @router.get("/flow-runs", tags=["flow-lab"])
-def flow_runs(flow_id: str | None = None) -> dict[str, Any]:
-    return {"items": flow_store.list_runs(flow_id)}
+def flow_runs(flow_id: str | None = None, compact: bool = False) -> dict[str, Any]:
+    return {"items": flow_store.list_runs(flow_id, compact=compact)}
 
 @router.get("/flow-alerts", tags=["flow-lab"])
 def flow_alerts(

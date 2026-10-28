@@ -12,11 +12,28 @@ class DiagnosticRepository:
                 CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
                     source TEXT NOT NULL, entity_id TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS decisions_source_time ON decisions(source,timestamp);
+                CREATE TABLE IF NOT EXISTS run_sensor_profiles(run_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(run_id,entity_id));
             """)
 
     def save_decisions(self, rows):
         with self._connect() as connection:
             connection.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)", rows)
+
+    def sensor_profiles_for_run(self, run_id):
+        with self._connect() as connection:
+            return {row[0]: json.loads(row[1]) for row in connection.execute(
+                "SELECT entity_id,payload FROM run_sensor_profiles WHERE run_id=?", (run_id,))}
+
+    def save_sensor_profiles_for_run(self, run_id, profiles):
+        from app.modulos.clasificador.profiles import AUTOMATIC_POLICY
+        rows = [(run_id, entity, json.dumps(profile, ensure_ascii=False, allow_nan=False))
+                for entity, profile in profiles.items()
+                if profile.get("onboarding_policy") == AUTOMATIC_POLICY]
+        if rows:
+            with self._connect() as connection:
+                connection.executemany("INSERT OR IGNORE INTO run_sensor_profiles VALUES (?,?,?)", rows)
+
     @contextmanager
     def _connect(self):
         connection = sqlite3.connect(self.database, timeout=60)

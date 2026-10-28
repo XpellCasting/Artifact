@@ -36,7 +36,7 @@ class FlowSyncTests(unittest.TestCase):
     def test_independent_clients_discover_the_same_execution_and_results_without_a_job_id(self):
         flow = {"flow_id": "flow", "name": "Flujo compartido", "nodes": [], "edges": []}
         summary = {"candidate_count": 4}
-        evaluate = Mock(return_value=(summary, None, {"flow": flow, "source": {}}))
+        evaluate = Mock(return_value=(summary, None, {"flow": flow, "source": {}, "diagnostic_snapshots": {"audit": "fixture"}}))
         api = self.api(self.jobs)
         with TestClient(api) as first, TestClient(api) as second:
             self.assertEqual(first.get("/flow-evaluations").json(), {"job": None, "latest_run_id": None})
@@ -60,9 +60,17 @@ class FlowSyncTests(unittest.TestCase):
             self.assertNotIn("run", completed["job"])
             details = second.get(f"/flow-evaluations/{started['job_id']}").json()
             self.assertEqual(details["run"]["summary"], summary)
+            self.assertIn("diagnostic_snapshots", details["run"]["snapshot"])
+            compact = second.get(f"/flow-evaluations/{started['job_id']}?compact=true").json()
+            self.assertNotIn("diagnostic_snapshots", compact["run"]["snapshot"])
+            self.assertEqual(compact["run"]["summary"], summary)
             run_id = completed["job"]["run_id"]
             self.assertEqual(completed["latest_run_id"], run_id)
             self.assertEqual(first.get("/flow-runs").json()["items"][0]["run_id"], run_id)
+            listed = first.get("/flow-runs?compact=true&flow_id=flow").json()["items"][0]
+            self.assertNotIn("diagnostic_snapshots", listed["snapshot"])
+            self.assertEqual(listed["run_id"], run_id)
+            self.assertEqual(first.get("/flow-runs?compact=true&flow_id=other").json()["items"], [])
 
         # Discovery still announces persisted results after the API is restarted.
         with TestClient(self.api(FlowEvaluationJobs(FlowStore(self.path)))) as restarted:
