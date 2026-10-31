@@ -75,3 +75,7 @@ Thumbs.db
 
 *.[mM][dD]
 ![rR][eE][aA][dD][mM][eE].[mM][dD]
+!ENTRENAMIENTO_ESCENARIOS.md
+
+# Datos derivados portables: se entregan mediante el paquete con hashes.
+/training/escenarios_*/

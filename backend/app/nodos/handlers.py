@@ -17,7 +17,7 @@ class NodeHandlers:
             for entry in item.get("evidence", []):
                 entry.setdefault("module_type", getattr(self, "_evidence_nodes", {}).get(entry.get("node_id"), {}).get("type", "unknown"))
             result = append_evidence(item, node_id, node.get("type", "unknown"), signal, status, data,
-                                     policy, getattr(self, "execution_id", ""))
+                                     policy, getattr(self, "execution_id", ""), filter_config=node.get("config",{}))
         else:
             result = deepcopy(item)
             result["signal"] = signal
@@ -111,6 +111,8 @@ class NodeHandlers:
             f1 = next((e for e in reversed(item.get("evidence", [])) if e.get("status") in {"suspicion", "no_suspicion"}), None)
             f2 = next((e.get("data", {}) for e in reversed(item.get("evidence", [])) if "context_outcome" in e.get("data", {})), {})
             contexts.append({**deepcopy(f2), **identity, "event_id": item["observation_id"], "routing": {"terminal": False}})
+            contexts[-1]["filter_evidence"] = deepcopy(item.get("evidence", []))
+            contexts[-1]["scenario_id"] = item.get("scenario_id", "runtime")
             candidate = {**(deepcopy(f1.get("data", {})) if f1 else {}), **identity}
             if f1 is not None:
                 candidate["is_suspicious"] = f1["signal"] == "positive"
@@ -164,7 +166,7 @@ class NodeHandlers:
                 return "indeterminate"
             label = item.get("combined_evaluation", {}).get("label")
             return {"sensor_fault": "fault_compatible", "environmental_anomaly": "environmental"}.get(label, "suspicion")
-        if item.get("evidence_policy") == "combine_v1":
+        if item.get("evidence_policy") == "combine_v1" or item.get("combined_evaluation", {}).get("policy") == "integrated_classifier_v1":
             label = item.get("combined_evaluation", {}).get("label", "indeterminate")
             return {"sensor_fault": "fault_compatible", "environmental_anomaly": "environmental",
                     "normal": "normal", "no_alert": "no_alert", "suspicion": "suspicion"}.get(label, "indeterminate")

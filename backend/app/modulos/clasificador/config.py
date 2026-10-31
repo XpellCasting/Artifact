@@ -50,13 +50,18 @@ class Config:
     entity_value_modes: dict[str, str] | None = None
     segment_encoder: str = "gat"
     active_scales: tuple[bool, bool, bool] = (True, True, True)
+    checkpoint_selection: str = "class_macro_f1"
+    require_all_classes: bool = True
+    frozen_sensor_catalog: bool = False
 
     def __post_init__(self):
         expected_schema = SCHEMA_VERSION
         if self.method != "gat_lstm" or self.schema_version != expected_schema or self.task != "diagnostic_3class":
             raise ValueError("Método, tarea o versión de esquema incompatibles")
-        if self.architecture_version not in {"gat_lstm_v3_segments_multiscale"}:
+        if self.architecture_version not in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
             raise ValueError("Versión de arquitectura GAT-LSTM incompatible")
+        if self.checkpoint_selection not in {"class_macro_f1", "type_macro_f1"}:
+            raise ValueError("Criterio de selección inválido")
         if self.pretrain_enabled:
             raise ValueError("El preentrenamiento predictivo aún no está disponible en GAT-LSTM por segmentos")
         expected_lookback = (self.sequence_steps - 1) * self.grid_seconds

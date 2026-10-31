@@ -1,0 +1,218 @@
+{
+  "calibration_end": "2026-02-15T00:00:00+00:00",
+  "calibration_start": "2026-02-01T00:00:00+00:00",
+  "context_seconds": 259200,
+  "durations": {
+    "bias": [
+      3600,
+      10800,
+      21600
+    ],
+    "drift": [
+      10800,
+      21600,
+      43200
+    ],
+    "noise": [
+      3600,
+      10800,
+      21600
+    ],
+    "spike": [
+      0
+    ],
+    "state_replace": [
+      900,
+      3600,
+      10800
+    ],
+    "stuck": [
+      3600,
+      10800,
+      21600
+    ],
+    "unavailable": [
+      900,
+      3600,
+      10800
+    ]
+  },
+  "environmental_episodes": 2,
+  "environmental_group": {
+    "amount_native_units": 3.0,
+    "entities": [
+      "sensor.weatherstation_inside_temp_2",
+      "sensor.office_sensor_temperature",
+      "sensor.hall_sensor_temperature"
+    ],
+    "name": "cambio_termico_interior_coherente",
+    "unit": "temperature_native",
+    "unit_basis": "Escenario térmico predefinido en evaluation_injections.json; unidades nativas, sin certificar equivalencia física de dispositivos."
+  },
+  "factors": {
+    "bias": 3.0,
+    "drift": 3.0,
+    "noise": 1.0,
+    "spike": 6.0
+  },
+  "input_hashes": {
+    "audit": "be8a40afb2469d8fd45813bc8c1bfee537e985196ff8494a17a749a7a72f52f3",
+    "source": "ddc03e27c4e7378cf26fd1d025d3baaeff4eaf87c3fdae3d473a714ee8fcea51"
+  },
+  "model": {
+    "batch_size": 16,
+    "device": "auto",
+    "max_epochs": 30,
+    "patience": 5
+  },
+  "normal_stride_seconds": 3600,
+  "partitions": {
+    "dev_tune": [
+      "2026-04-01T00:00:00Z",
+      "2026-05-01T00:00:00Z"
+    ],
+    "test": [
+      "2026-05-01T00:00:00Z",
+      "2026-06-01T00:00:00Z"
+    ],
+    "train_fit": [
+      "2026-02-01T00:00:00Z",
+      "2026-04-01T00:00:00Z"
+    ]
+  },
+  "quotas": {
+    "dev_tune": {
+      "episodes_per_type": 5,
+      "scenarios": 2
+    },
+    "test": {
+      "episodes_per_type": 5,
+      "scenarios": 2
+    },
+    "train_fit": {
+      "episodes_per_type": 8,
+      "scenarios": 5
+    }
+  },
+  "robustness_durations": {
+    "bias": [
+      7200,
+      14400
+    ],
+    "drift": [
+      14400,
+      28800
+    ],
+    "noise": [
+      7200,
+      14400
+    ],
+    "spike": [
+      0
+    ],
+    "state_replace": [
+      1800,
+      7200
+    ],
+    "stuck": [
+      7200,
+      14400
+    ],
+    "unavailable": [
+      1800,
+      7200
+    ]
+  },
+  "robustness_intensities": [
+    0.75,
+    1.25,
+    2.0
+  ],
+  "seed": 20261029,
+  "sensors": {
+    "binary_sensor.door_office": {
+      "kind": "binary"
+    },
+    "binary_sensor.office_sensor_motion": {
+      "kind": "binary"
+    },
+    "light.hall_downlight": {
+      "kind": "binary"
+    },
+    "sensor.hall_person_count": {
+      "kind": "multistate",
+      "unit": "count"
+    },
+    "sensor.hall_review_status": {
+      "kind": "multistate"
+    },
+    "sensor.hall_sensor_temperature": {
+      "kind": "continuous",
+      "limits": [
+        null,
+        null
+      ],
+      "unit": "temperature_native"
+    },
+    "sensor.office_sensor_illuminance": {
+      "kind": "continuous",
+      "limits": [
+        0,
+        null
+      ],
+      "unit": "illuminance_native"
+    },
+    "sensor.office_sensor_temperature": {
+      "kind": "continuous",
+      "limits": [
+        null,
+        null
+      ],
+      "unit": "temperature_native"
+    },
+    "sensor.shellyemg3_e4b063d49ecc_energy_meter_0_power": {
+      "kind": "continuous",
+      "limits": [
+        null,
+        null
+      ],
+      "unit": "unverified"
+    },
+    "sensor.sittingroom_person_count": {
+      "kind": "multistate",
+      "unit": "count"
+    },
+    "sensor.sittingroom_review_status": {
+      "kind": "multistate"
+    },
+    "sensor.weatherstation_inside_temp_2": {
+      "kind": "continuous",
+      "limits": [
+        null,
+        null
+      ],
+      "unit": "temperature_native"
+    },
+    "sensor.weatherstation_temp_2": {
+      "kind": "continuous",
+      "limits": [
+        null,
+        null
+      ],
+      "unit": "temperature_native"
+    },
+    "switch.hall_motion": {
+      "kind": "binary"
+    },
+    "switch.officeheater2": {
+      "kind": "binary"
+    }
+  },
+  "target_stride_seconds": 300,
+  "training_seeds": [
+    20261029,
+    20261030,
+    20261031
+  ],
+  "version": "synthetic-scenarios-v1"
+}

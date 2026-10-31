@@ -149,7 +149,7 @@ class FileArray:
 
 def sample_summaries(samples):
     """Accede a etiquetas y metadatos sin leer las ventanas de características."""
-    if isinstance(samples, DiskPartition):
+    if hasattr(samples, "summaries"):
         return samples.summaries()
     return iter(samples)
 

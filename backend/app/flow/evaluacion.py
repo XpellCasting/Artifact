@@ -210,7 +210,7 @@ class CausalFlowRunner(FlowRunner):
         for snapshot in diagnostic_snapshots.values():
             model = snapshot.get("model") or {}
             model_config = model.get("config") or {}
-            if model_config.get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+            if model_config.get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
                 diagnostic_windows.append(259200)
                 continue
             lookback = model_config.get("lookback_seconds")

@@ -69,3 +69,45 @@ class SegmentGATLSTM(nn.Module):
         if return_encoder:
             return representation
         return self.classifier(representation), self.fault_type_classifier(representation)
+
+
+class OptionalEvidenceGATLSTM(nn.Module):
+    """Frozen autonomous backbone with an exactly gated residual correction."""
+    architecture_version = "gat_lstm_v4_optional_evidence"
+
+    def __init__(self, backbone):
+        super().__init__()
+        from app.modulos.clasificador.evidence_features import FEATURE_NAMES
+        self.backbone = backbone
+        self.backbone.requires_grad_(False)
+        hidden = backbone.classifier.in_features
+        self.residual = nn.Sequential(nn.Linear(hidden+len(FEATURE_NAMES), 32), nn.ReLU(),
+                                      nn.Linear(32, 3+len(FAULT_TYPES)))
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+
+    @property
+    def kind_ids(self):
+        return self.backbone.kind_ids
+
+    @property
+    def threshold(self):
+        return self.backbone.threshold
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+    def forward(self, x, state_ids, adjacency, node_present, kind_ids=None,
+                evidence=None, evidence_valid=None):
+        self.backbone.eval()
+        with torch.no_grad():
+            h = self.backbone(x, state_ids, adjacency, node_present, kind_ids, return_encoder=True)
+            logits = self.backbone.classifier(h)
+            types = self.backbone.fault_type_classifier(h)
+        if evidence is None or evidence_valid is None:
+            return logits, types
+        correction = self.residual(torch.cat([h, evidence], -1))
+        correction = torch.where(evidence_valid[..., None], correction, torch.zeros_like(correction))
+        return logits+correction[..., :3], types+correction[..., 3:]

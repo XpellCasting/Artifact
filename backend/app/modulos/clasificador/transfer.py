@@ -227,6 +227,9 @@ def _validate_model(directory, model_id, dataset=None, sequence_dir=None):
     # mmap avoids retaining a second full copy of the serialized weights in RAM.
     state = torch.load(weights, map_location="cpu", weights_only=True, mmap=True)
     model = SegmentGATLSTM(len(FEATURE_NAMES), [prep["entities"][key]["kind"] for key in entities], config)
+    if config.architecture_version == "gat_lstm_v4_optional_evidence":
+        from app.modulos.clasificador.network_segments import OptionalEvidenceGATLSTM
+        model = OptionalEvidenceGATLSTM(model)
     model.load_state_dict(state, strict=True)
     expected_kinds = torch.tensor([KIND_TO_ID[prep["entities"][key]["kind"]] for key in entities])
     if not torch.equal(model.kind_ids, expected_kinds):

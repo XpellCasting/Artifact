@@ -21,17 +21,23 @@ def load_snapshot(directory: str, model_id: str):
 
 
 def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=None, metrics=None,
-               prediction_cache=None, sensor_kind=None):
+               prediction_cache=None, sensor_kind=None, filter_evidence=(), scenario_id="runtime", observation_id=None):
     """Pesos congelados; calibra entradas nuevas con el pasado disponible."""
     model, preprocessor, graph, manifest = snapshot
     from app.modulos.clasificador.config import Config
     config = Config(**manifest["config"])
+    integrated = config.architecture_version == "gat_lstm_v4_optional_evidence"
+    from app.modulos.clasificador.evidence_features import encode_evidence
+    encoded = encode_evidence(filter_evidence, observation_id=observation_id, timestamp=timestamp)
     base = {"entity_id": entity_id, "timestamp": timestamp, "method": "gat_lstm",
             "compatibility": None, "fault_type": None, "model_version": manifest["model_id"],
             "preprocessor_version": preprocessor.get("schema_version"),
             "graph_version": graph.get("graph_version"),
             "confidence_kind": "uncalibrated_softmax", "evaluation_scope": "causal_runtime",
             "fault_type_status": "not_supported"}
+    if integrated:
+        base.update(decision_policy="integrated_classifier_v1", classifier_evaluable=False,
+                    evidence_mode=encoded["mode"], consumed_evidence_ids=encoded["consumed_ids"])
 
     def reject(reason, coverage=None):
         return {**base, "status": "indeterminate", "predicted_label": None,
@@ -40,6 +46,8 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
 
     newly_onboarded = entity_id not in preprocessor["entity_ids"]
     if newly_onboarded:
+        if config.frozen_sensor_catalog:
+            return reject("entity_outside_frozen_training_catalog")
         profile = (sensor_profiles or {}).get(entity_id)
         if not profile or profile.get("status") != "available":
             from app.modulos.clasificador.profiles import profile_from_past
@@ -70,7 +78,8 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
         graph["graph_version"] = hashlib.sha256(json.dumps({"graph": graph, "profile": profile}, sort_keys=True).encode()).hexdigest()
         base["graph_version"] = graph["graph_version"]
     cache_key = (manifest["model_id"], str(timestamp), tuple(preprocessor["entity_ids"]),
-                 graph.get("graph_version"), tuple(tuple(row) for row in graph["adjacency"]))
+                 graph.get("graph_version"), tuple(tuple(row) for row in graph["adjacency"]),
+                 scenario_id, observation_id, encoded["fingerprint"] if integrated else None)
     cache_entry = prediction_cache.get(cache_key) if prediction_cache is not None else None
     if cache_entry is None:
         sample_started = perf_counter()
@@ -123,7 +132,14 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
             from app.modulos.clasificador.model_constants import KIND_TO_ID
             kinds = torch.tensor([KIND_TO_ID[preprocessor["entities"][key]["kind"]]
                                   for key in preprocessor["entity_ids"]], dtype=torch.long)
-            class_logits, type_logits = model(x, state_ids, adjacency, node_present, kinds)
+            if integrated:
+                evidence_tensor = torch.zeros((1,len(preprocessor["entity_ids"]),len(encoded["values"])))
+                evidence_tensor[0,index] = torch.tensor(encoded["values"])
+                evidence_valid = torch.zeros((1,len(preprocessor["entity_ids"])),dtype=torch.bool)
+                evidence_valid[0,index] = encoded["usable"]
+                class_logits, type_logits = model(x,state_ids,adjacency,node_present,kinds,evidence=evidence_tensor,evidence_valid=evidence_valid)
+            else:
+                class_logits, type_logits = model(x, state_ids, adjacency, node_present, kinds)
             scores_by_node = torch.softmax(class_logits[0], dim=-1).tolist()
             type_scores_by_node = torch.softmax(type_logits[0], dim=-1).tolist()
         cache_entry["scores_by_node"] = scores_by_node
@@ -137,6 +153,9 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
     type_scores = (cache_entry["type_scores_by_node"][index]
                    if cache_entry["type_scores_by_node"] is not None else None)
     policy = manifest.get("rejection_policy", {"threshold": .4, "margin": 0.0})
+    if integrated:
+        mode_policy=manifest.get("metrics",{}).get("evidence_mode_policies",{}).get(encoded["mode"],{})
+        policy=mode_policy.get("rejection_policy",policy)
     choice = decide(scores, policy["threshold"], policy["margin"])
     label = LABELS[choice] if choice is not None else None
     status = ("indeterminate" if choice is None else "compatible" if choice == 2
@@ -146,14 +165,23 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
     metrics = manifest.get("metrics", {})
     type_name = fault_types[type_index] if type_index is not None else None
     type_validation = metrics.get("fault_type_validation", {})
+    if integrated:
+        type_validation=mode_policy.get("fault_type_validation",{})
     type_identified = (type_name is not None
         and metrics.get("fault_type_train_episode_support", {}).get(type_name, 0) >= 3
         and type_validation.get("independent_episodes_by_type", {}).get(type_name, 0) >= 3
         and (type_validation.get("recall_by_type", {}).get(type_name) or 0) >= .5)
     reasons = ["score_below_rejection_policy"] if choice is None else []
+    blocking=[]
+    if metrics.get("fault_type_train_episode_support",{}).get(type_name,0)<3: blocking.append("fewer_than_three_original_train_contexts")
+    if type_validation.get("independent_episodes_by_type",{}).get(type_name,0)<3: blocking.append("fewer_than_three_original_validation_contexts")
+    if (type_validation.get("recall_by_type",{}).get(type_name) or 0)<.5: blocking.append("validation_recall_below_0.5")
+    if integrated: base["classifier_evaluable"]=True
     return {**base, "status": status,
             "fault_type_status": ("identified" if type_identified else "unknown") if choice == 2 else "not_applicable",
-            "fault_type": type_name if type_identified else None,
+            "fault_type": type_name if type_identified and choice == 2 else None,
+            "candidate_fault_type":type_name,"fault_type_scores":dict(zip(fault_types,type_scores or [])),
+            "fault_type_block_reasons":blocking if choice == 2 else ["general_class_not_sensor_fault"],
             "fault_type_confidence": type_confidence,
             "predicted_label": label, "confidence": max(scores),
             "class_scores": dict(zip(LABELS, scores)), "needs_review": choice is None,

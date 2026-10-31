@@ -22,9 +22,8 @@ def canonical(value):
 
 def provenance():
     directory = Path(__file__).resolve().parent
-    sources = {name: hashlib.sha256((directory / name).read_text(encoding="utf-8").encode()).hexdigest() for name in
-               ("training.py", "network_segments.py", "segments.py", "config.py",
-                "model_constants.py", "checkpoints.py", "balancing.py")}
+    sources = {path.name: hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest()
+               for path in sorted(directory.glob("*.py"))}
     versions = {}
     for name in ("torch", "torch-geometric", "numpy", "tzdata"):
         try:

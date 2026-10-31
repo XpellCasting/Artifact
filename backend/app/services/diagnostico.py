@@ -114,7 +114,7 @@ class DiagnosticRunSession:
         else:
             self.window_seconds = (self.snapshot.get("model") or {}).get("window_seconds", 3600)
         self.references = {}
-        if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+        if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
             self.window_seconds = 259200
         for reference in self.snapshot["references"]:
             end, _ = parse_time(reference["end"])
@@ -188,7 +188,7 @@ class DiagnosticRunSession:
             for entity, items in list(self.events.items()):
                 head = self.event_heads.get(entity, 0)
                 boundary = bisect_left(items, cutoff, lo=head, key=lambda item: item[0])
-                if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+                if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
                     boundary = max(head, boundary - 1)
                 for at, row in items[head:boundary]:
                     self.seen.discard((entity, at.value, row.get("source_row")))
@@ -220,7 +220,7 @@ class DiagnosticRunSession:
             values = self.events.get(str(entity), [])
             head = self.event_heads.get(str(entity), 0)
             left = bisect_left(values, start, lo=head, key=lambda item: item[0])
-            if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+            if (self.snapshot.get("model") or {}).get("config", {}).get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
                 left = max(head, left - 1)
             right = bisect_right(values, end, lo=head, key=lambda item: item[0])
             result.extend(row for _, row in values[left:right])
@@ -256,7 +256,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
     @staticmethod
     def _is_supported(item):
-        return item.get("method", "gat_lstm") == "gat_lstm" and item.get("config", {}).get("architecture_version") in {"gat_lstm_v3_segments_multiscale"}
+        return item.get("method", "gat_lstm") == "gat_lstm" and item.get("config", {}).get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}
 
     @classmethod
     def _require_supported(cls, item):
@@ -424,7 +424,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
         states = [str(row["state"]) for row in rows if valid_state(str(row["state"]))]
         kind = kind_row["kind"]
         active = self._active()
-        if active and self._read("models", active).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+        if active and self._read("models", active).get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
             kind = "continuous" if states and all(_finite_number(v) for v in states) else "multistate"
         profile_entity = {"kind": kind, "max_age_seconds": 900, "normal_references": []}
         if kind == "continuous":
@@ -522,7 +522,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
             from app.modulos.clasificador.training_coverage import require_training_coverage
             require_training_coverage(dataset)
         config = GATConfig(**(gat_config or dataset["config"]))
-        if config.architecture_version == "gat_lstm_v3_segments_multiscale" and importlib.util.find_spec("torch_geometric") is None:
+        if config.architecture_version in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"} and importlib.util.find_spec("torch_geometric") is None:
             raise ReviewError("GAT-LSTM por segmentos no está disponible: falta PyTorch Geometric.", 503)
         built_config = dataset["config"]
         for key in ("grid_seconds", "sequence_steps", "feature_window_seconds", "graph_top_k",
@@ -647,7 +647,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
         if trained.get("method") == "gat_lstm":
             if importlib.util.find_spec("torch") is None:
                 raise ReviewError("GAT-LSTM no está disponible: falta PyTorch.", 503)
-            if trained.get("architecture_version") == "gat_lstm_v3_segments_multiscale" and importlib.util.find_spec("torch_geometric") is None:
+            if trained.get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"} and importlib.util.find_spec("torch_geometric") is None:
                 raise ReviewError("GAT-LSTM por segmentos requiere PyTorch Geometric.", 503)
             from app.modulos.clasificador.training import load_candidate
             load_candidate(model_id, self.directory)  # hash, esquema y dimensiones antes de publicar
@@ -692,7 +692,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
         snapshot = self._run_snapshot_for_model(source, run_id, model_id)
         if (snapshot.get("model") or {}).get("method") == "gat_lstm":
             config = snapshot["model"]["config"]
-            if config.get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+            if config.get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
                 return 259200
             return (config["sequence_steps"] - 1) * config["grid_seconds"] + config["feature_window_seconds"]
         return snapshot["model"]["window_seconds"] if snapshot["model"] else 3600
@@ -786,7 +786,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
                 for entity in requested:
                     values = rows_by_entity.get(entity, [])
                     left = bisect_left(values, start, key=lambda pair: pair[0])
-                    if trained.get("config", {}).get("architecture_version") == "gat_lstm_v3_segments_multiscale":
+                    if trained.get("config", {}).get("architecture_version") in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
                         left = max(0, left - 1)
                     right = bisect_right(values, end, key=lambda pair: pair[0])
                     found.extend(row for _, row in values[left:right])
@@ -808,13 +808,17 @@ class DiagnosticWorkbench(DiagnosticRepository):
                     session.stats["gat_candidates"] += 1
                 result = predict_at(gat_snapshot, provider, entity_id, timestamp, sensor_profiles,
                                     metrics=session.stats if session is not None else None,
-                                    prediction_cache=prediction_cache, sensor_kind=item.get("sensor_kind"))
+                                    prediction_cache=prediction_cache, sensor_kind=item.get("sensor_kind"),
+                                    filter_evidence=item.get("filter_evidence", []), scenario_id=item.get("scenario_id", "runtime"),
+                                    observation_id=item.get("observation_id"))
                 target_us, _ = parse_time(timestamp)
                 if source != "history" and entity_id in entities and trained.get("training_end"):
                     if target_us <= parse_time(trained["training_end"])[0]:
                         result.update(status="indeterminate", predicted_label=None, confidence=0.0,
                                       class_scores={}, needs_review=True,
                                       reasons=["target_not_after_training_period"])
+                        if result.get("decision_policy") == "integrated_classifier_v1":
+                            result["classifier_evaluable"] = False
             except (ValueError, KeyError, TypeError, OverflowError, RuntimeError) as exc:
                 reason = (exc.reason if hasattr(exc, "reason") else
                           "invalid_event_format" if isinstance(exc, (ValueError, KeyError, TypeError, OverflowError))

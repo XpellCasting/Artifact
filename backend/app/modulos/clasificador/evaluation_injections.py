@@ -13,6 +13,7 @@ from app.modulos.clasificador.digests import sha256_file
 from app.modulos.clasificador.model_constants import FAULT_TYPES
 from app.services.csv_etiquetado import labelled_columns, read_label
 from app.services.estados_validos import valid_state
+from app.modulos.clasificador.interventions import altered_value
 
 VERSION="heldout_interventions_v1"
 
@@ -184,18 +185,11 @@ def generate_evaluation(csv_path,preprocessor,output,plan,*,seed=20261024):
                     if kind!="spike" or number==block["spike_row"]:
                         before=row["state"];amount=episode["amounts"][entity]
                         progress=(at-start).total_seconds()/max(1.,(end-start).total_seconds())
-                        if kind=="unavailable": after="unavailable"
-                        elif kind=="stuck": after=block["first_state"]
-                        elif kind=="state_replace":
-                            categories=sorted(entities[entity]["vocab"])
-                            after=next(value for value in categories if value!=before)
-                        else:
-                            delta=(randomizers[episode["episode_id"]].gauss(0,amount) if kind=="noise"
-                                   else amount*progress if kind=="drift"
-                                   else amount*(.25+.75*math.sin(math.pi*progress)) if kind=="environmental_anomaly" else amount)
-                            value=_bounded(entity,float(before)+delta)
-                            if not math.isfinite(value):
-                                raise ValueError("La intervención produjo un valor no finito")
+                        after=altered_value(kind,before,amount=amount,progress=progress,
+                            initial=block["first_state"],categories=entities[entity].get("vocab",{}),
+                            rng=randomizers[episode["episode_id"]])
+                        if kind in {"spike","bias","drift","noise","environmental_anomaly"}:
+                            value=_bounded(entity,float(after))
                             after=repr(value) if value!=float(before) else before
                         if entities[entity]["kind"]=="continuous" and valid_state(after) and float(after)==float(before):
                             after=before

@@ -8,6 +8,10 @@ VERSION = "equal_class_episode_v1"
 
 
 def episode_identity(metadata):
+    if metadata.get("original_context_id"):
+        context=str(metadata["original_context_id"])
+        group=metadata.get("balance_episode_id")
+        return str(metadata.get("source_history_id", "original")), f"{context}:{group}" if group else context
     episode = metadata.get("parent_episode_id") or metadata.get("sample_id")
     if not episode:
         raise ValueError("Cada muestra necesita parent_episode_id o sample_id para equilibrar episodios")
@@ -21,9 +25,11 @@ class EpisodeBalance:
         self.labels=tuple(labels)
         self.target_counts = Counter()
         self.rows = 0
+        self.original_context_groups = False
         by_class = [set() for _ in self.labels]
         self.window_support = [0] * len(self.labels)
         for row in summaries:
+            self.original_context_groups |= bool(row["metadata"].get("balance_episode_id"))
             self.rows += 1
             identity = episode_identity(row["metadata"])
             for label, active in zip(row["y"], row["label_mask"]):
@@ -64,7 +70,8 @@ class EpisodeBalance:
         return result
 
     def report(self):
-        return {"version": VERSION, "fit_partition": "train_fit",
+        return {"version": "original_context_episode_v2" if self.original_context_groups else VERSION, "fit_partition": "train_fit",
+                "support_semantics":"original_episode_context_groups_for_weights; publication_uses_disjoint_original_windows" if self.original_context_groups else "label_episodes",
                 "normalization": "fixed_train_fit_episode_mass_per_row",
                 "class_weights": dict(zip(self.labels, self.class_weights)),
                 "window_support": dict(zip(self.labels, self.window_support)),

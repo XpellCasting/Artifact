@@ -59,6 +59,23 @@ def _tensor_batch(samples, device):
     return x, states, present, y, mask, adjacency
 
 
+def forward_with_evidence(model, batch, x, states, adjacency, present, kinds, mode="both"):
+    from app.modulos.clasificador.network_segments import OptionalEvidenceGATLSTM
+    if not isinstance(model, OptionalEvidenceGATLSTM):
+        return model(x, states, adjacency, present, kinds)
+    from app.modulos.clasificador.evidence_features import encode_evidence, FEATURE_NAMES
+    metadata = batch["metadata"] if isinstance(batch, dict) else [s["metadata"] for s in batch]
+    evidence = torch.zeros((*x.shape[:1], x.shape[2], len(FEATURE_NAMES)), device=x.device)
+    valid = torch.zeros((len(x), x.shape[2]), device=x.device, dtype=torch.bool)
+    for i, meta in enumerate(metadata):
+        encoded = encode_evidence(meta.get("filter_evidence", []), mode=mode)
+        entity = meta.get("target_entity_id")
+        node = meta.get("entity_ids", []).index(entity) if entity in meta.get("entity_ids", []) else 0
+        evidence[i, node] = torch.tensor(encoded["values"], device=x.device)
+        valid[i, node] = encoded["usable"]
+    return model(x, states, adjacency, present, kinds, evidence=evidence, evidence_valid=valid)
+
+
 def _episode_weights(samples, device, full_episode_counts=None):
     metadata = samples["metadata"] if isinstance(samples, dict) else [s["metadata"] for s in samples]
     key = lambda m, i: m.get("parent_episode_id", m.get("sample_id", str(i)))
@@ -100,12 +117,15 @@ def masked_classification_loss(logits, y, mask, class_weights=None, episode_weig
                                if episode_weights is not None else mask.sum())
 
 
-def class_weights_from_episodes(samples, device="cpu"):
-    balance = EpisodeBalance(sample_summaries(samples))
+def class_weights_from_episodes(samples, device="cpu", require_all=True):
+    balance = EpisodeBalance(sample_summaries(samples), require_all=require_all)
     return torch.tensor(balance.class_weights, dtype=torch.float32, device=device), balance.episode_support
 
 
 def checkpoint_rank(metrics, dev_loss):
+    if "diagnostic_types" in metrics:
+        types = metrics["diagnostic_types"]
+        return (types["macro_f1"], -types["false_alarm_rate"], types["fault_recall"], -dev_loss)
     recalls = [metrics["per_class"][label]["recall"] or 0.0 for label in LABELS]
     return (metrics["macro_f1"] if metrics["macro_f1"] is not None else -1.0,
             min(recalls), -dev_loss)
@@ -113,8 +133,8 @@ def checkpoint_rank(metrics, dev_loss):
 
 def train_classifier(train_samples, dev_samples, config, category_sizes, entity_kinds,
                      progress=None, encoder=None, batch_progress=None,
-                     checkpoint_dir=None, resume=False, checkpoint_identity=None):
-    if config.architecture_version not in {"gat_lstm_v3_segments_multiscale"} or encoder is not None:
+                     checkpoint_dir=None, resume=False, checkpoint_identity=None, backbone_model=None):
+    if config.architecture_version not in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"} or encoder is not None:
         raise ValueError("Solo se admite GAT-LSTM por segmentos sin encoder predictivo externo")
     from dataclasses import replace
     device = resolve_device(config.device)
@@ -128,7 +148,7 @@ def train_classifier(train_samples, dev_samples, config, category_sizes, entity_
                       resume, environment) if checkpoint_dir is not None else None
     try:
         model, scores = _train_trials(train_samples, dev_samples, replace(config, device=str(device)),
-                                     entity_kinds, progress, batch_progress, run, environment)
+                                     entity_kinds, progress, batch_progress, run, environment, backbone_model)
         scores["runtime_parameters"]["requested_device"] = config.device
         return model, scores
     finally:
@@ -137,19 +157,23 @@ def train_classifier(train_samples, dev_samples, config, category_sizes, entity_
 
 
 def _train_trials(train_samples, dev_samples, config, entity_kinds, progress,
-                  batch_progress, run, environment):
+                  batch_progress, run, environment, backbone_model=None):
     from dataclasses import replace
     trials = []
     best = None
-    for trial, threshold in enumerate((.3, .5, .7) if config.segment_encoder == "gat" else (.5,)):
+    thresholds = (backbone_model.threshold,) if backbone_model is not None else ((.3, .5, .7) if config.segment_encoder == "gat" else (.5,))
+    for trial, threshold in enumerate(thresholds):
         notify = (lambda row: progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if progress else None
         notify_batch = (lambda row: batch_progress({**row, "threshold_trial": trial+1, "graph_threshold": threshold})) if batch_progress else None
         candidate, scores = _train_segment_classifier(train_samples, dev_samples,
             replace(config, segment_threshold=threshold), entity_kinds, notify, notify_batch,
-            run=run, trial=trial+1)
+            run=run, trial=trial+1, backbone_model=backbone_model)
         rank = (*checkpoint_rank(scores["dev_metrics"], scores["best_dev_loss"]), threshold)
         trials.append({"threshold": threshold, "macro_f1": rank[0],
-                       "min_class_recall": rank[1], "selected_epoch": scores["selected_epoch"]})
+                       "selection_metric":config.checkpoint_selection,
+                       "min_class_recall": rank[1] if config.checkpoint_selection == "class_macro_f1" else None,
+                       "false_alarm_rate": -rank[1] if config.checkpoint_selection == "type_macro_f1" else None,
+                       "selected_epoch": scores["selected_epoch"]})
         if best is None or rank > best[0]:
             best = (rank, candidate, scores)
     _, model, scores = best
@@ -163,7 +187,7 @@ def _train_trials(train_samples, dev_samples, config, entity_kinds, progress,
 
 
 def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
-                                  progress=None, batch_progress=None, run=None, trial=1):
+                                  progress=None, batch_progress=None, run=None, trial=1, backbone_model=None):
     from app.modulos.clasificador.model_constants import FAULT_TYPES
 
     if not train_samples or not dev_samples:
@@ -172,15 +196,20 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     device = resolve_device(config.device)
-    balance = EpisodeBalance(sample_summaries(train_samples))
+    balance = EpisodeBalance(sample_summaries(train_samples), require_all=config.require_all_classes)
     weights = torch.tensor(balance.class_weights, dtype=torch.float32, device=device)
     support = balance.episode_support
-    _, dev_support = class_weights_from_episodes(dev_samples, device)
+    _, dev_support = class_weights_from_episodes(dev_samples, device, require_all=config.require_all_classes)
     feature_dim = len(train_samples[0]["X"][0][0])
     if len(entity_kinds) != len(train_samples[0]["X"][0]):
         raise ValueError("Tipos de sensor incompletos para GAT-LSTM por segmentos")
     from app.modulos.clasificador.network_segments import SegmentGATLSTM
     model = SegmentGATLSTM(feature_dim, entity_kinds, config).to(device)
+    if config.architecture_version == "gat_lstm_v4_optional_evidence":
+        if backbone_model is None:
+            raise ValueError("La etapa D requiere el candidato C congelado")
+        from app.modulos.clasificador.network_segments import OptionalEvidenceGATLSTM
+        model = OptionalEvidenceGATLSTM(deepcopy(backbone_model)).to(device)
     supervised_train = sum(sum(row["label_mask"]) for row in sample_summaries(train_samples))
     supervised_dev = sum(sum(row["label_mask"]) for row in sample_summaries(dev_samples))
     def fault_summaries():
@@ -192,6 +221,10 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
     except ValueError as exc:
         raise ValueError("insufficient_fault_types: Desarrollo no contiene fallas con tipo conocido") from exc
     type_support = dict(zip(FAULT_TYPES,type_balance.episode_support))
+    original_summaries=[s["metadata"] for s in sample_summaries(train_samples) if any(s["label_mask"])]
+    if any(m.get("original_context_id") for m in original_summaries):
+        from app.modulos.clasificador.context_support import disjoint_context_count
+        type_support={kind:disjoint_context_count([m for m in original_summaries if m.get("fault_subtype")==kind and m.get("target_label")==2]) for kind in FAULT_TYPES}
     supported_types = [fault for fault in FAULT_TYPES if type_support[fault] > 0]
     if not supported_types:
         raise ValueError("insufficient_fault_types: Desarrollo no contiene fallas con tipo conocido")
@@ -254,7 +287,8 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
                 report_batch(epoch, "train", batch_index + 1, epoch_started, epoch_waiting)
                 continue
             kind_ids = model.kind_ids.to(device)
-            logits, type_logits = model(x, states, adjacency, present, kind_ids)
+            logits, type_logits = forward_with_evidence(model, batch, x, states, adjacency, present, kind_ids,
+                                                      mode=("none", "statistical", "contextual", "both")[(batch_index+epoch) % 4])
             target_episode_weights = torch.as_tensor(balance.target_weights(batch), device=device)
             class_loss = masked_classification_loss(logits, y, mask, weights, target_episode_weights,
                                                      normalizer=balance.normalizer)
@@ -293,10 +327,16 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
                         if len(active_nodes):
                             fault_y[row_index, int(active_nodes[0])] = FAULT_TYPES.index(fault)
                             fault_mask[row_index, int(active_nodes[0])] = True
+                    if not mask[row_index].any() and meta.get("target_label") in (0,1,2):
+                        fault=meta.get("fault_subtype")
+                        dev_records.append({"true_label":meta["target_label"],"scores":[0.,0.,0.],"type_scores":[0.]*len(FAULT_TYPES),
+                            "true_type":FAULT_TYPES.index(fault) if fault in FAULT_TYPES and meta["target_label"]==2 else None,
+                            "episode_id":meta.get("parent_episode_id"),"context_start":meta.get("context_start"),"context_end":meta.get("context_end"),
+                            "evaluable":False,"evidence_origin":meta.get("evidence_origin","unspecified")})
                 if not mask.any():
                     report_batch(epoch, "dev", batch_index + 1, epoch_started, epoch_waiting)
                     continue
-                logits, type_logits = model(x, states, adjacency, present, model.kind_ids.to(device))
+                logits, type_logits = forward_with_evidence(model, batch, x, states, adjacency, present, model.kind_ids.to(device))
                 class_loss = masked_classification_loss(logits, y, mask, weights)
                 dev_total += class_loss.item(); dev_count += 1
                 class_probs = torch.softmax(logits, dim=-1).cpu().tolist()
@@ -309,18 +349,28 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
                                 "scores": class_probs[row_index][node],
                                 "source_id": meta.get("source_id") or meta.get("source_dataset_id") or "unspecified",
                                 "episode_id": meta.get("parent_episode_id"),
+                                "context_start":meta.get("context_start"),"context_end":meta.get("context_end"),
+                                "true_type": FAULT_TYPES.index(meta["fault_subtype"]) if meta.get("fault_subtype") in FAULT_TYPES and labels[row_index][node] == 2 else None,
+                                "type_scores": type_probs[row_index][node],
                                 "evidence_origin": meta.get("evidence_origin", "unspecified")})
                     if fault_mask[row_index].any():
                         node = int(torch.nonzero(fault_mask[row_index], as_tuple=False)[0].item())
                         type_records.append({"true_type": int(fault_y[row_index, node]),
                             "scores": type_probs[row_index][node],
+                            "context_start":meta.get("context_start"),"context_end":meta.get("context_end"),
                             "episode_id": meta.get("parent_episode_id")})
                 report_batch(epoch, "dev", batch_index + 1, epoch_started, epoch_waiting)
         if not dev_count:
             raise ValueError("insufficient_labels: dev_tune vacío")
         dev_loss = dev_total / dev_count
         policy = choose_rejection_policy(dev_records)
+        type_diagnostics = None
+        if config.checkpoint_selection == "type_macro_f1":
+            from app.modulos.clasificador.type_metrics import select_type_policy
+            policy, type_diagnostics, _ = select_type_policy(dev_records, type_support)
         dev_metrics = classification_metrics(dev_records, policy["threshold"], policy["margin"])
+        if type_diagnostics is not None:
+            dev_metrics["diagnostic_types"] = type_diagnostics
         rank = checkpoint_rank(dev_metrics, dev_loss)
         duration = monotonic() - epoch_started
         row = {"epoch": epoch + 1, "train_loss": train_total / train_count,
@@ -354,15 +404,26 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
                                for index, fault in enumerate(FAULT_TYPES)}
     type_validation_episodes = {fault: len({row["episode_id"] for row in best_type_records
         if row["true_type"] == index}) for index, fault in enumerate(FAULT_TYPES)}
+    if any(r.get("context_end") for r in best_type_records):
+        from app.modulos.clasificador.context_support import disjoint_context_count
+        type_validation_episodes={kind:disjoint_context_count([r for r in best_type_records if r["true_type"]==index]) for index,kind in enumerate(FAULT_TYPES)}
     type_validation_recall = {fault: (sum(max(range(len(row["scores"])), key=row["scores"].__getitem__) == index
         for row in best_type_records if row["true_type"] == index) / type_validation_support[fault]
         if type_validation_support[fault] else None) for index, fault in enumerate(FAULT_TYPES)}
     rejection = choose_rejection_policy(best_dev_records)
+    if config.checkpoint_selection == "type_macro_f1":
+        from app.modulos.clasificador.type_metrics import select_type_policy
+        rejection, _, _ = select_type_policy(best_dev_records, type_support)
+        from app.modulos.clasificador.type_metrics import diagnostic_metrics
+        internal = diagnostic_metrics(best_dev_records, rejection["threshold"], rejection["margin"])
+        type_validation_recall = {kind: internal["per_type"][kind]["recall"] for kind in FAULT_TYPES}
     selected_metrics = classification_metrics(best_dev_records, rejection["threshold"], rejection["margin"])
+    if config.checkpoint_selection == "type_macro_f1":
+        selected_metrics["diagnostic_types"] = select_type_policy(best_dev_records, type_support)[1]
     return model, {"history": history, "best_dev_loss": best_loss,
         "dev_macro_f1": selected_metrics["macro_f1"], "dev_metrics": selected_metrics,
         "balancing": balance.report(), "fault_type_balancing":type_balance.report(), "selected_epoch": selected_epoch,
-        "checkpoint_selection": {"primary": "dev_macro_f1", "tie_breakers": ["min_class_recall", "dev_loss"]},
+        "checkpoint_selection": {"primary": config.checkpoint_selection, "tie_breakers": ["false_alarm_rate", "fault_recall", "dev_loss"] if config.checkpoint_selection == "type_macro_f1" else ["min_class_recall", "dev_loss"]},
         "quality_warnings": [f"zero_dev_recall:{label}" for label in LABELS
                              if not selected_metrics["per_class"][label]["recall"]],
         "dev_metrics_by_source": {source: classification_metrics(
@@ -370,7 +431,7 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
             rejection["threshold"], rejection["margin"])
             for source in sorted({row.get("source_id", "unspecified") for row in best_dev_records})},
         "train_episode_support": support, "dev_episode_support": dev_support,
-        "rejection_policy": choose_rejection_policy(best_dev_records),
+        "rejection_policy": rejection,
         "fault_types": list(FAULT_TYPES), "fault_type_train_episode_support": type_support,
         "fault_type_validation": {"support": len(best_type_records), "accuracy": type_accuracy,
             "independent_episodes": len({row["episode_id"] for row in best_type_records}),
@@ -390,7 +451,7 @@ def _train_segment_classifier(train_samples, dev_samples, config, entity_kinds,
 
 def save_candidate(model, preprocessor: dict, graph: dict, config, directory: Path, metrics: dict):
     """Publica primero pesos y metadatos; manifiesto de modelo al final."""
-    if config.architecture_version == "gat_lstm_v3_segments_multiscale":
+    if config.architecture_version in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
         from dataclasses import replace
         from importlib.metadata import version
         config = replace(config, segment_threshold=model.threshold)
@@ -437,7 +498,7 @@ def load_candidate(identifier: str, directory: Path):
     if hashlib.sha256(weights.read_bytes()).hexdigest() != manifest["weights_sha256"]:
         raise ValueError("Hash de pesos incompatible")
     from app.modulos.clasificador.config import Config
-    if manifest.get("config", {}).get("architecture_version") not in {"gat_lstm_v3_segments_multiscale"}:
+    if manifest.get("config", {}).get("architecture_version") not in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
         raise ValueError("Arquitectura retirada o no declarada")
     config = Config(**manifest["config"])
     architecture = manifest.get("architecture_version", config.architecture_version)
@@ -446,10 +507,13 @@ def load_candidate(identifier: str, directory: Path):
     preprocessor = json.loads((directory / "preprocessors" / f"{identifier}.json").read_text(encoding="utf-8"))
     graph = json.loads((directory / "graphs" / f"{identifier}.json").read_text(encoding="utf-8"))
     kinds = [preprocessor["entities"][e]["kind"] for e in preprocessor["entity_ids"]]
-    if architecture not in {"gat_lstm_v3_segments_multiscale"}:
+    if architecture not in {"gat_lstm_v3_segments_multiscale", "gat_lstm_v4_optional_evidence"}:
         raise ValueError("El modelo requiere GAT-LSTM por segmentos explícito")
     from app.modulos.clasificador.network_segments import SegmentGATLSTM
     model = SegmentGATLSTM(len(preprocessor["feature_names"]), kinds, config)
+    if architecture == "gat_lstm_v4_optional_evidence":
+        from app.modulos.clasificador.network_segments import OptionalEvidenceGATLSTM
+        model = OptionalEvidenceGATLSTM(model)
     model.load_state_dict(torch.load(weights, map_location="cpu", weights_only=True))
     model.eval()
     return model, preprocessor, graph, manifest

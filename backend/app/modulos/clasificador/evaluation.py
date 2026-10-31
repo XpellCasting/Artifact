@@ -27,7 +27,8 @@ def metrics(records: list[dict], threshold=.4, margin=0.0) -> dict:
         truth = row["true_label"]
         if truth not in range(3):
             raise ValueError("Etiqueta real inválida")
-        prediction = decide(row["scores"], threshold, margin)
+        frozen = row.get("rejection_policy", {})
+        prediction = decide(row["scores"], frozen.get("threshold", threshold), frozen.get("margin", margin))
         matrix[truth][prediction if prediction is not None else 3] += 1
         episodes[truth].add(row.get("episode_id", row.get("sample_id")))
         origins[row.get("evidence_origin", "unspecified")] += 1
