@@ -13,6 +13,21 @@ from app.api.diagnostico import crear_router_diagnostico
 
 
 class ApiCompatibilityTests(unittest.TestCase):
+    def test_retired_evaluation_directs_to_flows_without_creating_a_failed_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workbench = DiagnosticWorkbench(Path(tmp))
+            api = FastAPI()
+            api.include_router(crear_router_diagnostico(workbench))
+            with TestClient(api) as client, \
+                    patch.object(workbench, "_read", return_value={"method": "gat_lstm"}), \
+                    patch.object(workbench, "start_job") as start:
+                response = client.post("/diagnostics/models/model/evaluate",
+                                       json={"dataset_id": "dataset", "partition": "test"})
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("/flows/{flow_id}/runs", response.json()["detail"])
+            self.assertIn("gat_lstm_evaluate.py --flow-id", response.json()["detail"])
+            start.assert_not_called()
+
     def test_flow_model_list_matches_diagnostic_versions_and_active_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             workbench = DiagnosticWorkbench(Path(tmp))

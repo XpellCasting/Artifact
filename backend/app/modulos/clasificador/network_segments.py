@@ -9,6 +9,8 @@ from app.modulos.clasificador.segments import ARCHITECTURE, MAX_SEGMENTS, MAX_PO
 
 class SegmentGATLSTM(nn.Module):
     architecture_version = ARCHITECTURE
+    # Graphs connect segments within one entity; entities never exchange features.
+    entity_independent = True
 
     def __init__(self, feature_dim, entity_kinds, config):
         super().__init__()

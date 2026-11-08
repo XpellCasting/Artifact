@@ -166,7 +166,7 @@ def fit_spec(events, preprocessor, config, fit_bounds):
     return result
 
 
-def build_sample(provider, target, preprocessor, graph, config, labels=None):
+def build_sample(provider, target, preprocessor, graph, config, labels=None, *, sample_entities=None):
     lengths = graph["segment_steps"]
     if len(lengths) != len(SCALES):
         raise ValueError("Se requiere una longitud de segmento para cada escala")
@@ -176,9 +176,12 @@ def build_sample(provider, target, preprocessor, graph, config, labels=None):
     start = target-timedelta(seconds=SCALES[-1][0])
     entities = preprocessor["entity_ids"]
     rows = provider(start, target, entities)
+    # Keep the original tensor layout and provenance. Only an entity-independent
+    # inference caller may omit feature construction for unrequested entities.
+    selected = set(entities if sample_entities is None else sample_entities)
     grouped = {key: [] for key in entities}
     for row in rows:
-        if row["entity_id"] in grouped and parse_utc(row["timestamp"]) <= target:
+        if row["entity_id"] in selected and row["entity_id"] in grouped and parse_utc(row["timestamp"]) <= target:
             grouped[row["entity_id"]].append(row)
     x = [[[0.]*len(FEATURE_NAMES) for _ in entities] for _ in range(3*MAX_SEGMENTS)]
     states = [[0 for _ in entities] for _ in x]

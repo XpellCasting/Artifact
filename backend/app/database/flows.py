@@ -1,6 +1,8 @@
 from __future__ import annotations
 from contextlib import contextmanager
 import json
+import logging
+import os
 from pathlib import Path
 import sqlite3
 import unicodedata
@@ -8,8 +10,8 @@ from time import perf_counter
 from typing import Any
 from uuid import uuid4
 from app.flow.definitions import _json, _now, validate_flow
+from app.flow.result_spool import FORMAT, ALERT_DECISIONS, SpoolRecords, ResultArchive, archive_path, archive_for_run
 
-ALERT_DECISIONS = {"fault_compatible", "environmental", "suspicion"}
 ALERT_SEVERITIES = {"fault": ("fault_compatible",), "anomaly": ("environmental", "suspicion")}
 
 
@@ -26,6 +28,8 @@ class FlowStore:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._database() as db:
+            # Keep status, saved runs and alerts readable while a large spool is saved.
+            db.execute("PRAGMA journal_mode=WAL")
             import_alerts = not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_alerts'").fetchone()
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS flows (
@@ -56,6 +60,13 @@ class FlowStore:
                     PRIMARY KEY (run_id, node_id, observation_id)
                 );
                 CREATE INDEX IF NOT EXISTS flow_results_page ON flow_results(run_id, node_id, sequence);
+                CREATE TABLE IF NOT EXISTS flow_run_archives (
+                    run_id TEXT PRIMARY KEY,filename TEXT NOT NULL,format_version TEXT NOT NULL,
+                    counts TEXT NOT NULL,timings TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS flow_run_archive_delete AFTER DELETE ON flow_runs BEGIN
+                    DELETE FROM flow_run_archives WHERE run_id=OLD.run_id;
+                END;
                 CREATE TABLE IF NOT EXISTS flow_alerts (
                     alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     execution_id TEXT NOT NULL, observation_id TEXT NOT NULL,
@@ -179,6 +190,8 @@ class FlowStore:
 
     def save_run_stream(self, flow_id: str, snapshot: dict[str, Any], summary: dict[str, Any], records, execution_id: str | None = None) -> tuple[str, float]:
         """Persist a completed spool atomically without materializing its rows."""
+        if isinstance(records, SpoolRecords):
+            return self._save_archive(flow_id, snapshot, summary, records, execution_id)
         run_id = uuid4().hex
         started = perf_counter()
         db = self._connect()
@@ -214,6 +227,101 @@ class FlowStore:
             raise
         finally:
             db.close()
+
+    @staticmethod
+    def _archive_performance(summary, counts, timings):
+        performance = summary.setdefault("performance", {})
+        phases = performance.setdefault("phases_ms", {})
+        phases.update({key: round(value, 3) for key, value in timings.items()})
+        phases["result_spooling"] = round(counts["spooling_ms"], 3)
+        phases["result_spool_finalize"] = round(counts["finalize_ms"], 3)
+        phases["total_with_result_inserts"] = round(phases.get("total", 0) + phases.get("result_persistence_before_commit", 0), 3)
+        phases["total_with_persistence"] = round(phases["total_with_result_inserts"] + phases["result_spool_finalize"] + phases.get("result_commit", 0), 3)
+        performance.setdefault("counts", {})["result_storage"] = {
+            "format": FORMAT, **{key: value for key, value in counts.items() if not key.endswith("_ms")}}
+        performance.setdefault("included_in", {}).update({
+            "result_spooling": "causal_evaluation", "result_spool_finalize": "total_with_persistence",
+            "result_archive_publication": "result_persistence_before_commit", "result_commit": "total_with_persistence",
+            "result_persistence_before_commit": "total_with_result_inserts",
+            "total_with_result_inserts": "evaluation and publication; excludes archive finalization and commit",
+        })
+
+    def _save_archive(self, flow_id, snapshot, summary, records, execution_id):
+        started = perf_counter()
+        spool = records.spool
+        spool.finish()
+        scratch_path = spool.path
+        run_id = uuid4().hex
+        destination = archive_path(self.path, run_id + ".sqlite3")
+        db, committed = None, False
+        timings = {}
+        try:
+            records.progress("publication", f"Guardando {spool.stats['records']:,} resultados de la ejecución")
+            spool.stage_publication(destination)
+            timings["result_archive_publication"] = (perf_counter() - started) * 1000
+            db = self._connect()
+            db.execute("BEGIN IMMEDIATE")
+            if execution_id is None:
+                self._activate_alert_execution(db, run_id)
+                self._insert_alerts(db, run_id, flow_id,
+                                    (record["payload"] for record in ResultArchive(destination).records("output", alerts_only=True)), run_id)
+            else:
+                db.execute("INSERT OR IGNORE INTO flow_alert_state VALUES (1,?)", (execution_id,))
+                db.execute("UPDATE flow_alerts SET run_id=? WHERE execution_id=?", (run_id, execution_id))
+            records.progress("commit", "Confirmando el archivo de resultados y las métricas")
+            timings["result_persistence_before_commit"] = (perf_counter() - started) * 1000
+            self._archive_performance(summary, spool.stats, timings)
+            stored_snapshot = snapshot
+            if spool.has_audit_snapshot:
+                # Keep identities/configuration accessible to older SQL tools;
+                # the full immutable training manifest lives once in the archive.
+                snapshots = {}
+                diagnostic = snapshot.get("diagnostic_snapshots")
+                for node, value in (diagnostic if isinstance(diagnostic, dict) else {}).items():
+                    value = value if isinstance(value, dict) else {}
+                    model = value.get("model")
+                    model = model if isinstance(model, dict) else {}
+                    snapshots[node] = {"run_id": value.get("run_id"), "model": {
+                        key: model[key] for key in ("model_id", "method", "config", "architecture_version",
+                                                  "schema_version", "graph_version", "window_seconds", "training_end") if key in model}}
+                stored_snapshot = {**snapshot, "diagnostic_snapshots": snapshots}
+            db.execute("INSERT INTO flow_runs VALUES (?,?,?,?,?)", (run_id, flow_id, _json(stored_snapshot), _json(summary), _now()))
+            db.execute("INSERT INTO flow_run_archives VALUES (?,?,?,?,?)",
+                       (run_id, destination.name, FORMAT, _json(spool.stats), _json(timings)))
+            commit_started = perf_counter()
+            timings["result_persistence_before_commit"] = (commit_started - started) * 1000
+            db.commit()
+            timings["result_commit"] = (perf_counter() - commit_started) * 1000
+            committed = True
+            spool.path, spool.published = destination, True
+            if scratch_path.exists():
+                try:
+                    scratch_path.unlink()
+                except OSError:
+                    logging.getLogger(__name__).warning("No se pudo retirar el archivo temporal %s", scratch_path.name, exc_info=True)
+            self._archive_performance(summary, spool.stats, timings)
+            # Record commit latency without rewriting the large audit snapshot.
+            # A telemetry failure must not turn a committed evaluation into a failure.
+            try:
+                db.execute("UPDATE flow_run_archives SET timings=? WHERE run_id=?", (_json(timings), run_id))
+                db.commit()
+            except sqlite3.Error:
+                db.rollback()
+                logging.getLogger(__name__).warning("No se pudo guardar el tiempo de confirmación de %s", run_id, exc_info=True)
+            return run_id, round((perf_counter() - started) * 1000, 3)
+        except BaseException:
+            if not committed:
+                if db is not None:
+                    db.rollback()
+                if destination.exists():
+                    if spool.path.exists():
+                        destination.unlink()
+                    else:
+                        os.replace(destination, spool.path)
+            raise
+        finally:
+            if db is not None:
+                db.close()
 
     @staticmethod
     def _activate_alert_execution(db, execution_id):
@@ -272,12 +380,32 @@ class FlowStore:
         table = "flow_run_display" if compact else "flow_runs"
         with self._database() as db:
             rows = db.execute(f"SELECT run_id,flow_id,snapshot,summary,created_at FROM {table}" + clause + " ORDER BY created_at DESC", args).fetchall()
-        return [{"run_id": row[0], "flow_id": row[1], "snapshot": json.loads(row[2]), "summary": json.loads(row[3]), "created_at": row[4]} for row in rows]
+            archives = {key: (filename, json.loads(counts), json.loads(timings)) for key, filename, counts, timings in
+                        db.execute("SELECT run_id,filename,counts,timings FROM flow_run_archives")}
+        items = []
+        for row in rows:
+            summary = json.loads(row[3])
+            snapshot = json.loads(row[2])
+            if row[0] in archives:
+                filename, counts, timings = archives[row[0]]
+                self._archive_performance(summary, counts, timings)
+                if not compact:
+                    missing = object()
+                    diagnostic = ResultArchive(archive_path(self.path, filename)).diagnostic_snapshots(missing)
+                    if diagnostic is not missing:
+                        snapshot["diagnostic_snapshots"] = diagnostic
+            items.append({"run_id": row[0], "flow_id": row[1], "snapshot": snapshot, "summary": summary, "created_at": row[4]})
+        return items
 
     def results(self, run_id: str, node_id: str = "output", offset: int = 0, limit: int = 100) -> dict[str, Any]:
         with self._database() as db:
             if not db.execute("SELECT 1 FROM flow_runs WHERE run_id=?", (run_id,)).fetchone():
                 raise KeyError(run_id)
+            archive = archive_for_run(db, self.path, run_id)
+            if archive is not None:
+                total, items = ResultArchive(archive).page(node_id, offset, limit)
+                return {"run_id": run_id, "node_id": node_id, "total": total, "offset": offset, "items": items,
+                        "next_offset": offset + len(items) if offset + len(items) < total else None}
             total = db.execute("SELECT COUNT(*) FROM flow_results WHERE run_id=? AND node_id=?", (run_id, node_id)).fetchone()[0]
             rows = db.execute("SELECT payload FROM flow_results WHERE run_id=? AND node_id=? ORDER BY sequence LIMIT ? OFFSET ?", (run_id, node_id, limit, offset)).fetchall()
         items = [json.loads(row[0]) for row in rows]

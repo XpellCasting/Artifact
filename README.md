@@ -242,6 +242,62 @@ diagnóstico combinado se conserva por separado y no sustituye el valor lógico.
 Si después de una compuerta se ejecuta otro filtro, ese filtro calcula una nueva
 evaluación con la política de evidencias seleccionada.
 
+## Guardado de resultados y evidencias
+
+Las evaluaciones nuevas escriben un archivo incremental con formato
+`flow-flyweight-v1`. Cada lectura comparte su identidad y un conjunto de
+evidencias entre las vistas de los nodos; las vistas guardan referencias en
+lugar de repetir todo el historial. Los bloques y el manifiesto diagnóstico se
+comprimen sin pérdida. Las consultas reconstruyen el detalle completo y las
+métricas frente a las etiquetas conservan su representación habitual.
+
+Durante la evaluación se prepara un archivo privado en
+`storage/database/flow_lab.results/.pending/`. Al terminar se comprueba su
+integridad, se sincroniza a disco y se publica junto con los metadatos de la
+ejecución. El archivo publicado permanece inmutable. La base central conserva
+las métricas, las identidades de modelos y la ubicación de ese archivo. Las
+ejecuciones anteriores continúan leyéndose desde `flow_results`.
+
+**Las copias de seguridad deben incluir tanto `flow_lab.sqlite3` como el
+directorio `flow_lab.results/`.** No mover ni borrar los archivos publicados por
+separado. Los archivos de `.pending/` son temporales y no se anuncian como
+ejecuciones terminadas. Una interrupción conserva las ejecuciones confirmadas;
+la evaluación en curso sigue necesitando ejecutarse nuevamente.
+
+`scripts/benchmark_flow_storage.py` compara el guardado anterior y el nuevo a
+partir de resultados ya evaluados, sin ejecutar detectores ni modificar la base
+de producción. Comprueba por consulta todas las filas de todos los nodos y sus
+métricas. Usar `--work-dir` en el mismo sistema de archivos que los datos para
+medir también el costo de escritura del entorno real.
+
+## Medir el rendimiento de evaluaciones CSV
+
+El clasificador de segmentos prepara las características de las entidades
+solicitadas en cada timestamp y comparte la muestra y la inferencia entre los
+candidatos de ese grupo. Conserva las dimensiones del modelo y la procedencia
+de las entradas. La caché pertenece a cada llamada diagnóstica y admite hasta
+ocho grupos; el estado causal permanece en su sesión.
+
+Para comparar esta preparación con la preparación completa de referencia:
+
+```powershell
+backend/.venv/Scripts/python.exe scripts/benchmark_causal_flow.py --reference-run ID_EJECUCION --sizes 5000 20000 --runs 3 --output outputs/benchmark-causal.json
+```
+
+Usar el identificador de una ejecución guardada cuyo CSV coincida con el archivo
+local. El script comprueba su huella, congela el modelo registrado, completa el
+último timestamp de cada prefijo y alterna ambas variantes. Verifica las salidas
+de todos los nodos, las referencias de evidencia, las decisiones y las métricas
+frente a las etiquetas. Guarda tiempos de replay y persistencia, CPU, RSS y
+bytes escritos. La carga y la preparación estadística inicial se registran por
+separado. Las escrituras del ensayo usan bases y archivos temporales aislados.
+
+`--use-prepared-cache` reutiliza la preparación interna después de verificar su
+procedencia estadística. `--flow-run ID` permite estudiar otro flujo congelado
+como experimento nuevo sobre esos datos. Para montar los datos en solo lectura,
+exportar primero las instantáneas y etiquetas con `--export-reference ruta.json`
+y proporcionar ese archivo al ensayo mediante `--reference-file ruta.json`.
+
 ## Añadir nuevos nodos
 
 Para incorporar otro tipo de nodo, usar uno de los existentes como referencia y

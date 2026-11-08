@@ -1,7 +1,10 @@
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
+from threading import Event
 from types import ModuleType
 import unittest
 from unittest.mock import Mock, patch
@@ -99,6 +102,47 @@ class FlowSyncTests(unittest.TestCase):
             self.assertEqual(shared["job_id"], next_job["job_id"])
             self.assertEqual(shared["mode"], "csv")
             finish_csv()
+
+    def test_discovery_and_saved_results_remain_readable_during_a_large_streamed_save(self):
+        previous = self.store.save_run("previous", {}, {}, {})
+        entered, release = Event(), Event()
+
+        def connection():
+            db = sqlite3.connect(self.path, timeout=.1)
+            # Force dirty pages to spill before commit, as they do with large evaluations.
+            db.execute("PRAGMA cache_size=1")
+            return db
+
+        def records():
+            for index in range(20):
+                yield {"node_id": "output", "observation_id": str(index), "sequence": index,
+                       "payload": {"observation_id": str(index), "final_decision": "suspicion",
+                                   "evidence": "large result " * 2000}}
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("The test did not release the streamed save")
+
+        with TestClient(self.api(self.jobs)) as client, \
+             patch.object(self.store, "_connect", side_effect=connection), \
+             ThreadPoolExecutor(max_workers=1) as executor:
+            saving = executor.submit(self.store.save_run_stream, "current", {}, {}, records())
+            try:
+                self.assertTrue(entered.wait(5))
+                response = client.get("/flow-evaluations")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {"job": None, "latest_run_id": previous})
+                listed = client.get("/flow-runs?compact=true")
+                self.assertEqual(listed.status_code, 200)
+                self.assertEqual([run["run_id"] for run in listed.json()["items"]], [previous])
+                alerts = client.get("/flow-alerts")
+                self.assertEqual(alerts.status_code, 200)
+                self.assertEqual(alerts.json()["items"], [])
+            finally:
+                release.set()
+            run_id, _ = saving.result(timeout=5)
+            self.assertEqual(client.get("/flow-evaluations").json()["latest_run_id"], run_id)
+            self.assertEqual(client.get(f"/flow-runs/{run_id}/results").json()["total"], 20)
+            self.assertEqual(len(client.get("/flow-alerts").json()["items"]), 20)
 
 
 if __name__ == "__main__":

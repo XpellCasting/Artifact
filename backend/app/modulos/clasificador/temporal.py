@@ -9,7 +9,8 @@ class CausalInputError(ValueError):
 
 
 def build_causal_sample(event_provider, target_time, preprocessor: dict, graph: dict, config,
-                        labels: dict[str, int] | None = None) -> dict:
+                        labels: dict[str, int] | None = None, *, sample_entities=None) -> dict:
     """Construye las tres escalas temporales del modelo SegmentGATLSTM."""
     from app.modulos.clasificador.segments import build_sample
-    return build_sample(event_provider, target_time, preprocessor, graph, config, labels)
+    return build_sample(event_provider, target_time, preprocessor, graph, config, labels,
+                        sample_entities=sample_entities)

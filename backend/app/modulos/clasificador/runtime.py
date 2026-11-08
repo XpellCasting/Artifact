@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from collections import OrderedDict
 import hashlib
 import json
 from pathlib import Path
@@ -20,8 +21,50 @@ def load_snapshot(directory: str, model_id: str):
     return load_candidate(model_id, Path(directory))
 
 
+class _PredictionCache(OrderedDict):
+    """Bound sample and score reuse to a small number of timestamp groups."""
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > 8:
+            self.popitem(last=False)
+
+    def get(self, key, default=None):
+        if key not in self:
+            return default
+        self.move_to_end(key)
+        return self[key]
+
+
+class ClassifierProxy:
+    """Call-scoped reuse against a fixed causal provider and model snapshot.
+
+    All candidates at a timestamp share one sample and inference. Segment models
+    can prepare just their requested entities without changing tensor dimensions,
+    graph identities, thresholds, or the provenance returned for each diagnosis.
+    """
+    def __init__(self, snapshot, event_provider, requests, sensor_profiles=None, metrics=None):
+        self.snapshot, self.event_provider = snapshot, event_provider
+        self.sensor_profiles, self.metrics = sensor_profiles, metrics
+        self.cache = _PredictionCache()
+        model, _, graph, _ = snapshot
+        self.targets = None
+        if (getattr(model, "entity_independent", False) and not model.training
+                and graph.get("method") == "within_entity_segment_dtw"):
+            self.targets = {}
+            for item in requests:
+                if not item.get("routing", {}).get("terminal"):
+                    self.targets.setdefault(str(item.get("timestamp", "")), set()).add(str(item.get("entity_id", "")))
+
+    def predict_at(self, entity_id, timestamp, sensor_kind=None):
+        return predict_at(self.snapshot, self.event_provider, entity_id, timestamp,
+                          self.sensor_profiles, self.metrics, self.cache, sensor_kind,
+                          sample_entities=self.targets.get(str(timestamp), {entity_id})
+                          if self.targets is not None else None)
+
+
 def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=None, metrics=None,
-               prediction_cache=None, sensor_kind=None):
+               prediction_cache=None, sensor_kind=None, *, sample_entities=None):
     """Pesos congelados; calibra entradas nuevas con el pasado disponible."""
     model, preprocessor, graph, manifest = snapshot
     from app.modulos.clasificador.config import Config
@@ -69,13 +112,16 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
                  "onboarding_policy": "within_entity_segments_v1"}
         graph["graph_version"] = hashlib.sha256(json.dumps({"graph": graph, "profile": profile}, sort_keys=True).encode()).hexdigest()
         base["graph_version"] = graph["graph_version"]
+    selected = (tuple(key for key in preprocessor["entity_ids"] if key in sample_entities or key == entity_id)
+                if sample_entities is not None else None)
     cache_key = (manifest["model_id"], str(timestamp), tuple(preprocessor["entity_ids"]),
-                 graph.get("graph_version"), tuple(tuple(row) for row in graph["adjacency"]))
+                 graph.get("graph_version"), tuple(tuple(row) for row in graph["adjacency"]), selected)
     cache_entry = prediction_cache.get(cache_key) if prediction_cache is not None else None
     if cache_entry is None:
         sample_started = perf_counter()
         try:
-            sample = build_causal_sample(event_provider, timestamp, preprocessor, graph, config)
+            sample = build_causal_sample(event_provider, timestamp, preprocessor, graph, config,
+                                         **({"sample_entities": selected} if selected is not None else {}))
         except CausalInputError as exc:
             if metrics is not None:
                 metrics["gat_sample_ms"] = metrics.get("gat_sample_ms", 0.0) + (perf_counter() - sample_started) * 1000
@@ -89,6 +135,7 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
         if metrics is not None:
             metrics["gat_sample_ms"] = metrics.get("gat_sample_ms", 0.0) + (perf_counter() - sample_started) * 1000
             metrics["gat_samples"] = metrics.get("gat_samples", 0) + 1
+            metrics["gat_feature_entities"] = metrics.get("gat_feature_entities", 0) + len(selected if selected is not None else preprocessor["entity_ids"])
         cache_entry = {"sample": sample, "scores_by_node": None, "type_scores_by_node": None}
         if prediction_cache is not None:
             prediction_cache[cache_key] = cache_entry

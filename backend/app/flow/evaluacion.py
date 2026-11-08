@@ -14,6 +14,7 @@ from uuid import uuid4
 import pandas as pd
 
 from app.flow.runner import FlowRunner
+from app.flow.result_spool import FlowResultSpool
 from app.flow.definitions import _time
 from app.flow.definitions import observation_valid
 from app.services.reproduccion import MotorReproduccionValidacion
@@ -22,10 +23,10 @@ from app.modulos.clasificador.disponibilidad import CLASSIFIER_MODEL_REQUIRED
 FLOW_PROGRESS_INTERVAL_SECONDS = 0.5
 
 
-class FlowResultSpool:
-    """Per-job JSONL spool so completed node outputs do not accumulate in RAM."""
-    def __init__(self, job_id):
-        fd, name = tempfile.mkstemp(prefix=f"flow-evaluation-{job_id}-", suffix=".jsonl")
+class LegacyFlowResultSpool:
+    """JSONL reference implementation retained for storage benchmarks."""
+    def __init__(self, job_id, directory=None):
+        fd, name = tempfile.mkstemp(prefix=f"flow-evaluation-{job_id}-", suffix=".jsonl", dir=directory)
         self.path = Path(name)
         self.file = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
         self.sequences = Counter()
@@ -533,7 +534,9 @@ class FlowEvaluationJobs:
                                          recent_events_per_second=rate,
                                          last_completed_at=last_completed["wall"],
                                          **metadata)
-        spool = FlowResultSpool(job_id)
+        store_path = getattr(self.store, "path", None)
+        spool_directory = Path(store_path).with_suffix(".results") / ".pending" if isinstance(store_path, (str, Path)) else None
+        spool = FlowResultSpool(job_id, directory=spool_directory)
         def sink(results):
             spool.write_block(results)
             self.store.record_alerts(job_id, flow_id, results.get("output", []))
@@ -546,8 +549,12 @@ class FlowEvaluationJobs:
                 summary, _, snapshot = evaluate(progress, sink)
                 progress(summary.get("candidate_count", 0), summary.get("candidate_count", 0),
                          "saving", "Guardando resultados por nodo")
-                spool.finish()
-                run_id, persistence_ms = self.store.save_run_stream(flow_id, snapshot, summary, spool.records(), execution_id=job_id)
+                spool.finish(snapshot=snapshot)
+                records = spool.records()
+                records.on_progress = lambda stage, detail: progress(
+                    summary.get("candidate_count", 0), summary.get("candidate_count", 0), "saving", detail,
+                    saving_stage=stage, saving_records=spool.stats["records"], saving_bytes=spool.stats["archive_bytes"])
+                run_id, persistence_ms = self.store.save_run_stream(flow_id, snapshot, summary, records, execution_id=job_id)
                 with self.lock:
                     self.jobs[job_id].update(status="completed", persistence_ms=persistence_ms,
                                              warning=snapshot.get("source", {}).get("connection_error"),

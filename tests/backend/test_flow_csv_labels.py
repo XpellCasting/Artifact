@@ -138,6 +138,27 @@ class RecoverFlowLabelsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ya tiene etiquetas"):
             recover_run_labels(self.store.path, self.csv, self.run_id, apply=True)
 
+    def test_recovery_of_shared_evidence_uses_a_new_file_and_keeps_the_backed_up_version(self):
+        from app.flow.result_spool import FlowResultSpool, ResultArchive
+        before = self.store.list_runs()[0]
+        spool = FlowResultSpool("recover", self.store.path.parent)
+        self.addCleanup(spool.cleanup)
+        spool.write_block({"output": self.items, "statistical": self.items})
+        identifier, _ = self.store.save_run_stream("flow", before["snapshot"], before["summary"], spool.records())
+        original_archive = spool.path
+        preview = recover_run_labels(self.store.path, self.csv, identifier)
+        self.assertEqual(preview["matched_rows"], 3)
+        self.assertFalse(preview["applied"])
+        result = recover_run_labels(self.store.path, self.csv, identifier, apply=True)
+        self.assertTrue(original_archive.exists())
+        self.assertTrue(all("evaluation" not in item for item in ResultArchive(original_archive).page("output", 0, 100)[1]))
+        recovered = self.store.results(identifier)["items"]
+        self.assertTrue(all("evaluation" in item for item in recovered))
+        for original, item in zip(self.items, recovered):
+            self.assertEqual({key: value for key, value in item.items() if key != "evaluation"}, original)
+        with closing(sqlite3.connect(result["backup"])) as db:
+            self.assertEqual(db.execute("SELECT filename FROM flow_run_archives WHERE run_id=?", (identifier,)).fetchone()[0], original_archive.name)
+
     def test_another_csv_cannot_overwrite_the_saved_results(self):
         self.csv.write_text(self.csv.read_text().replace("sensor.a,1,", "sensor.a,99,"))
         before = self.store.list_runs()[0]

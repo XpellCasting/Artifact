@@ -631,7 +631,12 @@ class DiagnosticWorkbench(DiagnosticRepository):
 
     def evaluate_gat(self, model_id, dataset_id, partition="validation",
                      progress=lambda *_: None):
-        raise ReviewError("GAT-LSTM se prepara y ajusta solo con Desarrollo. Validación y Prueba quedan reservadas para generar eventos futuros.")
+        raise ReviewError(
+            "GAT-LSTM se prepara y ajusta solo con Desarrollo. "
+            "Evalúa los eventos futuros desde Evaluación de flujos: carga el CSV etiquetado "
+            "en /validation/labelled/upload, selecciona el modelo en el flujo y ejecuta "
+            "/flows/{flow_id}/runs. Desde consola usa scripts/gat_lstm_evaluate.py --flow-id ID.",
+            409)
 
 
     def activate(self, model_id, allow_exploratory=False):
@@ -724,7 +729,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
                                source, run_id, session, snapshot):
         trained = snapshot["model"]
         from app.modulos.clasificador.runtime import load_snapshot
-        from app.modulos.clasificador.runtime import predict_at
+        from app.modulos.clasificador.runtime import ClassifierProxy
         gat_snapshot = (session.gat_snapshot if session is not None and session.gat_snapshot else None)
         if gat_snapshot is None and importlib.util.find_spec("torch") is not None:
             try:
@@ -789,7 +794,8 @@ class DiagnosticWorkbench(DiagnosticRepository):
                     found.extend(row for _, row in values[left:right])
                 return found
         enriched, decisions = {}, []
-        prediction_cache = {}
+        classifier = ClassifierProxy(gat_snapshot, provider, contextual_results, sensor_profiles,
+                                     metrics=session.stats if session is not None else None)
         def context_order(pair):
             at = pd.to_datetime(pair[1].get("timestamp"), utc=True, errors="coerce")
             return (pd.isna(at), at.value if not pd.isna(at) else 0, pair[0])
@@ -803,9 +809,7 @@ class DiagnosticWorkbench(DiagnosticRepository):
             try:
                 if session is not None:
                     session.stats["gat_candidates"] += 1
-                result = predict_at(gat_snapshot, provider, entity_id, timestamp, sensor_profiles,
-                                    metrics=session.stats if session is not None else None,
-                                    prediction_cache=prediction_cache, sensor_kind=item.get("sensor_kind"))
+                result = classifier.predict_at(entity_id, timestamp, sensor_kind=item.get("sensor_kind"))
                 target_us, _ = parse_time(timestamp)
                 if source != "history" and entity_id in entities and trained.get("training_end"):
                     if target_us <= parse_time(trained["training_end"])[0]:

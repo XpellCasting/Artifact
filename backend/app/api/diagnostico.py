@@ -99,7 +99,7 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
             raise HTTPException(400, "Indica dataset_id y partition para evaluar.")
         trained = translate(workbench._read, "models", model_id)
         if trained.get("method") == "gat_lstm":
-            return translate(workbench.start_job, workbench.evaluate_gat, model_id,
+            return translate(workbench.evaluate_gat, model_id,
                              payload["dataset_id"], payload["partition"])
         raise HTTPException(409, "Solo se admite GAT-LSTM v2.")
 

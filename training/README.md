@@ -146,6 +146,14 @@ python scripts/gat_lstm_transfer.py import storage/exports/candidate-cuda.tar.gz
 
 La importación registra el modelo y conserva sus métricas y evaluaciones; no lo selecciona ni cambia la activación local. Revisa sus resultados y actívalo desde el flujo habitual de Artifact cuando decidas utilizarlo. La evaluación del clasificador sobre las particiones históricas `validation` y `test` está deshabilitada por el contrato actual: quedan reservadas para el flujo de reproducción de eventos futuros. La validación operacional se realiza con los flujos de la aplicación que ya soportan ese análisis; las métricas `dev_tune` no sustituyen esa validación.
 
+Para ejecutar esa evaluación desde consola, carga Desarrollo y el CSV etiquetado de eventos futuros en la aplicación. Guarda un flujo con GAT-LSTM habilitado y selecciona el modelo en su nodo, o utiliza el modelo activo. Después ejecuta el comando con el identificador del flujo.
+
+```powershell
+python scripts/gat_lstm_evaluate.py --flow-id ID_FLUJO --base http://127.0.0.1:8000
+```
+
+El comando espera hasta una hora, ajustable con `--wait-seconds`, e imprime en stdout el JSON de la ejecución guardada, con sus métricas y configuración. El identificador del trabajo aparece en stderr para consultar su estado si se interrumpe la espera. Este uso sustituye los antiguos argumentos `model_id`, `dataset_id`, `--partition` y `--review-dir` del evaluador.
+
 Si trabajas con una ubicación de revisión personalizada, añade el mismo `--review-dir RUTA` a los comandos de entrenamiento y transferencia en ese equipo. Los pesos y checkpoints se guardan fuera de Git, dentro de las rutas locales de datos/modelos o `storage/`; el código y esta guía sí se publican en GitHub.
 
 ## Problemas frecuentes
