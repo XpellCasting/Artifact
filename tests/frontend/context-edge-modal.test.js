@@ -43,3 +43,45 @@ test("clicking a 1.00 cell opens its detail and closes normally", async () => {
     assert.ok(ui.container.querySelector('.context-matrix'));
   } finally { if (ui) await ui.close(); await server.close(); }
 });
+
+test("compact maps load complete evidence only when a relation is opened", async () => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  let ui;
+  const calls = [];
+  const edge = { edge_id: "relation-a", source: "sensor.a", target: "sensor.b", association_signed: 1, accepted: true };
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    return { ok: true, json: async () => ({ ...edge, slice_associations: [1, null],
+      pair_support: { basis: "known_state_overlap", support_days_utc: 5 } }) };
+  };
+  try {
+    const { ContextualWorkspace } = await server.ssrLoadModule("/src/features/contextual/ContextualWorkspace.jsx");
+    const mapData = { compact: true, nodes: [], edges: [edge], matrices: {
+      entities: ["sensor.a", "sensor.b"], association: [[1, 1], [1, 1]], accepted: [[true, true], [true, true]] } };
+    ui = await renderInteractive(ContextualWorkspace, { apiBaseUrl: "/api", mapData, results: [], summary: {} });
+    assert.deepEqual(calls, []);
+    await ui.event([...ui.container.querySelectorAll('.context-matrix-cell')].find((cell) => !cell.disabled), "click");
+    assert.deepEqual(calls, ["/api/context/map/edges/relation-a"]);
+    assert.match(ui.container.querySelector('[role="dialog"]').textContent, /Días de apoyo/);
+    assert.match(ui.container.querySelector('[role="dialog"]').textContent, /Periodo 2/);
+    await ui.event(ui.container.querySelector('[aria-label="Cerrar detalle"]'), "click");
+    assert.equal(ui.container.querySelector('[role="dialog"]'), null);
+  } finally { if (ui) await ui.close(); globalThis.fetch = previousFetch; await server.close(); }
+});
+
+test("a failed detail request explains that the compact evidence is incomplete", async () => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  let ui;
+  globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({ detail: "Actualiza el mapa." }) });
+  try {
+    const { ContextualWorkspace } = await server.ssrLoadModule("/src/features/contextual/ContextualWorkspace.jsx");
+    const edge = { edge_id: "old-relation", source: "sensor.a", target: "sensor.b", association_signed: 1, accepted: true };
+    const mapData = { compact: true, nodes: [], edges: [edge], matrices: {
+      entities: ["sensor.a", "sensor.b"], association: [[1, 1], [1, 1]], accepted: [[true, true], [true, true]] } };
+    ui = await renderInteractive(ContextualWorkspace, { apiBaseUrl: "/api", mapData, results: [], summary: {} });
+    await ui.event([...ui.container.querySelectorAll('.context-matrix-cell')].find((cell) => !cell.disabled), "click");
+    assert.match(ui.container.querySelector('[role="dialog"] [role="alert"]').textContent, /evidencia completa.*Actualiza el mapa/);
+  } finally { if (ui) await ui.close(); globalThis.fetch = previousFetch; await server.close(); }
+});

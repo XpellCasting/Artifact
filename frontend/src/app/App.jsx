@@ -344,7 +344,7 @@ function ArtifactApp() {
     return runStep("context-load", async () => {
       setContextError("");
       const [mapResponse, resultsResponse] = await Promise.allSettled([
-        api("/context/map"),
+        api("/context/map?compact=true"),
         api("/context/results"),
       ]);
       const messages = [];
@@ -373,7 +373,7 @@ function ArtifactApp() {
   async function rebuildContextMap() {
     return runStep("context-rebuild", async () => {
       setContextError("");
-      const nextMap = await api("/context/map/rebuild", { method: "POST" });
+      const nextMap = await api("/context/map/rebuild?compact=true", { method: "POST" });
       setContextMap(nextMap);
       try {
         const nextResults = await api("/context/results");
@@ -691,6 +691,7 @@ function ArtifactApp() {
           error={contextError}
           onReload={loadContextualData}
           onRebuild={rebuildContextMap}
+          apiBaseUrl={API_BASE_URL}
         />
       ) : activeModule === "revision" ? (
         <ReviewWorkspace apiBaseUrl={API_BASE_URL} />

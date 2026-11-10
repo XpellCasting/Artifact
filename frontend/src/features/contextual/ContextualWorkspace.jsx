@@ -14,6 +14,7 @@ import {
   Zap,
 } from "lucide-react";
 import { downloadCsv } from "../../shared/csv.js";
+import { request } from "../../shared/api.js";
 import ReviewWorkspace from "../review/ReviewWorkspace.jsx";
 import DiagnosticWorkspace from "../diagnostics/DiagnosticWorkspace.jsx";
 import FlowLab from "../flows/FlowLab.jsx";
@@ -23,8 +24,19 @@ import { isEnvironmentalResult, contextRoutingLabel, contextRoutingReasonLabel, 
 import { Metric, Panel, SummaryRow, Empty, TimeStack, KeyValueGrid } from "../../shared/components.jsx";
 import { compactEntityId, kindText, formatPercent, formatCount, formatNumber, formatCalc, formatSeconds, formatBucketSeconds, shortDate } from "../../shared/analysis.jsx";
 
-export function ContextualWorkspace({ mapData, results, summary, busy, error, onReload, onRebuild }) {
+export function ContextualWorkspace({ apiBaseUrl, mapData, results, summary, busy, error, onReload, onRebuild }) {
   const [selectedEdge, setSelectedEdge] = useState(null);
+  const [edgeDetail, setEdgeDetail] = useState(null);
+  const [edgeError, setEdgeError] = useState("");
+  useEffect(() => {
+    setEdgeDetail(null); setEdgeError("");
+    if (!mapData?.compact || !selectedEdge?.edge_id) return;
+    let active = true;
+    request(apiBaseUrl, `/context/map/edges/${encodeURIComponent(selectedEdge.edge_id)}`)
+      .then((detail) => { if (active) setEdgeDetail(detail); })
+      .catch((reason) => { if (active) setEdgeError(reason.message); });
+    return () => { active = false; };
+  }, [selectedEdge, mapData, apiBaseUrl]);
   const [selectedContextResult, setSelectedContextResult] = useState(null);
   const nodes = contextMapNodes(mapData);
   const edges = contextMapEdges(mapData);
@@ -186,7 +198,9 @@ export function ContextualWorkspace({ mapData, results, summary, busy, error, on
 
       {selectedEdge && (
         <ContextEdgeModal
-          edge={selectedEdge}
+          edge={edgeDetail || selectedEdge}
+          loading={Boolean(mapData?.compact && selectedEdge.edge_id && !edgeDetail && !edgeError)}
+          error={edgeError}
           mapVersion={mapData?.map_version}
           onClose={() => setSelectedEdge(null)}
         />
@@ -375,7 +389,7 @@ export function ContextStatusBadge({ value, label }) {
 }
 
 
-export function ContextEdgeModal({ edge, mapVersion, onClose }) {
+export function ContextEdgeModal({ edge, mapVersion, onClose, loading, error }) {
   const accepted = contextEdgeAccepted(edge);
   const coverage = contextNumber(edge.coverage_ratio, edge.coverage);
   const stability = contextNumber(edge.stability_score, edge.temporal_stability, edge.stability);
@@ -396,6 +410,8 @@ export function ContextEdgeModal({ edge, mapVersion, onClose }) {
             <X size={18} />
           </button>
         </header>
+        {loading && <p role="status">Cargando evidencia de la relación…</p>}
+        {error && <p role="alert">No se pudo cargar la evidencia completa: {error}</p>}
         <div className="modal-score-grid">
           <SummaryRow label="Aceptada" value={accepted ? "si" : "no"} />
           <SummaryRow label="Asociacion" value={formatContextValue(edge.association ?? edge.association_signed ?? edge.weight)} />

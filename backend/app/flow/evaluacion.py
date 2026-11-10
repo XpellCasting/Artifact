@@ -368,6 +368,7 @@ class CausalFlowRunner(FlowRunner):
                              current_timestamp=_time(batch["timestamp_dt"].iloc[0]),
                              current_batch_rows=len(batch), groups_completed=groups_completed,
                              last_batch_ms=round((completed_at - batch_started) * 1000, 3),
+                             last_node_timings_ms=summary["node_timings_ms"],
                              group_started_at=None)
                     last_progress_at = completed_at
             if progress and groups_completed == 0:

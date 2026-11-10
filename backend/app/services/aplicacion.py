@@ -33,6 +33,7 @@ class EstadoAplicacion(ServicesHistoryMixin, ServicesReplayMixin, DatabaseReplay
     resultados: list[dict[str, Any]] = field(default_factory=list)
     timeline_base_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     mapa_contextual_cache: dict[str, Any] | None = None
+    context_map_build_lock: Any = field(default_factory=Lock, repr=False)
     resultados_contextuales: list[dict[str, Any]] = field(default_factory=list)
     analysis_completed: bool = False
     future_baseline_template: dict[str, Any] | None = field(

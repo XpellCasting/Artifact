@@ -109,9 +109,14 @@ class ServicesAnalysisMixin:
         return {"config_path": str(self.filtro_estadistico.continuos.conf_path), "baseline_id": (self.future_baseline_template or {}).get("provenance", {}).get("baseline_id"), "configs": guardadas}
     def mapa_contextual(self, force: bool = False) -> dict[str, Any]:
         if self.historial is None:
-            self.status()
-        if self.historial is None:
             raise ValueError("Primero debes cargar un historial.")
+        if not force:
+            # Viewing a frozen reference must not train another map, fingerprint
+            # the entire history, or replace the reference used by a live run.
+            mapa = self.future_context_map_template
+            if mapa is None:
+                raise ValueError("El mapa contextual aún no está preparado. Espera a que termine la carga del historial.")
+            return mapa
         if (
             force
             and self.validation_replay_state
@@ -219,6 +224,14 @@ class ServicesAnalysisMixin:
             mapa=mapa,
         )
     def _asegurar_mapa_contextual(self, force: bool = False, progress_callback=None) -> dict[str, Any]:
+        if not self.context_map_build_lock.acquire(blocking=False):
+            raise ValueError("Ya se está preparando el mapa contextual. Espera a que termine.")
+        try:
+            return self._actualizar_mapa_contextual(force, progress_callback)
+        finally:
+            self.context_map_build_lock.release()
+
+    def _actualizar_mapa_contextual(self, force: bool = False, progress_callback=None) -> dict[str, Any]:
         if progress_callback is not None:
             progress_callback("context_cache", 0.0, "Comprobando el mapa contextual guardado")
         if self.historial is None:
