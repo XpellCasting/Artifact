@@ -19,7 +19,7 @@ try {
     $sourcePaths = @((Join-Path $InputDir 'real.csv'), (Join-Path $InputDir 'sintetico.csv'))
     foreach ($sourcePath in $sourcePaths) {
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-            throw "Falta el CSV de entrada: $sourcePath. Extrae entradas-mixto.zip en la raiz de Artifact."
+            throw "Falta el CSV de entrada: $sourcePath. Extrae entradas-mixto.zip en la raiz de Paranoid."
         }
     }
     & $PythonPath scripts/gat_lstm_check.py --device $Device

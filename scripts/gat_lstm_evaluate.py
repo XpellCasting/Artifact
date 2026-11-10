@@ -59,7 +59,7 @@ def main(argv=None):
         "El comando usa el flujo y el CSV ya cargados en el servidor. "
         "Sustituye los antiguos model_id/dataset_id/--partition/--review-dir por --flow-id."))
     parser.add_argument("--flow-id", required=True, help="Identificador del flujo guardado en la aplicación")
-    parser.add_argument("--base", default="http://127.0.0.1:8000", help="URL base de la API de Artifact")
+    parser.add_argument("--base", default="http://127.0.0.1:8000", help="URL base de la API de Paranoid")
     parser.add_argument("--wait-seconds", type=int, default=3600, help="Tiempo máximo de espera del resultado")
     args = parser.parse_args(argv)
     if args.wait_seconds <= 0:

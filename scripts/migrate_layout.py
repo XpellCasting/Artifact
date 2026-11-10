@@ -1,4 +1,4 @@
-"""Inventariar o migrar Artifact: ejecutar con la aplicación detenida."""
+"""Inventariar o migrar Paranoid: ejecutar con la aplicación detenida."""
 import argparse
 import json
 from pathlib import Path

@@ -48,7 +48,7 @@ test("the main dashboard can reuse the theme received by Alerts with an older in
   } finally { alerts.disconnect(); alerts.dom.window.close(); dashboard?.disconnect(); dashboard?.dom.window.close(); }
 });
 
-test("Home Assistant's dashboard bridge recognizes nested Artifact frames and sends theme changes without reloading them", async () => {
+test("Home Assistant's dashboard bridge recognizes nested Paranoid frames and sends theme changes without reloading them", async () => {
   const dom = new JSDOM("<!doctype html><body><home-assistant></home-assistant></body>", {
     url: "http://ha.local/", runScripts: "outside-only", pretendToBeVisual: true,
   });

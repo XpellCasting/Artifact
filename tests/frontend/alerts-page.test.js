@@ -28,8 +28,8 @@ test("the independent alerts page shows faults and anomalies and polls without a
     const { default: Page } = await server.ssrLoadModule("/src/features/alerts/AlertsPage.jsx");
     context.mock.timers.enable({ apis: ["setTimeout"] });
     view = await renderInteractive(Page, { apiBaseUrl: "/api" });
-    assert.equal(view.container.querySelector("h1").textContent, "Artifact-Alertas");
-    assert.equal(document.title, "Artifact-Alertas");
+    assert.equal(view.container.querySelector("h1").textContent, "Paranoid-Alertas");
+    assert.equal(document.title, "Paranoid-Alertas");
     assert.match(view.container.textContent, /sensor.temperature/);
     assert.equal(view.container.querySelector(".fl-output-alert-fault").textContent, "Falla · Posible falla: Deriva");
     await React.act(async () => context.mock.timers.tick(3000));
@@ -179,7 +179,7 @@ test("the alerts route opens directly without loading history or starting the fl
     const { App } = await server.ssrLoadModule("/src/app/App.jsx");
     function Host() { window.history.replaceState({}, "", "/alertas"); return React.createElement(App); }
     view = await renderInteractive(Host, {});
-    assert.match(view.container.textContent, /Artifact-Alertas/);
+    assert.match(view.container.textContent, /Paranoid-Alertas/);
     assert.match(view.container.textContent, /No hay alertas de salida/);
     assert.deepEqual(calls, ["/api/flow-alerts?limit=50"]);
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }

@@ -1,4 +1,4 @@
-"""Small asynchronous client for Artifact's existing health endpoint."""
+"""Small asynchronous client for Paranoid's existing health endpoint."""
 
 from typing import Any
 
@@ -9,7 +9,7 @@ from .const import REQUEST_TIMEOUT
 
 
 class InvalidArtifactResponse(Exception):
-    """The endpoint did not return Artifact's health contract."""
+    """The endpoint did not return Paranoid's health contract."""
 
 
 def normalize_url(value: str) -> str:
@@ -39,7 +39,7 @@ class ArtifactClient:
         self.base_url = normalize_url(base_url)
 
     async def async_register_bridge(self, bridge_id: str, token: str) -> bool:
-        """Pair once; older Artifact servers remain usable for health/link access."""
+        """Pair once; older Paranoid servers remain usable for health/link access."""
         async with self._session.post(
             f"{self.base_url}/home-assistant/bridge/register",
             headers={"Authorization": f"Bearer {token}"}, json={"bridge_id": bridge_id},
@@ -56,7 +56,7 @@ class ArtifactClient:
             return True
 
     def bridge_socket(self, token: str):
-        """Open only the configured Artifact endpoint; the HA session stays owned by HA."""
+        """Open only the configured Paranoid endpoint; the HA session stays owned by HA."""
         base = URL(self.base_url)
         url = base.with_scheme("wss" if base.scheme == "https" else "ws")
         return self._session.ws_connect(
@@ -81,6 +81,6 @@ class ArtifactClient:
             or "static_history_dir" not in payload
             or "real_history_path" not in payload
         ):
-            raise InvalidArtifactResponse("The API is not a healthy Artifact instance")
+            raise InvalidArtifactResponse("The API is not a healthy Paranoid instance")
         # Internal filesystem paths are not needed in Home Assistant.
         return {"status": "ok"}

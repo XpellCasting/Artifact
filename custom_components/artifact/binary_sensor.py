@@ -1,4 +1,4 @@
-"""Expose API connectivity and a link to Artifact's web interface."""
+"""Expose API connectivity and a link to Paranoid's web interface."""
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -34,7 +34,7 @@ class ArtifactConnection(CoordinatorEntity[ArtifactCoordinator], BinarySensorEnt
             identifiers={(DOMAIN, entry.entry_id)},
             name=entry.title,
             manufacturer="XpellCasting",
-            model="Artifact",
+            model="Paranoid",
             entry_type=DeviceEntryType.SERVICE,
             configuration_url=entry.data[CONF_WEB_URL],
         )

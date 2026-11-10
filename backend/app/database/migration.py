@@ -1,6 +1,6 @@
 """Migración offline del almacenamiento anterior, con inventario y reanudación.
 
-Los movimientos ocurren dentro del mismo Artifact; las bases no se exportan ni
+Los movimientos ocurren dentro del mismo Paranoid; las bases no se exportan ni
 se reconstruyen. Cada movimiento queda registrado antes de retirar el origen.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ def is_supported(value):
 def safe(root, path):
     path = Path(path).resolve()
     if path == root or not path.is_relative_to(root):
-        raise ValueError(f"Ruta fuera de Artifact: {path}")
+        raise ValueError(f"Ruta fuera de Paranoid: {path}")
     return path
 
 

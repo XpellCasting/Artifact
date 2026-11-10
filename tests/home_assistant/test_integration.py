@@ -30,7 +30,7 @@ from homeassistant.components.frontend import DATA_PANELS, DATA_EXTRA_MODULE_URL
 
 @pytest_asyncio.fixture
 async def endpoint(tmp_path) -> AsyncIterator[tuple[str, dict]]:
-    """Serve the real health contract without loading Artifact's ML runtime."""
+    """Serve the real health contract without loading Paranoid's ML runtime."""
     state = {
         "payload": {"status": "ok", "static_history_dir": "/private/history", "real_history_path": "/private/history.csv"},
         "status": 200,
@@ -112,7 +112,7 @@ async def hass(tmp_path):
 def make_entry(base_url):
     return SimpleNamespace(
         entry_id="artifact-test",
-        title="Artifact",
+        title="Paranoid",
         data={"url": base_url, "web_url": "http://artifact.example:5173"},
         state=ConfigEntryState.SETUP_IN_PROGRESS,
         async_on_unload=Mock(),
@@ -187,6 +187,7 @@ async def test_setup_form_and_success(hass, endpoint, session, monkeypatch):
     assert (await flow.async_step_user())["type"] == "form"
     result = await flow.async_step_user({"url": base + "/", "web_url": "http://artifact.example:5173/"})
     assert result["type"] == "create_entry"
+    assert result["title"] == "Paranoid"
     assert result["data"] == {"url": base, "web_url": "http://artifact.example:5173"}
 
 
@@ -228,18 +229,30 @@ async def test_reconfigure_updates_same_entry(hass, endpoint, session, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, monkeypatch):
+@pytest.mark.parametrize("title", ["Artifact", "Paranoid", "Sensores de mi casa"])
+async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, monkeypatch, title):
     base, state = endpoint
     entry = make_entry(base)
+    entry.title = title
+    def update_entry(current, **changes):
+        for key, value in changes.items():
+            setattr(current, key, value)
+    hass.config_entries.async_update_entry.side_effect = update_entry
     monkeypatch.setattr(coordinator, "async_get_clientsession", lambda _: session)
     assert await async_setup_entry(hass, entry)
+    expected_title = "Paranoid" if title == "Artifact" else title
+    assert entry.title == expected_title
+    title_updates = [call.kwargs["title"] for call in hass.config_entries.async_update_entry.call_args_list if "title" in call.kwargs]
+    assert title_updates == (["Paranoid"] if title == "Artifact" else [])
     assert hass.config_entries.async_forward_entry_setups.await_count == 1
     panel = hass.data[DATA_PANELS][alerts_panel_path(entry)]
-    assert panel.sidebar_title == "Artifact-Alertas"
+    assert panel.sidebar_title == "Paranoid-Alertas"
     assert panel.config["url"] == "http://artifact.example:5173/alertas"
     assert any("dashboard-theme.js" in url for url in hass.data[DATA_EXTRA_MODULE_URL].urls)
     sensor = ArtifactConnection(entry.runtime_data, entry)
     assert sensor.available and sensor.is_on
+    assert sensor.device_info["name"] == expected_title
+    assert sensor.device_info["model"] == "Paranoid"
     assert sensor.device_info["configuration_url"] == entry.data["web_url"]
     assert sensor.unique_id == "artifact-test_connection"
     state["status"] = 503

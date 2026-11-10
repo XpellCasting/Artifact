@@ -74,7 +74,7 @@ export default function SensorSelection({ catalog, busy, prepareDisabled, onPrep
     <div className="hs-sensors-heading"><div><h4>Elige los sensores que se analizarán</h4><p>{homeAssistant ? "Sensores disponibles en Home Assistant. El historial se descargará después de confirmar." : catalog.filename}</p></div><button type="button" disabled={busy} onClick={onBack}>Volver al origen</button></div>
     {catalog.request && <p>Período: {new Date(catalog.request.start).toLocaleString()} a {new Date(catalog.request.end).toLocaleString()}.</p>}
     <p className="hs-selection-summary" role="status"><strong>{count(selected.length)} de {count(entities.length)} sensores activos</strong>. {homeAssistant ? "Elige al menos un sensor para continuar." : "Todos están activos inicialmente."} Los desactivados quedan fuera de las bases estadística y contextual.</p>
-    {homeAssistant && !areasAvailable && <p className="hs-capacity" role="status">No se pudieron consultar las áreas. Se muestra el catálogo sin agrupación; actualiza la integración Artifact y revisa su conexión para disponer de estos metadatos.</p>}
+    {homeAssistant && !areasAvailable && <p className="hs-capacity" role="status">No se pudieron consultar las áreas. Se muestra el catálogo sin agrupación; actualiza la integración Paranoid y revisa su conexión para disponer de estos metadatos.</p>}
     {catalog.invalid_rows > 0 && <p>{count(catalog.invalid_rows)} filas del CSV no tienen entidad o fecha válidas y se omitirán.</p>}
     <fieldset disabled={busy}>
       <div className="hs-sensor-filters">

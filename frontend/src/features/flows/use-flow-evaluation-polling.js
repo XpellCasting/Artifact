@@ -38,7 +38,7 @@ export function useFlowEvaluationPolling({ apiBaseUrl, jobId, discover = false, 
       } catch (reason) {
         if (stopped) return;
         if (!discover && reason.status === 404) {
-          handlers.current.onFailure("La API ya no conserva esta recepción. Comprueba si Artifact se reinició antes de iniciar otra sesión.");
+          handlers.current.onFailure("La API ya no conserva esta recepción. Comprueba si Paranoid se reinició antes de iniciar otra sesión.");
         } else {
           handlers.current.onConnectionError(reason.message);
           timer = setTimeout(poll, 3000);
@@ -51,7 +51,7 @@ export function useFlowEvaluationPolling({ apiBaseUrl, jobId, discover = false, 
         return;
       }
       if (!state) {
-        if (runningId || expectedJobId) handlers.current.onFailure("La API ya no conserva esta evaluación. Comprueba si Artifact se reinició; las ejecuciones terminadas siguen guardadas.");
+        if (runningId || expectedJobId) handlers.current.onFailure("La API ya no conserva esta evaluación. Comprueba si Paranoid se reinició; las ejecuciones terminadas siguen guardadas.");
         runningId = null;
       } else if (state.status === "failed" || state.status === "completed") {
         runningId = null;

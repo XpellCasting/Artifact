@@ -122,7 +122,7 @@ class HomeAssistantBridge:
             if self.registration is not None:
                 if (self.registration.get("bridge_id") != bridge_id
                         or not hmac.compare_digest(self.registration.get("token_hash", ""), digest)):
-                    raise PermissionError("Artifact ya está vinculado a otra integración de Home Assistant.")
+                    raise PermissionError("Paranoid ya está vinculado a otra integración de Home Assistant.")
                 return
             registration = {"bridge_id": bridge_id, "token_hash": digest}
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,8 +162,8 @@ class HomeAssistantBridge:
             connection = self.connection
         if connection is None or not connection.connected:
             if not self.status()["bridge_configured"]:
-                raise BridgeUnavailable("Integración no configurada. Añade Artifact en las integraciones de Home Assistant.")
-            raise BridgeUnavailable("La integración de Home Assistant está desconectada. Comprueba que esté cargada y que Artifact sea accesible.")
+                raise BridgeUnavailable("Integración no configurada. Añade Paranoid en las integraciones de Home Assistant.")
+            raise BridgeUnavailable("La integración de Home Assistant está desconectada. Comprueba que esté cargada y que Paranoid sea accesible.")
         return connection
 
     def require_connected(self):

@@ -40,10 +40,10 @@ export function App() {
   if (typeof window !== "undefined" && window.location.pathname.replace(/\/$/, "").endsWith("/alertas")) {
     return <AlertsPage apiBaseUrl={API_BASE_URL} />;
   }
-  return <ArtifactApp />;
+  return <ParanoidApp />;
 }
 
-function ArtifactApp() {
+function ParanoidApp() {
   useEffect(() => connectHomeAssistantTheme(), []);
   const [health, setHealth] = useState(null);
   const [historyStatus, setHistoryStatus] = useState(null);
@@ -522,7 +522,7 @@ function ArtifactApp() {
         </section>
       )}
 
-      <nav className="module-tabs" aria-label="Módulos del artefacto">
+      <nav className="module-tabs" aria-label="Módulos de Paranoid">
         <ModuleTab active={activeModule === "flujos"} icon={<GitBranch size={17} />} label="Evaluación de flujos" onClick={() => setActiveModule("flujos")} />
         <ModuleTab active={activeModule === "evaluacion"} icon={<Database size={17} />} label="Selector de Historial" onClick={() => setActiveModule("evaluacion")} />
         <ModuleTab

@@ -20,7 +20,7 @@ export default function AlertsPage({ apiBaseUrl }) {
 
   useEffect(() => {
     const previousTitle = document.title;
-    document.title = "Artifact-Alertas";
+    document.title = "Paranoid-Alertas";
     return () => { document.title = previousTitle; };
   }, []);
 
@@ -60,7 +60,7 @@ export default function AlertsPage({ apiBaseUrl }) {
   }, [apiBaseUrl, beforeId, revision, severity]);
 
   return <main className="artifact-alerts">
-    <header className="artifact-alerts-header"><div><h1>Artifact-Alertas</h1>
+    <header className="artifact-alerts-header"><div><h1>Paranoid-Alertas</h1>
       <p>Alertas de la última ejecución del flujo.</p></div>
       <button type="button" disabled={loading} onClick={() => { setBeforeId(null); setRevision((value) => value + 1); }}><RotateCcw size={17} />Actualizar</button>
     </header>

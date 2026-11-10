@@ -1,4 +1,4 @@
-"""Connect Home Assistant to an independently running Artifact application."""
+"""Connect Home Assistant to an independently running Paranoid application."""
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -16,6 +16,8 @@ PLATFORMS = [Platform.BINARY_SENSOR]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Validate the connection before loading the entity platform."""
+    if entry.title == "Artifact":
+        hass.config_entries.async_update_entry(entry, title="Paranoid")
     coordinator = ArtifactCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
@@ -23,7 +25,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await coordinator.bridge.async_start()
     except (ClientError, TimeoutError, InvalidArtifactResponse) as err:
-        raise ConfigEntryNotReady("Unable to establish the Artifact bridge") from err
+        raise ConfigEntryNotReady("Unable to establish the Paranoid bridge") from err
     try:
         await async_setup_alerts_panel(hass, entry)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

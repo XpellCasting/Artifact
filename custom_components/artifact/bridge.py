@@ -35,7 +35,7 @@ class ArtifactBridge:
             self.hass.config_entries.async_update_entry(self.entry, data={**self.entry.data, CONF_BRIDGE_TOKEN: self.token})
         if not await self.client.async_register_bridge(self.entry.entry_id, self.token):
             return
-        self.task = self.entry.async_create_background_task(self.hass, self._run(), "Artifact bridge")
+        self.task = self.entry.async_create_background_task(self.hass, self._run(), "Paranoid bridge")
 
     async def async_close(self):
         if self.task is not None:
@@ -56,7 +56,7 @@ class ArtifactBridge:
             writer = None
             try:
                 if not await self.client.async_register_bridge(self.entry.entry_id, self.token):
-                    raise InvalidArtifactResponse("The Artifact server does not support the bridge")
+                    raise InvalidArtifactResponse("The Paranoid server does not support the bridge")
                 async with self.client.bridge_socket(self.token) as socket:
                     queue = asyncio.Queue(maxsize=5000)
                     delay = 1
@@ -82,7 +82,7 @@ class ArtifactBridge:
             except asyncio.CancelledError:
                 raise
             except (ClientError, TimeoutError, ValueError, InvalidArtifactResponse):
-                _LOGGER.debug("Artifact bridge disconnected; retrying")
+                _LOGGER.debug("Paranoid bridge disconnected; retrying")
             finally:
                 self._clear_subscriptions()
                 if writer is not None:
@@ -171,7 +171,7 @@ class ArtifactBridge:
                 area_name = areas[area_id].name if area_id else None
                 assignments.append((area_id, area_name))
         except Exception:
-            _LOGGER.debug("Area metadata is unavailable for the Artifact catalog", exc_info=True)
+            _LOGGER.debug("Area metadata is unavailable for the Paranoid catalog", exc_info=True)
             return rows, False
         for row, (area_id, area_name) in zip(rows, assignments):
             row.update(area_id=area_id, area_name=area_name)

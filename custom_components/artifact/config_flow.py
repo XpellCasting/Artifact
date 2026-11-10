@@ -1,4 +1,4 @@
-"""Configure Artifact and its web interface from Home Assistant's UI."""
+"""Configure Paranoid and its web interface from Home Assistant's UI."""
 
 from typing import Any
 
@@ -25,7 +25,7 @@ STEP_SCHEMA = schema.Schema(
 
 
 class ArtifactConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Configure one or more Artifact servers without using URLs as unique IDs."""
+    """Configure one or more Paranoid servers without using URLs as unique IDs."""
 
     VERSION = 1
 
@@ -64,7 +64,7 @@ class ArtifactConfigFlow(ConfigFlow, domain=DOMAIN):
                         return self.async_abort(reason="already_configured")
                 if entry is not None:
                     return self.async_update_reload_and_abort(entry, data_updates=data)
-                return self.async_create_entry(title="Artifact", data=data)
+                return self.async_create_entry(title="Paranoid", data=data)
         return self.async_show_form(
             step_id=step_id,
             data_schema=self.add_suggested_values_to_schema(

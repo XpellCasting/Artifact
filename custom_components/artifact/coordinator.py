@@ -1,4 +1,4 @@
-"""Coordinate a single inexpensive health request for each Artifact instance."""
+"""Coordinate a single inexpensive health request for each Paranoid instance."""
 
 import logging
 from typing import Any
@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class ArtifactCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Poll only health; Artifact retains its own application lifecycle."""
+    """Poll only health; Paranoid retains its own application lifecycle."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
@@ -34,4 +34,4 @@ class ArtifactCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             return await self.client.async_health()
         except (ClientError, TimeoutError, InvalidArtifactResponse) as err:
-            raise UpdateFailed("Unable to obtain Artifact health") from err
+            raise UpdateFailed("Unable to obtain Paranoid health") from err

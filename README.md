@@ -1,4 +1,4 @@
-# Artifact
+# Paranoid
 
 Aplicación local para analizar históricos de sensores, detectar comportamientos
 inusuales y distinguir entre anomalías ambientales y posibles fallas del sensor.
@@ -63,34 +63,38 @@ Los directorios `data/`, `storage/` y `models/` conservan el estado entre reinic
 
 ### Home Assistant (HACS)
 
-La integración conecta Home Assistant con Artifact, proporciona históricos y
+La integración conecta Home Assistant con Paranoid, proporciona históricos y
 cambios de estado, y permite abrir la aplicación y su panel de alertas. Requiere
-Home Assistant 2024.12 o posterior. Artifact debe estar ejecutándose por separado;
+Home Assistant 2024.12 o posterior. Paranoid debe estar ejecutándose por separado;
 HACS instala únicamente la integración.
 
 1. En HACS, abrir **⋮ → Repositorios personalizados** y añadir
    `https://github.com/XpellCasting/Artifact` con el tipo **Integración**.
-2. Buscar **Artifact**, descargarlo y reiniciar Home Assistant.
+2. Buscar **Paranoid**, descargarlo y reiniciar Home Assistant.
 3. En **Configuración → Dispositivos y servicios → Añadir integración**, buscar
-   **Artifact** e introducir las direcciones del equipo donde está ejecutándose:
-   API `http://<equipo-artifact>:8000` e interfaz `http://<equipo-artifact>:5173`.
-   Reemplazar `<equipo-artifact>` por su IP o nombre de red. Ambas direcciones
+   **Paranoid** e introducir las direcciones del equipo donde está ejecutándose:
+   API `http://<equipo-paranoid>:8000` e interfaz `http://<equipo-paranoid>:5173`.
+   Reemplazar `<equipo-paranoid>` por su IP o nombre de red. Ambas direcciones
    deben ser accesibles desde Home Assistant y desde el navegador.
-4. Abrir el dispositivo **Artifact** y pulsar **Visitar**. El panel
-   **Artifact-Alertas** también queda disponible en la barra lateral.
+4. Abrir el dispositivo **Paranoid** y pulsar **Visitar**. El panel
+   **Paranoid-Alertas** también queda disponible en la barra lateral.
 
 Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
-La integración es la única conexión de Artifact con Home Assistant para consultar
+Desde la versión 0.4.1, la aplicación y la integración se llaman **Paranoid**.
+Al actualizar y recargar la integración, el nombre predeterminado anterior se
+actualiza automáticamente; los nombres personalizados se conservan. El dominio
+interno `artifact` mantiene el vínculo, las entidades y las rutas existentes.
+La integración es la única conexión de Paranoid con Home Assistant para consultar
 sensores, importar históricos y recibir eventos en directo. No se introducen URL
-ni tokens de Home Assistant en Artifact. El puente conserva su token interno y
-la integración conserva la dirección del servidor Artifact. La consulta de
+ni tokens de Home Assistant en Paranoid. El puente conserva su token interno y
+la integración conserva la dirección del servidor Paranoid. La consulta de
 históricos requiere Recorder activo. Solo se pueden iniciar consultas o sesiones
 cuando la conexión está **Conectada**; la interfaz también muestra **Comprobando
 conexión**, **Integración no configurada** y **Desconectada**.
 Las direcciones `localhost` de los ejemplos de instalación sirven para abrir
-Artifact desde el mismo equipo donde se ejecuta.
+Paranoid desde el mismo equipo donde se ejecuta.
 
-Actualizar primero la integración mediante HACS a la versión 0.4.0 o posterior y
+Actualizar primero la integración mediante HACS a la versión 0.4.1 o posterior y
 recargarla. Después, con el código actualizado, ejecutar
 `docker compose up -d --build api web` desde el repositorio y recargar el navegador.
 Los históricos y vínculos guardados se conservan; no es necesario volver a
@@ -199,7 +203,7 @@ y `last_changed` (fecha y hora, preferiblemente con zona horaria). Los conjuntos
 etiquetados incluyen además `es_sintetica`, `tipo` y `tipo_falla`; sus etiquetas
 se utilizan para comprobar los resultados.
 
-**Artifact-Alertas**, también disponible en la ruta `/alertas` de la interfaz,
+**Paranoid-Alertas**, también disponible en la ruta `/alertas` de la interfaz,
 muestra las detecciones de la última ejecución: rojo para posibles fallas y
 amarillo para anomalías y sospechas. Permite filtrar los avisos y consultar
 resultados anteriores de esa misma ejecución.

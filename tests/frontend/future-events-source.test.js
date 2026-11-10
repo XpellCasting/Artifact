@@ -129,7 +129,7 @@ test("live reception explains idle and reconnecting states and keeps the manual 
     for (const [connection, polling_error, expected] of [
       [{ status: "connected", received: 0 }, null, /Esperando cambios de estado/],
       [{ status: "reconnecting", received: 2, last_error: "Se perdió la conexión", interruptions: 1 }, null, /Reconectando con Home Assistant/],
-      [{ status: "connected", received: 2 }, "No se pudo consultar la API", /Recuperando comunicación con Artifact/],
+      [{ status: "connected", received: 2 }, "No se pudo consultar la API", /Recuperando comunicación con Paranoid/],
     ]) {
       view = await renderInteractive(Source, { apiBaseUrl: "/api", busy: true, job: {
         mode: "home_assistant", status: "running", phase: "evaluation", connection, polling_error } });

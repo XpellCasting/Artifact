@@ -14,7 +14,7 @@ class ArtifactAlertsPanel extends HTMLElement {
         :host { display: block; width: 100%; height: 100vh; height: 100dvh; overflow: hidden; font-family: var(--ha-font-family-body, Roboto, Noto, sans-serif); background: var(--primary-background-color, #fafafa); }
         iframe { display: block; width: 100%; height: 100%; min-height: 0; border: 0; }
       </style>
-      <iframe title="Artifact-Alertas" referrerpolicy="no-referrer"></iframe>`;
+      <iframe title="Paranoid-Alertas" referrerpolicy="no-referrer"></iframe>`;
     this.shadowRoot.querySelector("iframe").addEventListener("load", () => this._sendTheme(true));
     this._onThemeReady = (event) => {
       if (this._url && event.origin === new URL(this._url).origin

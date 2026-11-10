@@ -1,6 +1,6 @@
 # Entrenar GAT-LSTM en un ordenador con CUDA
 
-El entrenamiento se ejecuta desde consola, reutiliza el modelo y el procesamiento de Artifact, y guarda un candidato sin activarlo. La aplicación puede usar después sus pesos en CPU. No es necesario iniciar el frontend ni el servidor para entrenar.
+El entrenamiento se ejecuta desde consola, reutiliza el modelo y el procesamiento de Paranoid, y guarda un candidato sin activarlo. La aplicación puede usar después sus pesos en CPU. No es necesario iniciar el frontend ni el servidor para entrenar.
 
 ## 1. Preparar el ordenador NVIDIA
 
@@ -22,7 +22,7 @@ Si ya clonaste el repositorio, usa `git pull` y `git lfs pull` dentro de esa cop
 
 Instala **PyTorch con CUDA** siguiendo el [selector oficial de PyTorch](https://pytorch.org/get-started/locally/): elige tu sistema, Pip, Python y una variante CUDA compatible con el controlador. Copia el comando completo que muestra la página y sustituye únicamente su `pip` o `pip3` inicial por `.\.venv-cuda\Scripts\python.exe -m pip`. Conserva `install`, los nombres de paquetes (incluido `torch`) y los argumentos `--index-url` del comando generado. El fragmento que termina en `pip install` no es un comando completo y por sí solo produce el error «You must give at least one requirement to install». La versión de referencia del proyecto es `torch==2.14.0`; busca esa versión en las [instrucciones oficiales por versión](https://pytorch.org/get-started/previous-versions/) si el selector ofrece otra. No se fija aquí un índice `cuXXX` porque depende de la GPU y del controlador del equipo nuevo.
 
-El archivo `requirements-gat-training.txt` contiene las dependencias mínimas para entrenar desde consola. No instala el servidor ni los demás clasificadores de Artifact. Instala después las dependencias neuronales restantes:
+El archivo `requirements-gat-training.txt` contiene las dependencias mínimas para entrenar desde consola. No instala el servidor ni los demás clasificadores de Paranoid. Instala después las dependencias neuronales restantes:
 
 ```powershell
 .\.venv-cuda\Scripts\python.exe -m pip install -r backend/requirements-gat-cuda.txt
@@ -38,7 +38,7 @@ En Linux crea el entorno con `python3 -m venv .venv-cuda` y sustituye `.\.venv-c
 
 ## 2. Preparar y trasladar un dataset compatible
 
-En el ordenador actual, prepara un dataset con la versión actual de Artifact, desde el flujo GAT-LSTM de la aplicación, usando los históricos y las anotaciones seleccionadas. El contrato requerido es `gat-lstm-segments-v1`, con arquitectura `gat_lstm_v3_segments_multiscale`. Conserva su identificador para los siguientes comandos.
+En el ordenador actual, prepara un dataset con la versión actual de Paranoid, desde el flujo GAT-LSTM de la aplicación, usando los históricos y las anotaciones seleccionadas. El contrato requerido es `gat-lstm-segments-v1`, con arquitectura `gat_lstm_v3_segments_multiscale`. Conserva su identificador para los siguientes comandos.
 
 El snapshot publicado actualmente en Git LFS contiene el dataset histórico `3c145354dcda4cefb68f1811a21ef488`, con contrato anterior `gat-lstm-entities-v1` y arquitectura `gat_lstm_v2_shared_type`. **Ese dataset y sus pesos no se pueden usar para entrenar esta arquitectura por segmentos.** Hay que preparar un dataset nuevo; cambiar su etiqueta de versión no convierte los datos ni el modelo.
 
@@ -46,7 +46,7 @@ El preparador acepta varios CSV etiquetados de Desarrollo y genera un conjunto c
 
 ### Preparación directa desde los dos CSV
 
-Puedes preparar los datos sin iniciar la aplicación. Copia los archivos al ordenador CUDA como `storage/gat-mixto/inputs/real.csv` y `storage/gat-mixto/inputs/sintetico.csv`. El paquete local `storage/gat-mixto/entradas-mixto.zip`, si está disponible, contiene esa estructura: extráelo en la raíz de Artifact. Los CSV no se publican en Git.
+Puedes preparar los datos sin iniciar la aplicación. Copia los archivos al ordenador CUDA como `storage/gat-mixto/inputs/real.csv` y `storage/gat-mixto/inputs/sintetico.csv`. El paquete local `storage/gat-mixto/entradas-mixto.zip`, si está disponible, contiene esa estructura: extráelo en la raíz de Paranoid. Los CSV no se publican en Git.
 
 Después de actualizar el código e instalar el entorno CUDA, ejecuta desde PowerShell:
 
@@ -74,7 +74,7 @@ $dataset = (Get-Content storage/gat-mixto/dataset.json -Raw | ConvertFrom-Json).
 
 Añade `--inspect-only` al preparador para comprobar columnas, fechas, entidades y etiquetas sin generar secuencias. El resultado entrenado incluye `metrics.dev_metrics_by_source` para revisar cada histórico por separado con la misma política de decisión. Estas métricas siguen siendo de ajuste `dev_tune`.
 
-Para trasladar el dataset nuevo, exporta en el ordenador actual usando el Python que ya ejecuta Artifact:
+Para trasladar el dataset nuevo, exporta en el ordenador actual usando el Python que ya ejecuta Paranoid:
 
 ```powershell
 python scripts/gat_lstm_transfer.py export --dataset-id ID_DATASET --output storage/exports/dataset-cuda.tar.gz
@@ -138,13 +138,13 @@ $model = "ID_MODELO_DEVUELTO"
 .\.venv-cuda\Scripts\python.exe scripts/gat_lstm_transfer.py export --dataset-id $dataset --model-id $model --output storage/exports/candidate-cuda.tar.gz
 ```
 
-El paquete del candidato incluye pesos en CPU, preprocesador, grafo, configuración, política de decisión y dataset preparado. Copia el paquete al ordenador que ejecuta Artifact e impórtalo usando su entorno Python:
+El paquete del candidato incluye pesos en CPU, preprocesador, grafo, configuración, política de decisión y dataset preparado. Copia el paquete al ordenador que ejecuta Paranoid e impórtalo usando su entorno Python:
 
 ```powershell
 python scripts/gat_lstm_transfer.py import storage/exports/candidate-cuda.tar.gz
 ```
 
-La importación registra el modelo y conserva sus métricas y evaluaciones; no lo selecciona ni cambia la activación local. Revisa sus resultados y actívalo desde el flujo habitual de Artifact cuando decidas utilizarlo. La evaluación del clasificador sobre las particiones históricas `validation` y `test` está deshabilitada por el contrato actual: quedan reservadas para el flujo de reproducción de eventos futuros. La validación operacional se realiza con los flujos de la aplicación que ya soportan ese análisis; las métricas `dev_tune` no sustituyen esa validación.
+La importación registra el modelo y conserva sus métricas y evaluaciones; no lo selecciona ni cambia la activación local. Revisa sus resultados y actívalo desde el flujo habitual de Paranoid cuando decidas utilizarlo. La evaluación del clasificador sobre las particiones históricas `validation` y `test` está deshabilitada por el contrato actual: quedan reservadas para el flujo de reproducción de eventos futuros. La validación operacional se realiza con los flujos de la aplicación que ya soportan ese análisis; las métricas `dev_tune` no sustituyen esa validación.
 
 Para ejecutar esa evaluación desde consola, carga Desarrollo y el CSV etiquetado de eventos futuros en la aplicación. Guarda un flujo con GAT-LSTM habilitado y selecciona el modelo en su nodo, o utiliza el modelo activo. Después ejecuta el comando con el identificador del flujo.
 

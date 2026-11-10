@@ -1,4 +1,4 @@
-// Runs in Home Assistant; only configured Artifact frames receive theme values.
+// Runs in Home Assistant; only configured Paranoid frames receive theme values.
 const configuredUrl = new URL(new URL(import.meta.url).searchParams.get("web_url"));
 const themeProperties = [
   "--primary-background-color", "--secondary-background-color", "--card-background-color", "--ha-card-background",

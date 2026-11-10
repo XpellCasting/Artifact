@@ -1,4 +1,4 @@
-"""Constants for the Artifact integration."""
+"""Constants for the Paranoid integration."""
 
 from datetime import timedelta
 

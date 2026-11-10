@@ -1,4 +1,4 @@
-"""Register Artifact's alerts as a separate Home Assistant sidebar panel."""
+"""Register Paranoid's alerts as a separate Home Assistant sidebar panel."""
 
 from asyncio import Lock
 from pathlib import Path
@@ -27,7 +27,7 @@ async def async_setup_alerts_panel(hass, entry):
                 StaticPathConfig(DASHBOARD_THEME_URL, str(Path(__file__).parent / "frontend" / "dashboard-theme.js"), False),
             ])
             data["alerts_module_registered"] = True
-    dashboard_module = f"{DASHBOARD_THEME_URL}?{urlencode({'v': '0.3.3', 'web_url': entry.data[CONF_WEB_URL]})}"
+    dashboard_module = f"{DASHBOARD_THEME_URL}?{urlencode({'v': '0.4.1', 'web_url': entry.data[CONF_WEB_URL]})}"
     modules = data.setdefault("dashboard_theme_modules", {})
     if old_module := modules.get(entry.entry_id):
         frontend.remove_extra_js_url(hass, old_module)
@@ -37,9 +37,9 @@ async def async_setup_alerts_panel(hass, entry):
         hass,
         frontend_url_path=alerts_panel_path(entry),
         webcomponent_name="artifact-alerts-panel",
-        sidebar_title="Artifact-Alertas",
+        sidebar_title="Paranoid-Alertas",
         sidebar_icon="mdi:bell-alert",
-        module_url=f"{PANEL_MODULE_URL}?v=0.3.3",
+        module_url=f"{PANEL_MODULE_URL}?v=0.4.1",
         embed_iframe=False,
         config={"url": f"{entry.data[CONF_WEB_URL].rstrip('/')}/alertas"},
     )

@@ -1,22 +1,22 @@
 {
-  "title": "Artifact",
+  "title": "Paranoid",
   "config": {
     "step": {
       "user": {
-        "title": "Conectar Artifact",
-        "description": "Artifact debe estar ejecutándose en Docker. Las direcciones sugeridas usan la IP Tailscale del notebook: http://100.72.168.116:8000 y http://100.72.168.116:5173. Home Assistant, el notebook y el dispositivo donde abres el navegador necesitan acceso a la misma red Tailscale. Puedes cambiar estas direcciones para otra instalación.",
+        "title": "Conectar Paranoid",
+        "description": "Paranoid debe estar ejecutándose en Docker. Las direcciones sugeridas usan la IP Tailscale del notebook: http://100.72.168.116:8000 y http://100.72.168.116:5173. Home Assistant, el notebook y el dispositivo donde abres el navegador necesitan acceso a la misma red Tailscale. Puedes cambiar estas direcciones para otra instalación.",
         "data": {
           "url": "URL de la API",
           "web_url": "URL de la interfaz web"
         },
         "data_description": {
           "url": "Dirección base de la API, sin /health.",
-          "web_url": "Dirección que abre el enlace Visitar del dispositivo Artifact."
+          "web_url": "Dirección que abre el enlace Visitar del dispositivo Paranoid."
         }
       },
       "reconfigure": {
-        "title": "Reconfigurar Artifact",
-        "description": "Cambia las direcciones de la API y de la interfaz de Artifact. Para Tailscale, usa la IP Tailscale del notebook con los puertos 8000 y 5173.",
+        "title": "Reconfigurar Paranoid",
+        "description": "Cambia las direcciones de la API y de la interfaz de Paranoid. Para Tailscale, usa la IP Tailscale del notebook con los puertos 8000 y 5173.",
         "data": {
           "url": "URL de la API",
           "web_url": "URL de la interfaz web"
@@ -25,12 +25,12 @@
     },
     "error": {
       "invalid_url": "Introduce URL HTTP(S) válidas, sin credenciales, parámetros de consulta ni fragmentos.",
-      "cannot_connect": "No se puede conectar a la API. Comprueba que Artifact está activo y que Home Assistant puede acceder a su dirección.",
-      "invalid_response": "Esta dirección no devuelve el estado de Artifact. Comprueba la URL y el puerto de la API (normalmente 8000)."
+      "cannot_connect": "No se puede conectar a la API. Comprueba que Paranoid está activo y que Home Assistant puede acceder a su dirección.",
+      "invalid_response": "Esta dirección no devuelve el estado de Paranoid. Comprueba la URL y el puerto de la API (normalmente 8000)."
     },
     "abort": {
-      "already_configured": "Este servidor Artifact ya está configurado.",
-      "reconfigure_successful": "Se actualizó la conexión de Artifact."
+      "already_configured": "Este servidor Paranoid ya está configurado.",
+      "reconfigure_successful": "Se actualizó la conexión de Paranoid."
     }
   },
   "entity": {

@@ -25,7 +25,7 @@ async def lifespan(api):
         await home_assistant_bridge.close()
 
 def crear_app():
-    api = FastAPI(title="Artefacto de tesis", version="0.6.0", lifespan=lifespan,
+    api = FastAPI(title="Paranoid", version="0.6.0", lifespan=lifespan,
                   description="Filtros estadístico y contextual con diagnóstico GAT-LSTM v2.")
     api.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS,
                        allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
