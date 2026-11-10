@@ -4,7 +4,7 @@
   "after_dependencies": ["recorder"],
   "codeowners": ["@XpellCasting"],
   "config_flow": true,
-  "dependencies": ["frontend", "panel_custom"],
+  "dependencies": ["frontend", "http", "panel_custom"],
   "documentation": "https://github.com/XpellCasting/Artifact#home-assistant-hacs",
   "integration_type": "service",
   "iot_class": "local_polling",
