@@ -70,7 +70,8 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
     from app.modulos.clasificador.config import Config
     config = Config(**manifest["config"])
     base = {"entity_id": entity_id, "timestamp": timestamp, "method": "gat_lstm",
-            "compatibility": None, "fault_type": None, "model_version": manifest["model_id"],
+            "compatibility": None, "fault_type": None, "fault_type_confidence": None,
+            "model_version": manifest["model_id"],
             "preprocessor_version": preprocessor.get("schema_version"),
             "graph_version": graph.get("graph_version"),
             "confidence_kind": "uncalibrated_softmax", "evaluation_scope": "causal_runtime",
@@ -181,25 +182,29 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
     elif metrics is not None:
         metrics["gat_inference_cache_hits"] = metrics.get("gat_inference_cache_hits", 0) + 1
     scores = cache_entry["scores_by_node"][index]
-    type_scores = (cache_entry["type_scores_by_node"][index]
-                   if cache_entry["type_scores_by_node"] is not None else None)
     policy = manifest.get("rejection_policy", {"threshold": .4, "margin": 0.0})
     choice = decide(scores, policy["threshold"], policy["margin"])
     label = LABELS[choice] if choice is not None else None
-    status = ("indeterminate" if choice is None else "compatible" if choice == 2
+    is_sensor_fault = label == "sensor_fault"
+    status = ("indeterminate" if choice is None else "compatible" if is_sensor_fault
               else "environmental_anomaly" if choice == 1 else "no_fault_evidence")
-    type_index = max(range(len(type_scores)), key=type_scores.__getitem__) if type_scores else None
-    type_confidence = type_scores[type_index] if type_index is not None else None
-    metrics = manifest.get("metrics", {})
-    type_name = fault_types[type_index] if type_index is not None else None
-    type_validation = metrics.get("fault_type_validation", {})
-    type_identified = (type_name is not None
-        and metrics.get("fault_type_train_episode_support", {}).get(type_name, 0) >= 3
-        and type_validation.get("independent_episodes_by_type", {}).get(type_name, 0) >= 3
-        and (type_validation.get("recall_by_type", {}).get(type_name) or 0) >= .5)
+    # Interpret the subtype scores only after accepting a sensor fault.
+    type_name, type_confidence, type_identified = None, None, False
+    if is_sensor_fault:
+        type_scores = (cache_entry["type_scores_by_node"][index]
+                       if cache_entry["type_scores_by_node"] is not None else None)
+        type_index = max(range(len(type_scores)), key=type_scores.__getitem__) if type_scores else None
+        type_confidence = type_scores[type_index] if type_index is not None else None
+        type_name = fault_types[type_index] if type_index is not None else None
+        model_metrics = manifest.get("metrics", {})
+        type_validation = model_metrics.get("fault_type_validation", {})
+        type_identified = (type_name is not None
+            and model_metrics.get("fault_type_train_episode_support", {}).get(type_name, 0) >= 3
+            and type_validation.get("independent_episodes_by_type", {}).get(type_name, 0) >= 3
+            and (type_validation.get("recall_by_type", {}).get(type_name) or 0) >= .5)
     reasons = ["score_below_rejection_policy"] if choice is None else []
     return {**base, "status": status,
-            "fault_type_status": ("identified" if type_identified else "unknown") if choice == 2 else "not_applicable",
+            "fault_type_status": ("identified" if type_identified else "unknown") if is_sensor_fault else "not_applicable",
             "fault_type": type_name if type_identified else None,
             "fault_type_confidence": type_confidence,
             "predicted_label": label, "confidence": max(scores),
