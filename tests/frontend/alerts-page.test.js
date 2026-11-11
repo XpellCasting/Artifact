@@ -185,7 +185,7 @@ test("the alerts route opens directly without loading history or starting the fl
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });
 
-test("the Home Assistant sidebar panel embeds the alerts view without a duplicate toolbar", () => {
+test("the Home Assistant sidebar panel embeds both views and keeps the application open", () => {
   const require = createRequire(new URL("../../frontend/package.json", import.meta.url));
   const { JSDOM } = require("jsdom");
   const dom = new JSDOM("<!doctype html><body></body>", { url: "http://ha.local:8123", runScripts: "outside-only", pretendToBeVisual: true });
@@ -198,6 +198,16 @@ test("the Home Assistant sidebar panel embeds the alerts view without a duplicat
     assert.equal(panel.shadowRoot.querySelector("header, button, a"), null);
     panel.panel = { config: { url: "javascript:alert(1)" } };
     assert.equal(panel.shadowRoot.querySelector("iframe").src, "http://artifact.local:5173/alertas?ha_origin=http%3A%2F%2Fha.local%3A8123");
+    const appConfig = { config: { url: "http://artifact.local:5173", title: "Paranoid" } };
+    panel.panel = appConfig;
+    const frame = panel.shadowRoot.querySelector("iframe");
+    assert.equal(frame.title, "Paranoid");
+    assert.equal(frame.src, "http://artifact.local:5173/?ha_origin=http%3A%2F%2Fha.local%3A8123");
+    const changes = new dom.window.MutationObserver(() => {});
+    changes.observe(frame, { attributeFilter: ["src"] });
+    panel.panel = appConfig;
+    assert.equal(changes.takeRecords().length, 0);
+    changes.disconnect();
   } finally { dom.window.close(); }
 });
 

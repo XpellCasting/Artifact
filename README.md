@@ -61,23 +61,25 @@ docker compose stop
 
 Los directorios `data/`, `storage/` y `models/` conservan el estado entre reinicios.
 
-### Home Assistant (HACS)
+### Home Assistant (Marketplace y HACS)
 
 La integración conecta Home Assistant con Paranoid, proporciona históricos y
 cambios de estado, y permite abrir la aplicación y su panel de alertas. Requiere
-Home Assistant 2024.12 o posterior. Paranoid debe estar ejecutándose por separado;
-HACS instala únicamente la integración.
+Home Assistant 2024.12 o posterior. Paranoid debe estar ejecutándose por separado.
 
-1. En HACS, abrir **⋮ → Repositorios personalizados** y añadir
-   `https://github.com/XpellCasting/Artifact` con el tipo **Integración**.
-2. Buscar **Paranoid**, descargarlo y reiniciar Home Assistant.
+1. En Home Assistant 2026.11 o posterior, abrir **Configuración → Marketplace →
+   Añadir desde un enlace** y añadir `https://github.com/XpellCasting/Artifact`.
+   En versiones anteriores, añadir la misma dirección en **HACS → ⋮ →
+   Repositorios personalizados** con el tipo **Integración**.
+2. Instalar **Paranoid** y reiniciar Home Assistant si lo solicita.
 3. En **Configuración → Dispositivos y servicios → Añadir integración**, buscar
    **Paranoid** e introducir las direcciones del equipo donde está ejecutándose:
    API `http://<equipo-paranoid>:8000` e interfaz `http://<equipo-paranoid>:5173`.
    Reemplazar `<equipo-paranoid>` por su IP o nombre de red. Ambas direcciones
    deben ser accesibles desde Home Assistant y desde el navegador.
-4. Abrir el dispositivo **Paranoid** y pulsar **Visitar**. El panel
-   **Paranoid-Alertas** también queda disponible en la barra lateral.
+4. Una vez cargada la integración, Home Assistant añade **Paranoid** y
+   **Paranoid-Alertas** a la barra lateral. Ambos accesos se retiran al
+   desactivar o eliminar la configuración. El dispositivo **Paranoid** también ofrece **Visitar**.
 
 Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
 Desde la versión 0.4.1, la aplicación y la integración se llaman **Paranoid**.
@@ -94,9 +96,8 @@ conexión**, **Integración no configurada** y **Desconectada**.
 Las direcciones `localhost` de los ejemplos de instalación sirven para abrir
 Paranoid desde el mismo equipo donde se ejecuta.
 
-Actualizar primero la integración mediante HACS a la versión 0.4.1 o posterior y
-recargarla. Después, con el código actualizado, ejecutar
-`docker compose up -d --build api web` desde el repositorio y recargar el navegador.
+Para incorporar ambos paneles a una instalación existente, actualiza la integración
+a la versión 0.4.2 o posterior desde Marketplace o HACS y reinicia Home Assistant.
 Los históricos y vínculos guardados se conservan; no es necesario volver a
 emparejar. Una integración anterior todavía entrega el catálogo plano, con un
 aviso de que los metadatos de áreas no están disponibles.

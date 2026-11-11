@@ -24,7 +24,7 @@ window.addEventListener("message", (event) => {
     if (!client.frame.isConnected) { client.observer.disconnect(); clients.delete(source); }
   }
   const frame = findFrame(document, event.source);
-  if (!frame) return;
+  if (!frame || frame.hasAttribute("data-paranoid-panel")) return;
   const url = new URL(frame.src);
   const basePath = configuredUrl.pathname.replace(/\/$/, "");
   if (url.origin !== configuredUrl.origin || (basePath && url.pathname !== basePath && !url.pathname.startsWith(`${basePath}/`))) return;

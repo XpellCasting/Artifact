@@ -5,7 +5,7 @@ const ARTIFACT_THEME_PROPERTIES = [
   "--ha-card-border-color", "--ha-card-border-radius", "--ha-card-box-shadow",
 ];
 
-class ArtifactAlertsPanel extends HTMLElement {
+class ParanoidPanel extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
@@ -14,7 +14,7 @@ class ArtifactAlertsPanel extends HTMLElement {
         :host { display: block; width: 100%; height: 100vh; height: 100dvh; overflow: hidden; font-family: var(--ha-font-family-body, Roboto, Noto, sans-serif); background: var(--primary-background-color, #fafafa); }
         iframe { display: block; width: 100%; height: 100%; min-height: 0; border: 0; }
       </style>
-      <iframe title="Paranoid-Alertas" referrerpolicy="no-referrer"></iframe>`;
+      <iframe data-paranoid-panel title="Paranoid-Alertas" referrerpolicy="no-referrer"></iframe>`;
     this.shadowRoot.querySelector("iframe").addEventListener("load", () => this._sendTheme(true));
     this._onThemeReady = (event) => {
       if (this._url && event.origin === new URL(this._url).origin
@@ -64,14 +64,17 @@ class ArtifactAlertsPanel extends HTMLElement {
   }
 
   set panel(value) {
-    const url = value?.config?.url;
-    if (!url || url === this._url) return;
-    const target = new URL(url);
+    const config = value?.config;
+    if (!config?.url) return;
+    const target = new URL(config.url);
     if (!["http:", "https:"].includes(target.protocol)) return;
+    const frame = this.shadowRoot.querySelector("iframe");
+    frame.title = config.title || "Paranoid-Alertas";
+    if (target.href === this._url) return;
     this._url = target.href;
     target.searchParams.set("ha_origin", window.location.origin);
-    this.shadowRoot.querySelector("iframe").src = target.href;
+    frame.src = target.href;
   }
 }
 
-if (!customElements.get("artifact-alerts-panel")) customElements.define("artifact-alerts-panel", ArtifactAlertsPanel);
+if (!customElements.get("artifact-alerts-panel")) customElements.define("artifact-alerts-panel", ParanoidPanel);

@@ -9,7 +9,7 @@ from aiohttp import ClientError
 from .coordinator import ArtifactCoordinator
 from .api import InvalidArtifactResponse
 from .bridge import ArtifactBridge
-from .panel import async_remove_alerts_panel, async_setup_alerts_panel
+from .panel import async_remove_panels, async_setup_panels
 
 PLATFORMS = [Platform.BINARY_SENSOR]
 
@@ -27,10 +27,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except (ClientError, TimeoutError, InvalidArtifactResponse) as err:
         raise ConfigEntryNotReady("Unable to establish the Paranoid bridge") from err
     try:
-        await async_setup_alerts_panel(hass, entry)
+        await async_setup_panels(hass, entry)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except BaseException:
-        async_remove_alerts_panel(hass, entry)
+        async_remove_panels(hass, entry)
         await coordinator.bridge.async_close()
         raise
     return True
@@ -40,6 +40,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Remove entities; the coordinator is shut down by the config entry."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        async_remove_alerts_panel(hass, entry)
+        async_remove_panels(hass, entry)
         await entry.runtime_data.bridge.async_close()
     return unloaded

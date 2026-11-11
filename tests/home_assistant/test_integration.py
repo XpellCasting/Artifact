@@ -24,8 +24,8 @@ from custom_components.artifact.binary_sensor import ArtifactConnection
 from custom_components.artifact.config_flow import ArtifactConfigFlow
 from custom_components.artifact.bridge import ArtifactBridge
 from app.services.home_assistant_bridge import HomeAssistantBridge
-from custom_components.artifact.panel import alerts_panel_path, async_setup_alerts_panel, async_remove_alerts_panel
-from homeassistant.components.frontend import DATA_PANELS, DATA_EXTRA_MODULE_URL, UrlManager
+from custom_components.artifact.panel import alerts_panel_path, app_panel_path, async_remove_panels, async_setup_panels
+from homeassistant.components.frontend import DATA_PANELS, DATA_EXTRA_MODULE_URL, UrlManager, async_register_built_in_panel
 
 
 @pytest_asyncio.fixture
@@ -245,6 +245,9 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     title_updates = [call.kwargs["title"] for call in hass.config_entries.async_update_entry.call_args_list if "title" in call.kwargs]
     assert title_updates == (["Paranoid"] if title == "Artifact" else [])
     assert hass.config_entries.async_forward_entry_setups.await_count == 1
+    app_panel = hass.data[DATA_PANELS][app_panel_path(entry)]
+    assert app_panel.sidebar_title == "Paranoid"
+    assert app_panel.config["url"] == "http://artifact.example:5173"
     panel = hass.data[DATA_PANELS][alerts_panel_path(entry)]
     assert panel.sidebar_title == "Paranoid-Alertas"
     assert panel.config["url"] == "http://artifact.example:5173/alertas"
@@ -262,6 +265,7 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     await entry.runtime_data.async_refresh()
     assert sensor.available and sensor.is_on
     assert await async_unload_entry(hass, entry)
+    assert app_panel_path(entry) not in hass.data[DATA_PANELS]
     assert alerts_panel_path(entry) not in hass.data[DATA_PANELS]
     assert not hass.data[DATA_EXTRA_MODULE_URL].urls
     await entry.runtime_data.async_shutdown()
@@ -269,19 +273,23 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
 
 
 @pytest.mark.asyncio
-async def test_alerts_panels_use_distinct_paths_and_can_reload_without_registering_static_routes_twice(hass):
+async def test_panels_reload_without_removing_other_entries_or_user_dashboards(hass):
     first, second = make_entry("http://first.example"), make_entry("http://second.example")
     second.entry_id = "artifact-second"
-    second.data["web_url"] = "http://second.example:5173/"
-    await async_setup_alerts_panel(hass, first)
-    await async_setup_alerts_panel(hass, second)
-    assert len(hass.data[DATA_PANELS]) == 2
-    assert hass.data[DATA_PANELS][alerts_panel_path(second)].config["url"] == "http://second.example:5173/alertas"
-    async_remove_alerts_panel(hass, first)
-    assert alerts_panel_path(second) in hass.data[DATA_PANELS]
+    second.data["web_url"] = "http://second.example:5173/app/"
+    async_register_built_in_panel(hass, "lovelace", "Artifact", frontend_url_path="dashboard-artifact")
+    await async_setup_panels(hass, first)
+    await async_setup_panels(hass, second)
+    panels = hass.data[DATA_PANELS]
+    assert len(panels) == 5
+    assert panels[app_panel_path(second)].config["url"] == "http://second.example:5173/app"
+    assert panels[alerts_panel_path(second)].config["url"] == "http://second.example:5173/app/alertas"
+    async_remove_panels(hass, first)
+    assert set(panels) == {app_panel_path(second), alerts_panel_path(second), "dashboard-artifact"}
     first.data["web_url"] = "http://changed.example:5173"
-    await async_setup_alerts_panel(hass, first)
-    assert hass.data[DATA_PANELS][alerts_panel_path(first)].config["url"] == "http://changed.example:5173/alertas"
+    await async_setup_panels(hass, first)
+    assert panels[app_panel_path(first)].config["url"] == "http://changed.example:5173"
+    assert panels[alerts_panel_path(first)].config["url"] == "http://changed.example:5173/alertas"
     assert hass.http.async_register_static_paths.await_count == 1
 
 
