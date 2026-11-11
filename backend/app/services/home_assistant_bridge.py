@@ -120,10 +120,12 @@ class HomeAssistantBridge:
         digest = hashlib.sha256(token.encode()).hexdigest()
         with self.lock:
             if self.registration is not None:
-                if (self.registration.get("bridge_id") != bridge_id
-                        or not hmac.compare_digest(self.registration.get("token_hash", ""), digest)):
+                registered_id = self.registration.get("bridge_id")
+                if registered_id == bridge_id and hmac.compare_digest(self.registration.get("token_hash", ""), digest):
+                    return
+                # A local operator may authorize one specific replacement entry.
+                if bridge_id == registered_id or bridge_id != self.registration.get("replacement_bridge_id"):
                     raise PermissionError("Paranoid ya está vinculado a otra integración de Home Assistant.")
-                return
             registration = {"bridge_id": bridge_id, "token_hash": digest}
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(".tmp")

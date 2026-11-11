@@ -27,6 +27,28 @@ class BridgeRegistrationTests(unittest.TestCase):
                 restored.register("integration-1", "y" * 32)
             self.assertFalse(restored.status()["bridge_connected"])
 
+    def test_locally_approved_replacement_can_pair_only_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bridge.json"
+            old_token, new_token = "x" * 32, "y" * 32
+            HomeAssistantBridge(path).register("old-entry", old_token)
+            registration = json.loads(path.read_text())
+            registration["replacement_bridge_id"] = "new-entry"
+            path.write_text(json.dumps(registration))
+
+            bridge = HomeAssistantBridge(path)
+            bridge.register("old-entry", old_token)
+            with self.assertRaises(PermissionError):
+                bridge.register("unapproved-entry", new_token)
+            self.assertTrue(bridge.authorized(old_token))
+
+            bridge.register("new-entry", new_token)
+            restored = HomeAssistantBridge(path)
+            self.assertTrue(restored.authorized(new_token))
+            self.assertFalse(restored.authorized(old_token))
+            with self.assertRaises(PermissionError):
+                restored.register("new-entry", old_token)
+
     def test_disconnected_bridge_fails_without_falling_back_to_credentials(self):
         with tempfile.TemporaryDirectory() as folder:
             bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
