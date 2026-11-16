@@ -10,6 +10,10 @@
     "test": "node --test --test-concurrency=1 ../tests/frontend/*.test.js"
   },
   "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/material": "^7.3.11",
+    "@mui/x-charts": "^8.29.3",
     "@vitejs/plugin-react": "latest",
     "@xyflow/react": "12.11.6",
     "lucide-react": "latest",

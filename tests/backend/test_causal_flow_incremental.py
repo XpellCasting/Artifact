@@ -110,6 +110,8 @@ class StreamingFlowTests(unittest.TestCase):
         streamed_output = [item for block in blocks for item in block["output"]]
         self.assertEqual(streamed_output, regular_outputs["output"])
         self.assertEqual(streamed_summary["evaluation"], regular_summary["evaluation"])
+        self.assertEqual(streamed_summary["metrics"], regular_summary["metrics"])
+        self.assertEqual(streamed_summary["metrics"]["support"]["labelled"], 3)
         self.assertEqual(streamed_summary["node_counts"], regular_summary["node_counts"])
         self.assertEqual(streamed_snapshot["source"], regular_snapshot["source"])
 

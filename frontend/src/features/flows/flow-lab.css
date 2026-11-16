@@ -45,3 +45,35 @@
 .fl-table-scroll { overflow: auto; max-height: 400px; }.flow-lab table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }.flow-lab th { background: var(--ha-surface); color: var(--ha-text); position: sticky; top: 0; z-index: 1; }.flow-lab th,.flow-lab td { padding: 12px 16px; border-bottom: 1px solid var(--ha-divider); }.flow-lab td { color: var(--ha-text); }.fl-empty-row { padding: 20px; color: var(--fl-muted); }.fl-evidence { margin: 16px; padding: 16px; border: 1px solid var(--fl-border); border-radius: 8px; }.fl-evidence h4 { margin: 0 0 8px; }.fl-evidence details { margin-top: 12px; font-size: 12px; }.fl-evidence summary { cursor: pointer; }.fl-evidence pre { max-height: 300px; overflow: auto; background: var(--ha-surface); padding: 12px; color: var(--ha-text); white-space: pre-wrap; overflow-wrap: anywhere; }
 @media(max-width:1100px) { .fl-editor { grid-template-columns: minmax(0,1fr) 240px; }.fl-header { align-items: start; }.fl-state { white-space: normal; }.fl-execution { flex-wrap: wrap; }.fl-execution>div { flex-basis: 100%; } }
 @media(max-width:760px) { .fl-header { flex-direction: column; }.fl-editor { grid-template-columns: minmax(0,1fr); }.fl-canvas { height: 430px; }.fl-inspector { border-left: 0; border-top: 1px solid var(--fl-border); }.fl-canvas-toolbar { flex-wrap: wrap; }.fl-toolbar label { flex-basis: 100%; }.fl-result-controls>span { margin-left: 0; }.fl-results-toolbar { align-items: stretch; }.fl-results-toolbar h3 { flex-basis: 100%; } }
+.fl-run-results { min-width: 0; }
+.fl-run-header { padding: 8px 18px 16px; overflow-wrap: anywhere; }
+.flow-lab .fl-run-header h3 { margin: 0 0 4px; font-size: 18px; }
+.fl-run-header p { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; font-size: 12px; }
+.fl-run-header code { color: var(--fl-text); }
+.fl-run-tabs { border-block: 1px solid var(--fl-border); padding-inline: 4px; }
+.flow-lab .fl-run-tabs button.MuiTab-root { border: 0; border-radius: 0; background: transparent; min-width: auto; min-height: 46px; padding-inline: 15px; text-transform: none; font: inherit; font-size: 13px; color: var(--fl-muted); }
+.flow-lab .fl-run-tabs button.MuiTab-root:hover { color: var(--fl-text); background: var(--ha-surface-alt); }
+.flow-lab .fl-run-tabs button.Mui-selected { color: var(--fl-text); font-weight: 700; }
+.flow-lab .fl-run-tabs :is(button.MuiTab-root, .MuiTabs-scrollButtons):focus-visible { outline-offset: -3px; }
+.fl-run-tabs .MuiTabs-indicator { background-color: var(--ha-primary); height: 3px; }
+.fl-run-tabs .MuiTabs-scrollButtons { color: var(--fl-text); }
+.fl-run-panel:not([hidden]) { display: grid; gap: 16px; min-width: 0; padding: 18px; }
+.fl-run-panel:focus-visible { outline-offset: -3px; }
+.fl-run-panel .fl-result-controls { padding: 0; }
+.fl-run-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(175px, 100%), 1fr)); gap: 12px; margin: 0; }
+.fl-run-card { display: grid; align-content: start; gap: 7px; padding: 13px 15px; border: 1px solid var(--fl-border); border-radius: 8px; background: var(--ha-surface-alt); }
+.fl-run-card dt, .fl-run-card small, .fl-run-value small { color: var(--fl-muted); font-size: 12px; line-height: 1.4; }
+.fl-run-card dd { display: grid; gap: 5px; margin: 0; }
+.fl-run-card strong { font-size: 24px; font-weight: 600; }
+.fl-run-value small { display: block; margin-top: 3px; }
+.fl-run-chart { width: 100%; min-width: 0; overflow-x: auto; }
+.fl-run-chart > div { min-width: 290px; }
+.flow-lab .fl-run-chart .MuiChartsAxis-root .MuiChartsAxis-tickLabel { fill: var(--fl-text); }
+.flow-lab .fl-run-chart .MuiChartsAxis-root :is(.MuiChartsAxis-line, .MuiChartsAxis-tick) { stroke: var(--fl-muted); }
+.flow-lab .fl-run-chart .MuiChartsGrid-root .MuiChartsGrid-line { stroke: var(--fl-border); }
+.flow-lab .fl-run-chart .MuiChartsLegend-root { color: var(--fl-text); font-family: inherit; flex-wrap: wrap; gap: 10px; }
+.flow-lab .fl-run-chart .MuiChartsLegend-label { font-family: inherit; }
+.fl-matrix-mode { justify-self: start; }
+.fl-matrix { font-variant-numeric: tabular-nums; }
+.fl-matrix td { text-align: right; }
+.fl-matrix td, .fl-matrix th { min-width: 96px; }

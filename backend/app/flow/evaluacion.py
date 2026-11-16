@@ -14,6 +14,7 @@ from uuid import uuid4
 import pandas as pd
 
 from app.flow.runner import FlowRunner
+from app.flow.metrics import FlowMetrics
 from app.flow.result_spool import FlowResultSpool
 from app.flow.definitions import _time
 from app.flow.definitions import observation_valid
@@ -64,14 +65,16 @@ class LegacyFlowResultSpool:
         self.path.unlink(missing_ok=True)
 
 
-def labelled_report(results, truth, *, truth_index=None):
+def labelled_report(results, truth, *, truth_index=None, metrics=None):
     expected = truth_index if truth_index is not None else {int(row["raw_index"]): row for row in truth}
     groups = {}
     for item in results:
         label = expected.get(int(item["source_raw_index"]))
+        decision = item.get("final_decision")
+        if metrics is not None:
+            metrics.add(label["tipo"] if label is not None else None, decision)
         if label is None:
             continue
-        decision = item.get("final_decision")
         detected = decision in {"fault_compatible", "suspicion", "environmental"}
         unassessed = decision in {"indeterminate", "not_routed"}
         diagnoses = {entry.get("data", {}).get("fault_type") for entry in item.get("evidence", []) if entry.get("status") == "compatible"}
@@ -161,6 +164,7 @@ class CausalFlowRunner(FlowRunner):
         phase_started = perf_counter()
         # Labels stay in reporting; reuse this run's lookup across groups and nodes.
         truth_index = {int(row["raw_index"]): row for row in truth}
+        metrics = FlowMetrics() if truth_index else None
         diagnostic_snapshots = {}
         if hasattr(self.diagnostic, "_run_snapshot"):
             for node in flow["nodes"]:
@@ -329,7 +333,8 @@ class CausalFlowRunner(FlowRunner):
                     for node_id, items in batch_outputs.items():
                         outputs[node_id].extend(items)
                 else:
-                    block_report = labelled_report(batch_outputs.get("output", []), truth, truth_index=truth_index)
+                    block_report = labelled_report(batch_outputs.get("output", []), truth, truth_index=truth_index,
+                                                   metrics=metrics)
                     _merge_report_groups(streamed_report_groups, block_report)
                     for node_id in streamed_statistical_groups:
                         block_stats = statistical_labelled_report(batch_outputs.get(node_id, []), truth, node_id, truth_index=truth_index)
@@ -378,7 +383,7 @@ class CausalFlowRunner(FlowRunner):
                 session.flush()
         report_started = perf_counter()
         if result_sink is None:
-            report = labelled_report(outputs["output"], truth, truth_index=truth_index)
+            report = labelled_report(outputs["output"], truth, truth_index=truth_index, metrics=metrics)
             statistical_evaluation = {node_id: statistical_labelled_report(outputs.get(node_id, []), truth, node_id, truth_index=truth_index) for node_id in self.baselines}
             result_count = len(outputs["output"])
             node_counts = {key: len(value) for key, value in outputs.items()}
@@ -395,6 +400,7 @@ class CausalFlowRunner(FlowRunner):
             result_count = streamed_node_counts.get("output", 0)
             node_counts = dict(streamed_node_counts)
             final_decisions = dict(streamed_decisions)
+        finalized_metrics = metrics.finalize() if metrics is not None else None
         report_finalization_ms = (perf_counter() - report_started) * 1000
         performance["phases_ms"]["causal_evaluation"] = round((perf_counter() - started) * 1000, 3)
         node_types = {node["id"]: node["type"] for node in flow["nodes"]}
@@ -430,6 +436,8 @@ class CausalFlowRunner(FlowRunner):
             "classifier_execution": "graph_execution; includes diagnostic inference and writes",
         }
         summary = {"candidate_count": processed, "output_count": result_count, "node_counts": node_counts, "node_timings_ms": dict(timings), "elapsed_ms": round((perf_counter() - started) * 1000, 2), "by_final_decision": final_decisions, "evaluation": report, "statistical_evaluation": statistical_evaluation, "statistical_evaluation_version": "pre_suppression_v1", "performance": performance}
+        if finalized_metrics is not None:
+            summary["metrics"] = finalized_metrics
         provenance = deepcopy(baseline.get("provenance"))
         continuous_models = {node_id: deepcopy(value.get("continuous_model_manifest")) for node_id, value in self.baselines.items()}
         identity_payload = {"base": (provenance or {}).get("baseline_id"), "continuous_methods": {node_id: value.get("continuous_method") for node_id, value in self.baselines.items()}, "continuous_models": continuous_models}

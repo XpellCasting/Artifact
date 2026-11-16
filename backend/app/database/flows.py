@@ -1,18 +1,24 @@
 from __future__ import annotations
+from collections import OrderedDict
 from contextlib import contextmanager
+from hashlib import sha256
 import json
 import logging
 import os
 from pathlib import Path
 import sqlite3
+from threading import Lock
 import unicodedata
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
+import zlib
 from app.flow.definitions import _json, _now, validate_flow
-from app.flow.result_spool import FORMAT, ALERT_DECISIONS, SpoolRecords, ResultArchive, archive_path, archive_for_run
+from app.flow.metrics import METRICS_VERSION, reconstruct_metrics, run_timings, saved_support, unavailable_metrics
+from app.flow.result_spool import FORMAT, ALERT_DECISIONS, SpoolRecords, ResultArchive, archive_path, archive_for_run, iter_run_results
 
 ALERT_SEVERITIES = {"fault": ("fault_compatible",), "anomaly": ("environmental", "suspicion")}
+METRICS_CACHE_SIZE = 32
 
 
 def _flow_name(value):
@@ -26,6 +32,8 @@ def _flow_name_key(value):
 class FlowStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._metrics_cache = OrderedDict()
+        self._metrics_lock = Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._database() as db:
             # Keep status, saved runs and alerts readable while a large spool is saved.
@@ -396,6 +404,42 @@ class FlowStore:
                         snapshot["diagnostic_snapshots"] = diagnostic
             items.append({"run_id": row[0], "flow_id": row[1], "snapshot": snapshot, "summary": summary, "created_at": row[4]})
         return items
+
+    def run_metrics(self, run_id: str) -> dict[str, Any]:
+        with self._database() as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT summary,snapshot FROM flow_run_display WHERE run_id=?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            summary, snapshot = map(json.loads, row)
+            metrics = summary.get("metrics")
+            if not isinstance(metrics, dict) or metrics.get("version") != METRICS_VERSION:
+                # Recovered labels update the saved summary and invalidate previous cache entries.
+                key = (run_id, METRICS_VERSION, sha256(row[0].encode()).digest())
+                metrics = self._reconstruct_metrics(db, run_id, summary, key)
+        return {"run_id": run_id, **metrics, "timings": run_timings(summary, snapshot.get("flow") or {})}
+
+    def _reconstruct_metrics(self, db, run_id, summary, key):
+        try:
+            archive = archive_for_run(db, self.path, run_id)
+            if archive is not None and not archive.is_file():
+                raise FileNotFoundError(archive)
+            with self._metrics_lock:
+                if key in self._metrics_cache:
+                    self._metrics_cache.move_to_end(key)
+                    return self._metrics_cache[key]
+            metrics = reconstruct_metrics(summary, iter_run_results(db, self.path, run_id, "output"))
+        except FileNotFoundError:
+            return unavailable_metrics(saved_support(summary), "Falta el archivo de resultados de esta ejecución.")
+        except (OSError, sqlite3.Error, ValueError, KeyError, IndexError, TypeError, AttributeError, zlib.error):
+            logging.getLogger(__name__).warning("No se pudieron leer las métricas de %s", run_id, exc_info=True)
+            return unavailable_metrics(saved_support(summary), "No se pudieron leer todos los resultados guardados de Salida.")
+        with self._metrics_lock:
+            self._metrics_cache[key] = metrics
+            self._metrics_cache.move_to_end(key)
+            if len(self._metrics_cache) > METRICS_CACHE_SIZE:
+                self._metrics_cache.popitem(last=False)
+        return metrics
 
     def results(self, run_id: str, node_id: str = "output", offset: int = 0, limit: int = 100) -> dict[str, Any]:
         with self._database() as db:

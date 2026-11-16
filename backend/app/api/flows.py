@@ -162,3 +162,11 @@ def flow_run_results(
         return flow_store.results(run_id, node_id, offset, limit)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Ejecución no encontrada.") from exc
+
+
+@router.get("/flow-runs/{run_id}/metrics", tags=["flow-lab"])
+def flow_run_metrics(run_id: str) -> dict[str, Any]:
+    try:
+        return flow_store.run_metrics(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Ejecución no encontrada.") from exc

@@ -6,6 +6,7 @@ import "@xyflow/react/dist/style.css";
 import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, defaultNodeConfig, edgeLabel, fingerprint, flowPayload, labelNode, nextNodeId, removeNode, templates, validateDraft } from "./flow-lab-model.js";
 import "./flow-lab.css";
 import FutureEventsSource from "./FutureEventsSource.jsx";
+import FlowRunResults from "./FlowRunResults.jsx";
 import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
 
 const PRESETS = templates();
@@ -97,12 +98,15 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const [target, setTarget] = useState("");
   const [activeRun, setActiveRun] = useState(null);
   const [inspecting, setInspecting] = useState(false);
+  const [resultsTab, setResultsTab] = useState("detail");
   const [resultNode, setResultNode] = useState("output");
   const [page, setPage] = useState({ items: [], total: 0, offset: 0, next_offset: null });
   const [resultBusy, setResultBusy] = useState(false);
+  const [resultError, setResultError] = useState("");
   const [selectedResult, setSelectedResult] = useState(null);
   const pageRequest = useRef(0);
   const refreshRequest = useRef(0);
+  const resultsRef = useRef(null);
   const [layoutRevision, setLayoutRevision] = useState(0);
   const [canvasNodes, setCanvasNodes, onCanvasNodesChange] = useNodesState([]);
   const { fitView, screenToFlowPosition } = useReactFlow();
@@ -164,7 +168,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     onFailure: (detail) => { setError(detail); setJob(null); },
     onComplete: (state) => {
       setJob(null);
-      setActiveRun(state.run); setInspecting(true); setResultNode("output"); setSelection(null);
+      openRun(state.run);
       setMessage(state.mode === "home_assistant" ? "Recepción terminada. La ejecución y sus resultados quedaron guardados." : "Evaluación terminada. El gráfico muestra el flujo utilizado con todos los eventos futuros.");
       if (state.warning) setError(state.warning);
     },
@@ -175,6 +179,16 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     if (canvasRef.current) observer.observe(canvasRef.current);
     return () => observer.disconnect();
   }, [fitView]);
+  function openRun(run) {
+    setActiveRun(run);
+    setInspecting(true);
+    setResultsTab("summary");
+    setResultNode("output");
+    setSelection(null);
+    setError("");
+    setMessage("");
+    setLayoutRevision((value) => value + 1);
+  }
   function change(mutator) { setDraft((current) => { const next = clone(current); mutator(next); return next; }); setMessage(""); }
   function choose(flow, isSaved = false) {
     setDraft(clone(flow)); setSavedKey(isSaved ? fingerprint(flow) : ""); setSelection(null); setSource(""); setTarget(""); setInspecting(false); setMessage(""); setError(""); setLayoutRevision((value) => value + 1);
@@ -248,12 +262,13 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   }
   const loadPage = useCallback(async (runId, nodeId, offset) => {
     const revision = ++pageRequest.current;
-    setResultBusy(true); setSelectedResult(null); setPage({ items: [], total: 0, offset, next_offset: null });
+    setResultBusy(true); setResultError(""); setSelectedResult(null); setPage({ items: [], total: 0, offset, next_offset: null });
     try { const payload = await request(apiBaseUrl, `/flow-runs/${runId}/results?node_id=${encodeURIComponent(nodeId)}&offset=${offset}&limit=${PAGE_SIZE}`); if (revision === pageRequest.current) setPage(payload); }
-    catch (reason) { if (revision === pageRequest.current) setError(reason.message); }
+    catch (reason) { if (revision === pageRequest.current) setResultError(reason.message); }
     finally { if (revision === pageRequest.current) setResultBusy(false); }
   }, [apiBaseUrl]);
-  useEffect(() => { if (activeRun) loadPage(activeRun.run_id, resultNode, 0); return () => { pageRequest.current += 1; }; }, [activeRun, resultNode, loadPage]);
+  const activeRunId = activeRun?.run_id;
+  useEffect(() => { if (activeRunId) loadPage(activeRunId, resultNode, 0); return () => { pageRequest.current += 1; }; }, [activeRunId, resultNode, loadPage]);
   const visualNodes = useMemo(() => graph.nodes.map((item) => ({ id: item.id, type: "filter", position: item.position || { x: 0, y: 0 }, selected: selection?.id === item.id, deletable: !["input", "output"].includes(item.type), data: { node: item, count: inspecting ? activeRun?.summary?.node_counts?.[item.id] : undefined } })), [graph, selection?.id, inspecting, activeRun?.summary?.node_counts]);
   const visualEdges = useMemo(() => graph.edges.map((item, index) => ({ ...item, data: { lane: index % 3 }, selected: selection?.id === item.id, type: "routed", markerEnd: { type: MarkerType.ArrowClosed }, label: item.when === undefined ? undefined : edgeLabel(item), labelStyle: { fontSize: 11 }, labelBgPadding: [7, 4], labelBgBorderRadius: 5, labelBgStyle: { fill: "var(--ha-surface)", fillOpacity: 1 } })), [graph, selection?.id]);
   useEffect(() => { setCanvasNodes(visualNodes); }, [visualNodes, setCanvasNodes]);
@@ -275,7 +290,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     <div className="fl-editor"><div className="fl-canvas-column">
       <div className="fl-canvas-toolbar">{!inspecting && <><label className="fl-inline">Añadir<select aria-label="Tipo de nodo" value={newType} disabled={busy} onChange={(event) => setNewType(event.target.value)}>{Object.entries(NODE_LABELS).filter(([type]) => !["input", "output"].includes(type)).map(([type, label]) => <option key={type} value={type}>{label}</option>)}</select></label><button disabled={busy} onClick={addNode}><Plus size={16} />Nodo</button></>}<button className="fl-fit" onClick={() => fitView({ padding: .18, duration: 200 })}><Maximize2 size={16} />Ver todo</button></div>
       <div className="fl-canvas" ref={canvasRef}><ReactFlow nodes={canvasNodes} edges={visualEdges} nodeTypes={NODE_TYPES} edgeTypes={EDGE_TYPES} colorMode="dark" fitView minZoom={.15} maxZoom={2} nodesDraggable={!inspecting && !busy} nodesConnectable={!inspecting && !busy} deleteKeyCode={inspecting || busy ? null : ["Backspace", "Delete"]}
-        onConnect={addConnection} onNodeClick={(_, item) => { setSelection({ kind: "node", id: item.id }); if (inspecting) setResultNode(item.id); }} onEdgeClick={(_, item) => setSelection({ kind: "edge", id: item.id })} onPaneClick={() => setSelection(null)}
+        onConnect={addConnection} onNodeClick={(_, item) => { setSelection({ kind: "node", id: item.id }); if (inspecting) { setResultNode(item.id); setResultsTab("detail"); } }} onEdgeClick={(_, item) => setSelection({ kind: "edge", id: item.id })} onPaneClick={() => setSelection(null)}
         onNodesChange={(changes) => { onCanvasNodesChange(changes); if (inspecting || busy) return; const removed = changes.filter((item) => item.type === "remove").map((item) => item.id); if (removed.length) change((next) => { for (const id of removed) { const updated = removeNode(next, id); next.nodes = updated.nodes; next.edges = updated.edges; } }); }}
         onNodeDragStop={(_, moved) => { if (inspecting || busy) return; change((next) => { const item = next.nodes.find((node) => node.id === moved.id); if (item) item.position = moved.position; }); }}
         onEdgesChange={(changes) => { if (inspecting || busy) return; const removed = changes.filter((item) => item.type === "remove").map((item) => item.id); if (removed.length) change((next) => { next.edges = next.edges.filter((item) => !removed.includes(item.id)); }); }}>
@@ -302,26 +317,29 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
       </div></section>
     </>}
     <section className="fl-comparison" aria-label="Comparación de conjuntos etiquetados"><h3>Conjuntos etiquetados evaluados</h3><div className="fl-table-scroll"><table><thead><tr><th>Conjunto · huella</th><th>Flujo · fecha</th><th>Fallas detectadas / total</th><th>Anomalías detectadas / total</th><th>Tipos identificados / etiquetados</th><th>Falsos positivos</th><th>Detalle</th></tr></thead><tbody>{runs.filter(r => r.summary.evaluation?.labelled).map(run => {
-      const groups = run.summary.evaluation.groups;
+      const groups = run.summary.evaluation.groups || [];
       const sum = (kind, field) => groups.filter(g => !kind || g.expected === kind).reduce((total, g) => total + (g[field] || 0), 0);
-      return <tr key={run.run_id}><td>{run.snapshot.source.filename}<small className="fl-muted"> · {run.snapshot.source.fingerprint.slice(0, 10)}</small></td><td>{run.snapshot.flow.name} · {new Date(run.created_at).toLocaleString()}</td><td>{sum("Falla", "detected")} / {sum("Falla", "total")}</td><td>{sum("anomalia", "detected")} / {sum("anomalia", "total")}</td><td>{sum("Falla", "type_identified")} / {groups.filter(g => g.expected === "Falla" && g.fault_type).reduce((n, g) => n + g.total, 0)}</td><td>{sum(null, "false_positives")}</td><td><button disabled={busy} onClick={() => { setActiveRun(run); setInspecting(true); setResultNode("output"); setSelection(null); }}>Ver resultados</button></td></tr>;
+      return <tr key={run.run_id}><td>{run.snapshot.source?.filename || "Histórico"}{run.snapshot.source?.fingerprint && <small className="fl-muted"> · {run.snapshot.source.fingerprint.slice(0, 10)}</small>}</td><td>{run.snapshot.flow.name} · {new Date(run.created_at).toLocaleString()}</td><td>{sum("Falla", "detected")} / {sum("Falla", "total")}</td><td>{sum("anomalia", "detected")} / {sum("anomalia", "total")}</td><td>{sum("Falla", "type_identified")} / {groups.filter(g => g.expected === "Falla" && g.fault_type).reduce((n, g) => n + g.total, 0)}</td><td>{sum(null, "false_positives")}</td><td><button disabled={busy} onClick={() => { openRun(run); resultsRef.current?.focus(); }}>Ver resultados</button></td></tr>;
     })}</tbody></table></div>{!runs.some(r => r.summary.evaluation?.labelled) && <p className="fl-muted">Carga un conjunto etiquetado y evalúa un flujo para comenzar la comparación.</p>}</section>
-    <section className="fl-results" aria-label="Resultados de flujos"><div className="fl-results-toolbar"><h3>Ejecuciones</h3><label>Consultar<select aria-label="Ejecución guardada" value={activeRun?.run_id || ""} disabled={busy} onChange={(event) => { const run = runs.find((item) => item.run_id === event.target.value); if (run) { setActiveRun(run); setInspecting(true); setResultNode("output"); setSelection(null); setError(""); setMessage(""); setLayoutRevision((value) => value + 1); } }}><option value="">Seleccionar ejecución…</option>{runs.map((run) => <option key={run.run_id} value={run.run_id}>{run.snapshot?.flow?.name} · {run.snapshot.source?.filename || "Histórico"} · {new Date(run.created_at).toLocaleString()}</option>)}</select></label><button disabled={busy} aria-label="Actualizar ejecuciones" onClick={() => refresh().catch((e) => setError(e.message))}><RotateCcw size={16} /></button></div>
-      {!activeRun ? <div className="fl-empty"><GitBranch size={28} /><strong>{runsLoaded ? "Tu primera ejecución aparecerá aquí" : "Cargando ejecuciones guardadas…"}</strong><p>{runsLoaded ? "Guarda un flujo y ejecútalo para revisar el recorrido y la evidencia." : "Consultando las pruebas realizadas."}</p></div> : <>
-        <p><strong>{activeRun.snapshot.source?.filename || "Ejecución anterior"}</strong> · {activeRun.snapshot.execution_mode === "causal_live" ? "Eventos de Home Assistant · evaluación en directo" : activeRun.snapshot.execution_mode === "causal_future" ? "Eventos futuros · evaluación causal" : "Análisis retrospectivo anterior"} · {activeRun.snapshot.baseline_id ? `Base ${activeRun.snapshot.baseline_id.slice(0, 16)}` : "Base sin procedencia registrada"}</p>
+    <section ref={resultsRef} tabIndex={-1} className="fl-results" aria-label="Resultados de flujos"><div className="fl-results-toolbar"><h3>Ejecuciones</h3><label>Consultar<select aria-label="Ejecución guardada" value={activeRun?.run_id || ""} disabled={busy} onChange={(event) => { const run = runs.find((item) => item.run_id === event.target.value); if (run) openRun(run); }}><option value="">Seleccionar ejecución…</option>{runs.map((run) => <option key={run.run_id} value={run.run_id}>{run.snapshot?.flow?.name} · {run.snapshot.source?.filename || "Histórico"} · {new Date(run.created_at).toLocaleString()}</option>)}</select></label><button disabled={busy} aria-label="Actualizar ejecuciones" onClick={() => refresh().catch((e) => setError(e.message))}><RotateCcw size={16} /></button></div>
+      {!activeRun ? <div className="fl-empty"><GitBranch size={28} /><strong>{runsLoaded ? "Tu primera ejecución aparecerá aquí" : "Cargando ejecuciones guardadas…"}</strong><p>{runsLoaded ? "Guarda un flujo y ejecútalo para revisar el recorrido y la evidencia." : "Consultando las pruebas realizadas."}</p></div> : <FlowRunResults
+        key={`${apiBaseUrl}/${activeRunId}`} apiBaseUrl={apiBaseUrl} run={activeRun} activeTab={resultsTab} onTabChange={setResultsTab}>
+        <p className="fl-muted">{activeRun.snapshot.execution_mode === "causal_live" ? "Eventos de Home Assistant · evaluación en directo" : activeRun.snapshot.execution_mode === "causal_future" ? "Eventos futuros · evaluación causal" : "Análisis retrospectivo anterior"} · {activeRun.snapshot.baseline_id ? `Base ${activeRun.snapshot.baseline_id.slice(0, 16)}` : "Base sin procedencia registrada"}</p>
         <CalibrationReport models={Object.assign({}, ...Object.values(activeRun.snapshot.baseline_provenance?.continuous_models || {}))} />
         {activeRun.snapshot.baseline_provenance?.continuous_models && <p className="fl-muted">Entrenamiento completado · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => model.eligible).length} sensores preparados · {Object.values(activeRun.snapshot.baseline_provenance.continuous_models).flatMap((models) => Object.values(models || {})).filter((model) => !model.eligible).length} no evaluables</p>}
-        <div className="fl-metrics"><span><strong>{activeRun.summary.candidate_count}</strong>Lecturas de entrada</span><span><strong>{activeRun.summary.output_count}</strong>Resultados finales</span><span><strong>{Number(activeRun.summary.elapsed_ms).toLocaleString()} ms</strong>Tiempo total</span>{Object.entries(activeRun.summary.by_final_decision || {}).map(([key, value]) => <span key={key}><strong>{value}</strong>{DECISIONS[key] || key}</span>)}</div>
+        <div className="fl-metrics"><span><strong>{activeRun.summary.candidate_count ?? "—"}</strong>Lecturas de entrada</span><span><strong>{activeRun.summary.output_count ?? "—"}</strong>Resultados finales</span>{activeRun.summary.elapsed_ms != null && <span><strong>{Number(activeRun.summary.elapsed_ms).toLocaleString()} ms</strong>Tiempo de evaluación del flujo</span>}{Object.entries(activeRun.summary.by_final_decision || {}).map(([key, value]) => <span key={key}><strong>{value}</strong>{DECISIONS[key] || key}</span>)}</div>
         <FlowLabelReport report={activeRun.summary.evaluation} />
         <StatisticalLabelReport reports={activeRun.summary.statistical_evaluation} version={activeRun.summary.statistical_evaluation_version} />
         <div className="fl-result-controls"><label>Resultados del nodo<select aria-label="Nodo de resultados" value={resultNode} onChange={(event) => setResultNode(event.target.value)}><option value="output">Salida final</option>{activeRun.snapshot.flow.nodes.filter((item) => item.id !== "output").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><span className="fl-muted">{resultBusy ? "Cargando resultados…" : `${page.total ? page.offset + 1 : 0}–${page.offset + page.items.length} de ${page.total}`}</span><button disabled={resultBusy || page.offset === 0} onClick={() => loadPage(activeRun.run_id, resultNode, Math.max(0, page.offset - PAGE_SIZE))}><ArrowLeft size={15} />Anterior</button><button disabled={resultBusy || page.next_offset === null} onClick={() => loadPage(activeRun.run_id, resultNode, page.next_offset)}>Siguiente<ArrowRight size={15} /></button></div>
-        <div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Fecha y hora UTC</th><th>Resultado</th><th>Etiqueta y detección</th><th>Evidencia</th></tr></thead><tbody>{page.items.map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{item.timestamp}</td><td>{DECISIONS[item.final_decision] || SIGNAL_LABELS[item.signal] || "No evaluable"}</td><td>{item.evaluation ? `${item.evaluation.expected} · ${EVALUATION_LABELS[item.evaluation.outcome]}${item.evaluation.type_identified ? " · Tipo identificado" : ""}` : "—"}</td><td><button onClick={() => setSelectedResult(item)}>Ver {item.evidence?.length || 0} etapas</button></td></tr>)}</tbody></table>{!resultBusy && !page.items.length && <p className="fl-empty-row">Este nodo no recibió lecturas en la ejecución.</p>}</div>
+        {resultError ? <div className="fl-notice fl-error" role="alert">
+          <span>{resultError}</span><button onClick={() => loadPage(activeRunId, resultNode, page.offset)}>Reintentar</button>
+        </div> : <div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Fecha y hora UTC</th><th>Resultado</th><th>Etiqueta y detección</th><th>Evidencia</th></tr></thead><tbody>{page.items.map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{item.timestamp}</td><td>{DECISIONS[item.final_decision] || SIGNAL_LABELS[item.signal] || "No evaluable"}</td><td>{item.evaluation ? `${item.evaluation.expected} · ${EVALUATION_LABELS[item.evaluation.outcome]}${item.evaluation.type_identified ? " · Tipo identificado" : ""}` : "—"}</td><td><button onClick={() => setSelectedResult(item)}>Ver {item.evidence?.length || 0} etapas</button></td></tr>)}</tbody></table>{!resultBusy && !page.items.length && <p className="fl-empty-row">Este nodo no recibió lecturas en la ejecución.</p>}</div>}
         {selectedResult && <div className="fl-evidence"><h4>Recorrido de {selectedResult.entity_id}</h4>
           {selectedResult.logical_evaluation && <p>Resultado lógico del flujo: {SIGNAL_LABELS[selectedResult.logical_evaluation.signal]}</p>}
           {selectedResult.own_evaluation && <p>Evaluación propia: {selectedResult.own_evaluation.label} · Combinada: {selectedResult.combined_evaluation?.label}{selectedResult.combined_evaluation?.conflict ? " · Conflicto entre evidencias" : ""}</p>}
           <p className="fl-muted">{selectedResult.timestamp}</p>{(selectedResult.evidence || []).map((entry, index) => <details key={`${entry.node_id}-${index}`}><summary>{labelNode(activeRun.snapshot.flow.nodes.find((item) => item.id === entry.node_id))} · {SIGNAL_LABELS[entry.signal]} · {entry.status === "omitted" ? "Filtro omitido" : entry.status}</summary><pre>{JSON.stringify({ propia: entry.own_evaluation, evidencias_utilizadas: entry.used_evidence_ids, datos: entry.data }, null, 2)}</pre></details>)}
         </div>}
-      </>}
+      </FlowRunResults>}
     </section>
   </section>;
 }
@@ -329,6 +347,7 @@ export default function FlowLab(props) { return <ReactFlowProvider><FlowLabConte
 const EVALUATION_LABELS = { detectado: "Detectado", no_detectado: "No detectado", falso_positivo: "Falso positivo", normal_correcto: "Normal correcto", no_evaluable: "No evaluable", sin_etiqueta: "Sin etiqueta" };
 export function FlowLabelReport({ report }) {
   if (!report?.labelled) return <p className="fl-muted">Esta ejecución no tiene etiquetas de referencia para medir detecciones y errores.</p>;
+  if (!report.groups?.length) return <p className="fl-muted">El desglose de etiquetas de esta ejecución no está disponible.</p>;
   return <section aria-label="Detección de datos etiquetados"><h3>Qué identifica este flujo</h3><p>Se cuenta como detección una sospecha, una falla compatible o una anomalía ambiental en la salida final. Identificar el tipo exige que el diagnóstico coincida con tipo_falla; una sospecha sola no identifica el tipo.</p><div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Etiqueta</th><th>Origen</th><th>Tipo esperado</th><th>Detectadas / total</th><th>Evaluadas sin sospecha</th><th>Tipo identificado</th><th>Falsos positivos (lecturas)</th><th>Sin evaluación / sin conclusión</th></tr></thead><tbody>{report.groups.map((row, i) => <tr key={i}><td>{row.entity_id}</td><td>{row.expected}</td><td>{row.synthetic ? "Inyectado" : "No inyectado"}</td><td>{row.fault_type || "—"}</td><td>{["Falla", "anomalia"].includes(row.expected) ? `${row.detected} / ${row.total}` : `— / ${row.total}`}</td><td>{["Falla", "anomalia"].includes(row.expected) ? (row.missed_evaluable ?? Math.max(0, row.missed - row.indeterminate)) : "—"}</td><td>{row.fault_type ? row.type_identified : "—"}</td><td>{row.false_positives}</td><td>{row.indeterminate}</td></tr>)}</tbody></table></div><p className="fl-hint">Los falsos positivos cuentan lecturas, incluidas las repeticiones con alerta suprimida. El detalle estadístico separa las alertas emitidas. Las lecturas sin etiqueta no cuentan como normales. Los casos sin evaluación o sin conclusión se muestran aparte de las lecturas evaluadas sin sospecha. Consulta la Salida final para revisar el motivo.</p></section>;
 }
 export function StatisticalLabelReport({ reports, version }) {

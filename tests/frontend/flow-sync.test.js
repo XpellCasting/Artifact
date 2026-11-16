@@ -43,6 +43,9 @@ test("the workspace follows a remote run and its graph, preserves the local draf
         payload = { models: [] };
       }
       else if (url === "/api/history/home-assistant/config") payload = {};
+      else if (url.endsWith("/metrics")) payload = {
+        support: { labelled: 0, unlabelled: 10 }, diagnosis: null, reason: "La ejecución no tiene lecturas etiquetadas.",
+      };
       else if (url.startsWith("/api/flow-runs/")) payload = { items: [], total: 0, offset: 0, next_offset: null };
       else assert.fail(`Unexpected request: ${url}`);
       return { ok: true, json: async () => structuredClone(payload) };
@@ -72,6 +75,7 @@ test("the workspace follows a remote run and its graph, preserves the local draf
     await React.act(async () => context.mock.timers.tick(1500));
     assert.match(view.container.textContent, /Inspección de una ejecución/);
     assert.equal(view.container.querySelector('select[aria-label="Ejecución guardada"]').value, "finished");
+    assert.equal(view.container.querySelector('[role="tab"][aria-selected="true"]').textContent, "Resumen");
     const back = [...view.container.querySelectorAll("button")].find((item) => item.textContent.includes("Volver al diseño"));
     await view.event(back, "click");
     await React.act(async () => context.mock.timers.tick(1500));
