@@ -132,7 +132,7 @@ def saved_support(summary):
             "by_class": {label: counts[label] for label in CLASSES} if counts is not None else None}
 
 
-def reconstruct_metrics(summary, records):
+def reconstruct_metrics(summary, records, *, measurements=None):
     support = saved_support(summary)
     report = summary.get("evaluation") or {}
     accumulator = FlowMetrics()
@@ -145,6 +145,8 @@ def reconstruct_metrics(summary, records):
         matched += "expected" in evaluation
         invalid_labels += expected not in REFERENCE_LABELS
         accumulator.add(expected, item.get("final_decision"))
+        if measurements is not None:
+            measurements.observe(item, expected, evaluation.get("fault_type"))
 
     output_counts = (support["total"], summary.get("output_count"), (summary.get("node_counts") or {}).get("output"))
     if (not accumulator.total and support["total"] != 0) or any(

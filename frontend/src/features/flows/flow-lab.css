@@ -19,6 +19,15 @@
 .fl-event-option strong { color: var(--fl-text); font-size: 13px; }
 .fl-event-option small { color: var(--fl-muted); font-size: 12px; }
 .fl-future-csv>button, .fl-live-form>button { justify-self: start; }
+.fl-context-file { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.fl-context-file > strong { min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.fl-context-file p { flex-basis: 100%; }
+.flow-lab .fl-context-file .file-action { flex: 0 1 auto; position: relative; }
+.flow-lab .fl-context-file .file-action input { display: block; position: absolute; width: 1px; height: 1px; min-height: 0; padding: 0; opacity: 0; }
+.flow-lab .fl-context-file .file-action:focus-within { outline: 2px solid var(--ha-primary); outline-offset: 3px; }
+.fl-evaluation-progress .fl-context-heading { margin-top: 4px; }
+.fl-evaluation-progress .fl-context-progress > span { background: var(--ha-success); }
+.fl-stop-evaluation { justify-self: start; }
 .fl-live-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 14px; }
 .fl-live-form summary { color: var(--fl-muted); cursor: pointer; font-size: 13px; }
 .fl-live-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--ha-primary); border: 1px solid var(--ha-primary); background: var(--ha-surface); padding: 14px; font-size: 13px; }

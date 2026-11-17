@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app.database.flows import FlowStore
 from app.flow.evaluacion import labelled_report
+from app.flow.measurements import RunMeasurements
 from app.flow.metrics import FlowMetrics, run_timings
 from app.flow.result_spool import FlowResultSpool
 
@@ -94,7 +95,8 @@ class FlowMetricsTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             store = FlowStore(Path(directory) / "flows.sqlite3")
             legacy = store.save_run("flow", {}, summary, {"output": output})
-            current = store.save_run("flow", {}, {**summary, "metrics": expected}, {"output": output})
+            current = store.save_run("flow", {}, {**summary, "metrics": expected,
+                                                  "measurements": RunMeasurements().finalize()}, {"output": output})
             spool = FlowResultSpool("fixture", Path(directory))
             try:
                 for item in output:
@@ -104,6 +106,7 @@ class FlowMetricsTests(unittest.TestCase):
                     result = store.run_metrics(run_id)
                     self.assertEqual(result.pop("run_id"), run_id)
                     self.assertEqual(result.pop("timings")["total"]["ms"], 8)
+                    self.assertIsNone(result.pop("measurements")["latency_ms"]["p95"])
                     self.assertEqual(result, expected)
                 with patch("app.database.flows.iter_run_results", side_effect=AssertionError("unexpected rescan")):
                     for run_id in (current, legacy, archived):
@@ -132,4 +135,5 @@ class FlowMetricsTests(unittest.TestCase):
             self.assertEqual(result["support"]["labelled"], 2)
             self.assertEqual(result["timings"]["total"]["ms"], 12)
             self.assertIsNone(result["diagnosis"])
+            self.assertIsNone(result["measurements"]["fault_delay_seconds"]["detected"])
             self.assertEqual(store.results(run_id)["items"], output)

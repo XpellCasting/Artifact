@@ -1,9 +1,9 @@
 import { useEffect, useRef } from "react";
 import { request } from "../../shared/api.js";
 
-export function useFlowEvaluationPolling({ apiBaseUrl, jobId, discover = false, onUpdate, onComplete, onFailure, onConnectionError, onReady, onRunsChanged }) {
+export function useFlowEvaluationPolling({ apiBaseUrl, jobId, discover = false, onUpdate, onComplete, onCancelled, onFailure, onConnectionError, onReady, onRunsChanged }) {
   const handlers = useRef({});
-  useEffect(() => { handlers.current = { jobId, onUpdate, onComplete, onFailure, onConnectionError, onReady, onRunsChanged }; });
+  useEffect(() => { handlers.current = { jobId, onUpdate, onComplete, onCancelled, onFailure, onConnectionError, onReady, onRunsChanged }; });
   const trackedJobId = discover ? null : jobId;
   useEffect(() => {
     if (!discover && !trackedJobId) return;
@@ -53,12 +53,13 @@ export function useFlowEvaluationPolling({ apiBaseUrl, jobId, discover = false, 
       if (!state) {
         if (runningId || expectedJobId) handlers.current.onFailure("La API ya no conserva esta evaluación. Comprueba si Paranoid se reinició; las ejecuciones terminadas siguen guardadas.");
         runningId = null;
-      } else if (state.status === "failed" || state.status === "completed") {
+      } else if (["failed", "completed", "cancelled"].includes(state.status)) {
         runningId = null;
         const terminalKey = `${state.job_id || trackedJobId}:${state.status}`;
         if (handledTerminal !== terminalKey) {
           handledTerminal = terminalKey;
           if (state.status === "failed") handlers.current.onFailure(state.error);
+          else if (state.status === "cancelled") handlers.current.onCancelled?.(state);
           else handlers.current.onComplete(state);
         }
       } else {

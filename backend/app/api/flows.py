@@ -1,15 +1,21 @@
 from __future__ import annotations
 from copy import deepcopy
+from pathlib import Path
+from threading import Event
+from urllib.parse import unquote
 from uuid import uuid4
 from typing import Any, Literal
 from fastapi import HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 import app.database.evaluacion_etiquetada as labelled_evaluation
+from app.flow.context_replay import ContextReplay
 from app.flow.definitions import default_flow
 from app.flow.definitions import validate_flow
 from app.flow.evaluacion import CausalFlowRunner
 from fastapi import APIRouter
 from app.api.schemas import FlowRunRequest, HomeAssistantLiveRequest
 from app.services.home_assistant_live import HomeAssistantEventSource
+from app.services.historial.cargar_historial import CargadorHistorial
 from app.services.runtime import state, flow_store, flow_evaluation_jobs, home_assistant_bridge
 router = APIRouter()
 
@@ -58,6 +64,16 @@ async def update_flow(flow_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/flows/{flow_id}/runs", tags=["flow-lab"])
 def run_flow(flow_id: str, request: FlowRunRequest) -> dict[str, Any]:
+    return _start_csv_flow(flow_id)
+
+
+@router.post("/flows/{flow_id}/runs/context", tags=["flow-lab"])
+async def run_flow_with_context(flow_id: str, request: Request) -> dict[str, Any]:
+    filename = Path(unquote(request.headers.get("X-Filename", "contexto.csv"))).name or "contexto.csv"
+    return await run_in_threadpool(_start_csv_flow, flow_id, await request.body(), filename)
+
+
+def _start_csv_flow(flow_id, context_csv=None, context_filename=None):
     try:
         flow = flow_store.get(flow_id)
         require_classifier_models(flow)
@@ -76,12 +92,24 @@ def run_flow(flow_id: str, request: FlowRunRequest) -> dict[str, Any]:
                 raise ValueError("No hay etiquetas de referencia disponibles; vuelve a cargar el conjunto etiquetado.")
             filename = state.validation_replay_state.get("filename")
             runner = CausalFlowRunner(deepcopy(state.filtro_estadistico), deepcopy(state.filtro_contextual), state.diagnostic_workbench)
+        context_source = None
+        if context_csv is not None:
+            if not any(node["type"] == "contextual" and node.get("config", {}).get("enabled") is not False
+                       for node in flow["nodes"]):
+                raise ValueError("Activa un filtro contextual en el flujo para usar el CSV de contexto.")
+            if not context_csv.strip():
+                raise ValueError("El CSV de contexto está vacío.")
+            events = CargadorHistorial().cargar_real_csv(context_csv, context_filename).eventos
+            context_source = ContextReplay(events, future, development["timestamp_dt"].max(), context_filename)
+
+        cancel_event = Event()
+
         def evaluate(progress, result_sink):
             summary, results, snapshot = runner.evaluate(flow, development, future, entities, context_map, baseline, truth, progress,
-                                                         result_sink=result_sink)
+                                                         result_sink=result_sink, context_source=context_source, cancel_event=cancel_event)
             snapshot["source"]["filename"] = filename
             return summary, results, snapshot
-        return flow_evaluation_jobs.start(flow_id, evaluate, flow=flow)
+        return flow_evaluation_jobs.start(flow_id, evaluate, flow=flow, context_source=context_source, cancel_event=cancel_event)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
     except Exception as exc:
@@ -133,11 +161,11 @@ def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/flow-evaluations/{job_id}/stop", tags=["flow-evaluation"])
-def stop_live_flow(job_id: str):
+def stop_flow_evaluation(job_id: str):
     try:
         return flow_evaluation_jobs.stop(job_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="La recepción ya no está disponible.") from exc
+        raise HTTPException(status_code=404, detail="La ejecución ya no está disponible.") from exc
 
 @router.get("/flow-runs", tags=["flow-lab"])
 def flow_runs(flow_id: str | None = None, compact: bool = False) -> dict[str, Any]:

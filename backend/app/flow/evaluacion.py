@@ -1,13 +1,14 @@
 """Replay an arbitrary graph against future observations, with separate ground truth."""
 from collections import Counter, defaultdict, deque
 from copy import deepcopy
+from functools import partial
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import tempfile
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from time import perf_counter
 from uuid import uuid4
 
@@ -15,6 +16,8 @@ import pandas as pd
 
 from app.flow.runner import FlowRunner
 from app.flow.metrics import FlowMetrics
+from app.flow.measurements import RunMeasurements
+from app.flow.process_usage import ProcessUsage
 from app.flow.result_spool import FlowResultSpool
 from app.flow.definitions import _time
 from app.flow.definitions import observation_valid
@@ -22,6 +25,15 @@ from app.services.reproduccion import MotorReproduccionValidacion
 from app.modulos.clasificador.disponibilidad import CLASSIFIER_MODEL_REQUIRED
 
 FLOW_PROGRESS_INTERVAL_SECONDS = 0.5
+
+
+class FlowEvaluationCancelled(Exception):
+    pass
+
+
+def check_cancellation(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise FlowEvaluationCancelled()
 
 
 class LegacyFlowResultSpool:
@@ -65,7 +77,7 @@ class LegacyFlowResultSpool:
         self.path.unlink(missing_ok=True)
 
 
-def labelled_report(results, truth, *, truth_index=None, metrics=None):
+def labelled_report(results, truth, *, truth_index=None, metrics=None, measurements=None):
     expected = truth_index if truth_index is not None else {int(row["raw_index"]): row for row in truth}
     groups = {}
     for item in results:
@@ -73,6 +85,9 @@ def labelled_report(results, truth, *, truth_index=None, metrics=None):
         decision = item.get("final_decision")
         if metrics is not None:
             metrics.add(label["tipo"] if label is not None else None, decision)
+        if measurements is not None:
+            measurements.observe(item, label["tipo"] if label is not None else None,
+                                 label.get("fault_type") if label is not None else None)
         if label is None:
             continue
         detected = decision in {"fault_compatible", "suspicion", "environmental"}
@@ -148,7 +163,17 @@ def _merge_report_groups(target, report):
 
 class CausalFlowRunner(FlowRunner):
     def evaluate(self, flow, development, future, entities, context_map, baseline, truth=(), progress=None,
-                 result_sink=None, batch_source=None, source_identity=None):
+                 result_sink=None, batch_source=None, source_identity=None, context_source=None, cancel_event=None):
+        with ProcessUsage() as usage:
+            summary, outputs, snapshot = self._evaluate(
+                flow, development, future, entities, context_map, baseline, truth, progress,
+                result_sink, batch_source, source_identity, context_source, cancel_event)
+        summary["performance"]["resources"] = usage.measurements
+        return summary, outputs, snapshot
+
+    def _evaluate(self, flow, development, future, entities, context_map, baseline, truth, progress,
+                  result_sink, batch_source, source_identity, context_source, cancel_event):
+        check_cancellation(cancel_event)
         total_started = perf_counter()
         compiled = self.compile(flow)
         if (future is None or future.empty) and batch_source is None:
@@ -164,10 +189,12 @@ class CausalFlowRunner(FlowRunner):
         phase_started = perf_counter()
         # Labels stay in reporting; reuse this run's lookup across groups and nodes.
         truth_index = {int(row["raw_index"]): row for row in truth}
-        metrics = FlowMetrics() if truth_index else None
+        metrics = FlowMetrics()
+        measurements = RunMeasurements()
         diagnostic_snapshots = {}
         if hasattr(self.diagnostic, "_run_snapshot"):
             for node in flow["nodes"]:
+                check_cancellation(cancel_event)
                 if node["type"] == "classifier" and node.get("config", {}).get("enabled") is not False:
                     model_id = node.get("config", {}).get("model_id")
                     snapshot_fn = (self.diagnostic._run_snapshot_for_model
@@ -183,6 +210,7 @@ class CausalFlowRunner(FlowRunner):
         # Models may be shared internally, but each node receives an independent runtime.
         prepared = {}
         for node in statistical_nodes:
+            check_cancellation(cancel_event)
             method = "residual_focus_v1"
             if method not in prepared:
                 prepared[method] = baseline if baseline.get("continuous_method") == method else motor.construir_baseline(development, entities, continuous_method=method)
@@ -198,6 +226,7 @@ class CausalFlowRunner(FlowRunner):
         self.baselines = {n["id"]: independent_runtime(prepared["residual_focus_v1"]) for n in statistical_nodes}
         self.statistical_results = {}
         performance["phases_ms"]["baseline_preparation"] = round((perf_counter() - phase_started) * 1000, 3)
+        check_cancellation(cancel_event)
         # Whitelist inputs: labels and expected outcomes never reach any detector.
         columns = [c for c in future.columns if c not in {"es_sintetica", "tipo", "tipo_falla", "fault_type", "label", "evaluation"}]
         ordered = future[columns].sort_values(["timestamp_dt", "entity_id", "_raw_index"], kind="stable").copy()
@@ -243,6 +272,7 @@ class CausalFlowRunner(FlowRunner):
             available = None
         if hasattr(self.diagnostic, "create_run_session"):
             for node in flow["nodes"]:
+                check_cancellation(cancel_event)
                 if (available is not None and node["type"] == "classifier"
                         and node.get("config", {}).get("enabled") is not False):
                     model_id = node.get("config", {}).get("model_id")
@@ -291,9 +321,11 @@ class CausalFlowRunner(FlowRunner):
         graph_execution_ms = 0.0
         started = perf_counter()
         last_progress_at = None
+        check_cancelled = partial(check_cancellation, cancel_event) if cancel_event is not None else None
         # Equal timestamps are simultaneous; no node can see a later timestamp.
         try:
             for _, batch in (ordered.groupby("timestamp_dt", sort=True) if batch_source is None else batch_source):
+                check_cancellation(cancel_event)
                 if batch.empty:
                     continue
                 sample_start = sample_start if sample_start is not None else batch["timestamp_dt"].min()
@@ -313,28 +345,41 @@ class CausalFlowRunner(FlowRunner):
                 if prepared_context is not None:
                     context_started = perf_counter()
                     advance = getattr(prepared_context, "advance_normalized", prepared_context.advance)
+                    context_batch = batch
+                    if context_source is not None:
+                        received = context_source.take_through(sample_end)
+                        if not received.empty:
+                            context_batch = pd.concat([received, batch], ignore_index=True)
                     advance(
-                        batch,
-                        batch["timestamp_dt"].max() - pd.Timedelta(seconds=horizon),
+                        context_batch,
+                        sample_end - pd.Timedelta(seconds=horizon),
                     )
                     contextual_index_update_ms += (perf_counter() - context_started) * 1000
                 history_maintenance_ms += (perf_counter() - batch_started) * 1000
                 statistical_started = perf_counter()
                 for node in flow["nodes"]:
                     if node["id"] in self.baselines:
+                        check_cancellation(cancel_event)
                         method = "residual_focus_v1"
                         self.statistical_results[node["id"]] = motor.analizar_lote(batch, self.baselines[node["id"]], node.get("config", {}).get("suspicion_threshold", .6), continuous_method=method)
                 statistical_preparation_ms += (perf_counter() - statistical_started) * 1000
                 graph_started = perf_counter()
                 run_events = available if available is not None else batch
-                summary, batch_outputs, _ = self.run(flow, run_events, entities, context_map, candidate_events=batch, source_id=source_id, compiled=compiled, events_sorted=True, include_snapshot=False)
-                graph_execution_ms += (perf_counter() - graph_started) * 1000
+                summary, batch_outputs, _ = self.run(
+                    flow, run_events, entities, context_map, candidate_events=batch, source_id=source_id,
+                    compiled=compiled, events_sorted=True, include_snapshot=False, check_cancelled=check_cancelled)
+                check_cancellation(cancel_event)
+                output_ready = perf_counter()
+                graph_execution_ms += (output_ready - graph_started) * 1000
+                latency_ms = round((output_ready - batch_started) * 1000, 6)
+                for item in batch_outputs.get("output", []):
+                    item["latency_ms"] = latency_ms
                 if result_sink is None:
                     for node_id, items in batch_outputs.items():
                         outputs[node_id].extend(items)
                 else:
                     block_report = labelled_report(batch_outputs.get("output", []), truth, truth_index=truth_index,
-                                                   metrics=metrics)
+                                                   metrics=metrics, measurements=measurements)
                     _merge_report_groups(streamed_report_groups, block_report)
                     for node_id in streamed_statistical_groups:
                         block_stats = statistical_labelled_report(batch_outputs.get(node_id, []), truth, node_id, truth_index=truth_index)
@@ -348,6 +393,8 @@ class CausalFlowRunner(FlowRunner):
                         classifier_inputs[node["id"]] += summary["node_counts"].get(node["id"], 0)
                 processed += len(batch)
                 groups_completed += 1
+                if context_source is not None:
+                    context_source.complete_group()
                 completed_at = perf_counter()
                 while processed >= next_checkpoint:
                     checkpoints.append({
@@ -379,11 +426,14 @@ class CausalFlowRunner(FlowRunner):
             if progress and groups_completed == 0:
                 progress(0, expected_total, "evaluation", "Reproduciendo grupos temporales")
         finally:
-            for session in self.diagnostic_sessions.values():
-                session.flush()
+            if cancel_event is None or not cancel_event.is_set():
+                for session in self.diagnostic_sessions.values():
+                    session.flush()
+        check_cancellation(cancel_event)
         report_started = perf_counter()
         if result_sink is None:
-            report = labelled_report(outputs["output"], truth, truth_index=truth_index, metrics=metrics)
+            report = labelled_report(outputs["output"], truth, truth_index=truth_index, metrics=metrics,
+                                     measurements=measurements)
             statistical_evaluation = {node_id: statistical_labelled_report(outputs.get(node_id, []), truth, node_id, truth_index=truth_index) for node_id in self.baselines}
             result_count = len(outputs["output"])
             node_counts = {key: len(value) for key, value in outputs.items()}
@@ -400,7 +450,8 @@ class CausalFlowRunner(FlowRunner):
             result_count = streamed_node_counts.get("output", 0)
             node_counts = dict(streamed_node_counts)
             final_decisions = dict(streamed_decisions)
-        finalized_metrics = metrics.finalize() if metrics is not None else None
+        finalized_metrics = metrics.finalize()
+        finalized_measurements = measurements.finalize(finalized_metrics["reason"])
         report_finalization_ms = (perf_counter() - report_started) * 1000
         performance["phases_ms"]["causal_evaluation"] = round((perf_counter() - started) * 1000, 3)
         node_types = {node["id"]: node["type"] for node in flow["nodes"]}
@@ -436,14 +487,18 @@ class CausalFlowRunner(FlowRunner):
             "classifier_execution": "graph_execution; includes diagnostic inference and writes",
         }
         summary = {"candidate_count": processed, "output_count": result_count, "node_counts": node_counts, "node_timings_ms": dict(timings), "elapsed_ms": round((perf_counter() - started) * 1000, 2), "by_final_decision": final_decisions, "evaluation": report, "statistical_evaluation": statistical_evaluation, "statistical_evaluation_version": "pre_suppression_v1", "performance": performance}
-        if finalized_metrics is not None:
-            summary["metrics"] = finalized_metrics
+        summary["metrics"] = finalized_metrics
+        summary["measurements"] = finalized_measurements
         provenance = deepcopy(baseline.get("provenance"))
         continuous_models = {node_id: deepcopy(value.get("continuous_model_manifest")) for node_id, value in self.baselines.items()}
         identity_payload = {"base": (provenance or {}).get("baseline_id"), "continuous_methods": {node_id: value.get("continuous_method") for node_id, value in self.baselines.items()}, "continuous_models": continuous_models}
         run_baseline_id = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
         performance["counts"]["diagnostic_sessions"] = {node_id: session.stats for node_id, session in self.diagnostic_sessions.items()}
         snapshot = {"flow": deepcopy(flow), "execution_mode": "causal_live" if batch_source is not None else "causal_future", "statistical_evaluation_version": "pre_suppression_v1", "source": {"rows": processed, "fingerprint": source_id, "sample_start": _time(sample_start) if sample_start is not None else None, "sample_end": _time(sample_end) if sample_end is not None else None}, "development_end": _time(development["timestamp_dt"].max()), "context_map_version": context_map.get("map_version"), "baseline_version": baseline.get("version"), "baseline_id": run_baseline_id, "baseline_provenance": {**(provenance or {}), "continuous_models": continuous_models}, "diagnostic_snapshots": diagnostic_snapshots}
+        if context_source is not None:
+            reception = context_source.status(advance=False)
+            snapshot["source"]["context_replay"] = reception
+            performance["counts"]["context_rows"] = reception["applied"]
         return summary, dict(outputs) if outputs is not None else None, snapshot
 
     def _statistical(self, node_id, incoming, events, entities, config):
@@ -505,17 +560,24 @@ class FlowEvaluationJobs:
         self.store = store
         self.jobs = {}
         self.sources = {}
+        self.context_sources = {}
+        self.cancel_events = {}
         self.lock = Lock()
 
-    def start(self, flow_id, evaluate, live_source=None, flow=None):
+    def start(self, flow_id, evaluate, live_source=None, flow=None, context_source=None, cancel_event=None):
         with self.lock:
             if any(job["status"] == "running" for job in self.jobs.values()):
                 raise ValueError("Ya hay una evaluación de flujos en curso. Espera a que termine.")
             job_id = uuid4().hex
-            self.store.begin_alert_execution(job_id)
+            previous_alert_execution = self.store.begin_alert_execution(job_id)
             self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "flow": deepcopy(flow), "status": "running", "processed": 0, "total": 0, "phase": "preparation", "mode": "home_assistant" if live_source is not None else "csv"}
             if live_source is not None:
                 self.sources[job_id] = live_source
+            else:
+                cancel_event = cancel_event if cancel_event is not None else Event()
+                self.cancel_events[job_id] = cancel_event
+            if context_source is not None:
+                self.context_sources[job_id] = context_source
         recent_completions = deque()
         last_completed = {"processed": 0, "at": None, "wall": None}
         job_started = perf_counter()
@@ -536,6 +598,7 @@ class FlowEvaluationJobs:
             if last_completed["at"] is None or now - last_completed["at"] > 30.0:
                 rate = None
             with self.lock:
+                check_cancellation(cancel_event)
                 self.jobs[job_id].update(processed=processed, total=total, phase=phase, detail=detail,
                                          updated_at=wall_now,
                                          elapsed_seconds=round(now - job_started, 1),
@@ -547,7 +610,9 @@ class FlowEvaluationJobs:
         spool_directory = Path(store_path).with_suffix(".results") / ".pending" if isinstance(store_path, (str, Path)) else None
         spool = FlowResultSpool(job_id, directory=spool_directory)
         def sink(results):
+            check_cancellation(cancel_event)
             spool.write_block(results)
+            check_cancellation(cancel_event)
             self.store.record_alerts(job_id, flow_id, results.get("output", []))
             if live_source is not None:
                 with self.lock:
@@ -555,6 +620,7 @@ class FlowEvaluationJobs:
                     job["recent_results"] = (job.get("recent_results", []) + results.get("output", []))[-100:]
         def work():
             try:
+                check_cancellation(cancel_event)
                 summary, _, snapshot = evaluate(progress, sink)
                 progress(summary.get("candidate_count", 0), summary.get("candidate_count", 0),
                          "saving", "Guardando resultados por nodo")
@@ -564,15 +630,24 @@ class FlowEvaluationJobs:
                     summary.get("candidate_count", 0), summary.get("candidate_count", 0), "saving", detail,
                     saving_stage=stage, saving_records=spool.stats["records"], saving_bytes=spool.stats["archive_bytes"])
                 run_id, persistence_ms = self.store.save_run_stream(flow_id, snapshot, summary, records, execution_id=job_id)
-                with self.lock:
-                    self.jobs[job_id].update(status="completed", persistence_ms=persistence_ms,
-                                             warning=snapshot.get("source", {}).get("connection_error"),
-                                             run={"run_id": run_id, "summary": summary, "snapshot": snapshot})
+                outcome = {"status": "completed", "persistence_ms": persistence_ms,
+                           "warning": snapshot.get("source", {}).get("connection_error"),
+                           "run": {"run_id": run_id, "summary": summary, "snapshot": snapshot}}
+            except FlowEvaluationCancelled:
+                try:
+                    self.store.discard_alert_execution(job_id, previous_alert_execution)
+                    outcome = {"status": "cancelled", "phase": "cancelled", "detail": "Evaluación detenida"}
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("Falló la limpieza de alertas del flujo %s", flow_id)
+                    outcome = {"status": "failed", "error": str(exc)}
             except Exception as exc:
                 logging.getLogger(__name__).exception("Falló la evaluación del flujo %s", flow_id)
-                with self.lock:
-                    self.jobs[job_id].update(status="failed", error=str(exc))
+                outcome = {"status": "failed", "error": str(exc)}
             finally:
+                if context_source is not None:
+                    with self.lock:
+                        self.jobs[job_id]["context_replay"] = context_source.status(advance=False)
+                        self.context_sources.pop(job_id, None)
                 if live_source is not None:
                     live_source.stop()
                     with self.lock:
@@ -581,9 +656,18 @@ class FlowEvaluationJobs:
                             connection["status"] = "stopped"
                         self.jobs[job_id]["connection"] = connection
                         self.sources.pop(job_id, None)
-                spool.cleanup()
+                try:
+                    spool.cleanup()
+                except OSError:
+                    logging.getLogger(__name__).exception("No se pudo limpiar el archivo temporal del flujo %s", flow_id)
+                with self.lock:
+                    self.cancel_events.pop(job_id, None)
+                    self.jobs[job_id].update(outcome)
+        response = {"job_id": job_id, "status": "running"}
+        if context_source is not None:
+            response["context_replay"] = context_source.status(advance=False)
         Thread(target=work, daemon=True).start()
-        return {"job_id": job_id, "status": "running"}
+        return response
 
     def get(self, job_id, *, compact=False):
         with self.lock:
@@ -606,15 +690,20 @@ class FlowEvaluationJobs:
         source = self.sources.get(job_id)
         if source is not None:
             payload["connection"] = source.status()
+        context_source = self.context_sources.get(job_id)
+        if context_source is not None:
+            payload["context_replay"] = context_source.status(
+                advance=job["status"] == "running" and job["phase"] != "stopping")
         return payload
 
     def stop(self, job_id):
         with self.lock:
-            source = self.sources.get(job_id)
-            if source is None:
-                if job_id not in self.jobs:
-                    raise KeyError(job_id)
-            else:
-                self.jobs[job_id]["phase"] = "stopping"
-                source.stop()
-        return self.get(job_id)
+            job = self.jobs[job_id]
+            if job["status"] == "running" and job["phase"] not in {"saving", "stopping"}:
+                if job_id in self.sources:
+                    job["phase"] = "stopping"
+                    self.sources[job_id].stop()
+                elif job_id in self.cancel_events:
+                    self.cancel_events[job_id].set()
+                    job.update(phase="stopping", detail="Deteniendo la evaluación en curso…")
+            return self._snapshot(job_id)

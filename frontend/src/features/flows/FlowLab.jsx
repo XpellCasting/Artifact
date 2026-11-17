@@ -1,7 +1,7 @@
 import { request } from "../../shared/api.js";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ReactFlow, BaseEdge, Background, Controls, Handle, MarkerType, Position, ReactFlowProvider, useNodesState, useReactFlow } from "@xyflow/react";
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, Copy, GitBranch, Maximize2, Play, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, Copy, GitBranch, Maximize2, Play, Plus, RotateCcw, Save, Square, Trash2 } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, defaultNodeConfig, edgeLabel, fingerprint, flowPayload, labelNode, nextNodeId, removeNode, templates, validateDraft } from "./flow-lab-model.js";
 import "./flow-lab.css";
@@ -44,13 +44,15 @@ const EDGE_TYPES = { routed: RoutedEdge };
 function Signals({ value, onChange, legend = "Señales que pasan por esta conexión" }) {
   return <fieldset className="fl-signals"><legend>{legend}</legend>{SIGNALS.map((signal) => <label key={signal}><input type="checkbox" checked={value.includes(signal)} onChange={(event) => onChange(event.target.checked ? [...value, signal] : value.filter((item) => item !== signal))} />{SIGNAL_LABELS[signal]}</label>)}</fieldset>;
 }
-function FlowEvaluationProgress({ job, fallbackTotal }) {
+export function FlowEvaluationProgress({ job, fallbackTotal, stopPending, onStop }) {
   const processed = Math.max(0, Number(job?.processed) || 0);
   const total = Math.max(0, Number(job?.total) || Number(fallbackTotal) || 0);
-  const progress = total ? Math.min(100, processed / total * 100) : 0;
+  const context = job?.context_replay;
+  const progress = context?.evaluation_percent ?? (total ? Math.min(100, processed / total * 100) : 0);
   const count = (value) => Number(value).toLocaleString();
   const phase = job?.phase || "evaluation";
-  const title = phase === "preparation" ? "Preparando evaluación" : phase === "saving" ? "Guardando ejecución" : "Evaluando flujo";
+  const stopping = stopPending || phase === "stopping";
+  const title = stopping ? "Deteniendo evaluación" : phase === "preparation" ? "Preparando evaluación" : phase === "saving" ? "Guardando ejecución" : "Evaluando flujo";
   const detail = job?.detail || (phase === "preparation" ? "Calibrando modelos y preparando estados causales…" : phase === "saving" ? "Persistiendo resultados…" : null);
   const groupStarted = job?.group_started_at ? Date.parse(job.group_started_at) : NaN;
   const groupSeconds = Number.isFinite(groupStarted) ? Math.max(0, Math.floor((Date.now() - groupStarted) / 1000)) : null;
@@ -64,6 +66,18 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
     <div className="progress-track" role="progressbar" aria-label="Progreso de evaluación del flujo" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(progress)} aria-valuetext={`${count(processed)} de ${total ? count(total) : "total por determinar"} lecturas procesadas`}>
       <span style={{ width: `${progress}%` }} />
     </div>
+    {context && <>
+      <div className="history-load-heading fl-context-heading"><span>Recepción del CSV de contexto</span><strong>{Math.round(context.reception_percent)}%</strong></div>
+      <div className="progress-track fl-context-progress" role="progressbar" aria-label="Recepción del CSV de contexto" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(context.reception_percent)} aria-valuetext={`${count(context.received)} de ${count(context.total)} eventos de contexto recibidos`}>
+        <span style={{ width: `${context.reception_percent}%` }} />
+      </div>
+      <div className="history-load-meta">
+        <span>{count(context.received)} de {count(context.total)} eventos de contexto recibidos</span>
+        <span>{count(context.buffered)} en espera</span>
+        {context.received_through && <span>Recepción hasta {new Date(context.received_through).toLocaleString()}</span>}
+        {context.evaluated_through && <span>Evaluación hasta {new Date(context.evaluated_through).toLocaleString()}</span>}
+      </div>
+    </>}
     <p>{detail || (total ? `Procesadas ${count(processed)} de ${count(total)} lecturas del conjunto de evaluación.` : `Preparando las lecturas que se evaluarán…`)}</p>
     <div className="history-load-meta"><span>Lecturas procesadas: {phase === "evaluation" ? count(processed) : "—"}</span><span>Total: {phase === "evaluation" && total ? count(total) : "—"}</span></div>
     {phase === "evaluation" && job?.current_timestamp && <div className="history-load-meta">
@@ -71,6 +85,9 @@ function FlowEvaluationProgress({ job, fallbackTotal }) {
       <span>{groupSeconds === null ? `Último grupo: ${Number(job.last_batch_ms || 0).toLocaleString()} ms` : `Procesando hace ${groupSeconds} s`}</span>
       <span>{rateDetail}</span>
     </div>}
+    {job?.status === "running" && <button className="fl-stop-evaluation" type="button" onClick={onStop} disabled={stopping || phase === "saving"}>
+      <Square size={16} />{stopping ? "Deteniendo…" : "Detener evaluación"}
+    </button>}
   </section>;
 }
 
@@ -90,6 +107,8 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const [pending, setPending] = useState(false);
   const [synchronized, setSynchronized] = useState(false);
   const [job, setJob] = useState(null);
+  const [stopPending, setStopPending] = useState(false);
+  const [contextFile, setContextFile] = useState(null);
   const executing = job?.status === "running";
   const busy = pending || !synchronized || executing;
   const [loaded, setLoaded] = useState(false);
@@ -162,10 +181,12 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     onRunsChanged: () => refresh().catch((reason) => setError(reason.message)),
     onUpdate: (state) => {
       if (job?.job_id !== state.job_id) { setSelection(null); setMessage(""); setError(""); setLayoutRevision((value) => value + 1); }
-      setJob(state); setInspecting(false);
+      setJob((current) => current?.job_id === state.job_id && current.phase === "stopping" && !["stopping", "saving"].includes(state.phase) ? current : state);
+      setInspecting(false);
     },
     onConnectionError: (detail) => { if (!job) setSyncError(detail); setJob((current) => current ? { ...current, polling_error: detail } : current); },
     onFailure: (detail) => { setError(detail); setJob(null); },
+    onCancelled: () => { setJob(null); setMessage("Evaluación detenida. Se descartaron los resultados parciales."); },
     onComplete: (state) => {
       setJob(null);
       openRun(state.run);
@@ -239,7 +260,10 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     try {
       const saved = await prepareExecution();
       if (!saved) return;
-      const started = await request(apiBaseUrl, `/flows/${saved.flow_id}/runs`, { method: "POST", body: "{}" });
+      const path = `/flows/${saved.flow_id}/runs`;
+      const started = contextFile
+        ? await request(apiBaseUrl, `${path}/context`, { method: "POST", headers: { "Content-Type": "text/csv", "X-Filename": encodeURIComponent(contextFile.name) }, body: contextFile })
+        : await request(apiBaseUrl, path, { method: "POST", body: "{}" });
       setJob({ ...started, mode: "csv", flow: saved });
     } catch (reason) { setError(reason.message); }
     finally { setPending(false); }
@@ -255,10 +279,16 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     } catch (reason) { setError(reason.message); return false; }
     finally { setPending(false); }
   }
-  async function stopLive() {
+  async function stopEvaluation() {
+    const jobId = job.job_id;
+    setStopPending(true);
     setError("");
-    try { setJob(await request(apiBaseUrl, `/flow-evaluations/${job.job_id}/stop`, { method: "POST" })); }
+    try {
+      const state = await request(apiBaseUrl, `/flow-evaluations/${jobId}/stop`, { method: "POST" });
+      if (state.status === "running") setJob((current) => current?.job_id === jobId && current.phase !== "saving" ? state : current);
+    }
     catch (reason) { setError(reason.message); }
+    finally { setStopPending(false); }
   }
   const loadPage = useCallback(async (runId, nodeId, offset) => {
     const revision = ++pageRequest.current;
@@ -310,10 +340,10 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     </aside></div>
     {!inspecting && <>{!!errors.length && <div className="fl-validation" role="status"><strong>Completa el diseño para ejecutar</strong><ul>{errors.map((text) => <li key={text}>{text}</li>)}</ul></div>}
       <section className="fl-execution"><div><span className="hs-step">Evaluación</span>
-        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} error={visibleError} replay={replay} upload={upload} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopLive} />
+        <FutureEventsSource apiBaseUrl={apiBaseUrl} busy={busy} canRun={loaded && historyReady && !uploadBusy && !errors.length} canUpload={historyReady && !uploadBusy} dirty={dirty || !draft.flow_id} job={job} error={visibleError} replay={replay} upload={upload} contextFile={contextFile} onContextFile={setContextFile} onLabelledUpload={onLabelledUpload} onEvaluate={execute} onStartLive={startLive} onStopLive={stopEvaluation} stopPending={stopPending} />
         {!historyReady && <p className="fl-required">Carga un historial desde el Selector de Historial y espera a que se prepare el detector.</p>}
         <CalibrationReport models={continuousModels} />
-        {job && job.mode !== "home_assistant" && <>{job.polling_error && <p className="fl-required" role="status">No se pudo consultar el progreso. Se reintentará automáticamente. {job.polling_error}</p>}<FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} /></>}
+        {job && job.mode !== "home_assistant" && <>{job.polling_error && <p className="fl-required" role="status">No se pudo consultar el progreso. Se reintentará automáticamente. {job.polling_error}</p>}<FlowEvaluationProgress job={job} fallbackTotal={replay?.rows} stopPending={stopPending} onStop={stopEvaluation} /></>}
       </div></section>
     </>}
     <section className="fl-comparison" aria-label="Comparación de conjuntos etiquetados"><h3>Conjuntos etiquetados evaluados</h3><div className="fl-table-scroll"><table><thead><tr><th>Conjunto · huella</th><th>Flujo · fecha</th><th>Fallas detectadas / total</th><th>Anomalías detectadas / total</th><th>Tipos identificados / etiquetados</th><th>Falsos positivos</th><th>Detalle</th></tr></thead><tbody>{runs.filter(r => r.summary.evaluation?.labelled).map(run => {
@@ -333,7 +363,17 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
         <div className="fl-result-controls"><label>Resultados del nodo<select aria-label="Nodo de resultados" value={resultNode} onChange={(event) => setResultNode(event.target.value)}><option value="output">Salida final</option>{activeRun.snapshot.flow.nodes.filter((item) => item.id !== "output").map((item) => <option key={item.id} value={item.id}>{labelNode(item)}</option>)}</select></label><span className="fl-muted">{resultBusy ? "Cargando resultados…" : `${page.total ? page.offset + 1 : 0}–${page.offset + page.items.length} de ${page.total}`}</span><button disabled={resultBusy || page.offset === 0} onClick={() => loadPage(activeRun.run_id, resultNode, Math.max(0, page.offset - PAGE_SIZE))}><ArrowLeft size={15} />Anterior</button><button disabled={resultBusy || page.next_offset === null} onClick={() => loadPage(activeRun.run_id, resultNode, page.next_offset)}>Siguiente<ArrowRight size={15} /></button></div>
         {resultError ? <div className="fl-notice fl-error" role="alert">
           <span>{resultError}</span><button onClick={() => loadPage(activeRunId, resultNode, page.offset)}>Reintentar</button>
-        </div> : <div className="fl-table-scroll"><table><thead><tr><th>Entidad</th><th>Fecha y hora UTC</th><th>Resultado</th><th>Etiqueta y detección</th><th>Evidencia</th></tr></thead><tbody>{page.items.map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{item.timestamp}</td><td>{DECISIONS[item.final_decision] || SIGNAL_LABELS[item.signal] || "No evaluable"}</td><td>{item.evaluation ? `${item.evaluation.expected} · ${EVALUATION_LABELS[item.evaluation.outcome]}${item.evaluation.type_identified ? " · Tipo identificado" : ""}` : "—"}</td><td><button onClick={() => setSelectedResult(item)}>Ver {item.evidence?.length || 0} etapas</button></td></tr>)}</tbody></table>{!resultBusy && !page.items.length && <p className="fl-empty-row">Este nodo no recibió lecturas en la ejecución.</p>}</div>}
+        </div> : <div className="fl-table-scroll">
+          <table><thead><tr><th>Entidad</th><th>Fecha y hora UTC</th><th>Resultado</th><th>Etiqueta y detección</th>
+            {resultNode === "output" && <th>Latencia</th>}<th>Evidencia</th>
+          </tr></thead><tbody>{page.items.map((item) => <tr key={item.observation_id}>
+            <td>{item.entity_id}</td><td>{item.timestamp}</td><td>{DECISIONS[item.final_decision] || SIGNAL_LABELS[item.signal] || "No evaluable"}</td>
+            <td>{item.evaluation ? `${item.evaluation.expected} · ${EVALUATION_LABELS[item.evaluation.outcome]}${item.evaluation.type_identified ? " · Tipo identificado" : ""}` : "—"}</td>
+            {resultNode === "output" && <td>{item.latency_ms == null ? "—" : `${item.latency_ms.toLocaleString(undefined, { maximumFractionDigits: 3 })} ms`}</td>}
+            <td><button onClick={() => setSelectedResult(item)}>Ver {item.evidence?.length || 0} etapas</button></td>
+          </tr>)}</tbody></table>
+          {!resultBusy && !page.items.length && <p className="fl-empty-row">Este nodo no recibió lecturas en la ejecución.</p>}
+        </div>}
         {selectedResult && <div className="fl-evidence"><h4>Recorrido de {selectedResult.entity_id}</h4>
           {selectedResult.logical_evaluation && <p>Resultado lógico del flujo: {SIGNAL_LABELS[selectedResult.logical_evaluation.signal]}</p>}
           {selectedResult.own_evaluation && <p>Evaluación propia: {selectedResult.own_evaluation.label} · Combinada: {selectedResult.combined_evaluation?.label}{selectedResult.combined_evaluation?.conflict ? " · Conflicto entre evidencias" : ""}</p>}

@@ -70,6 +70,31 @@ class CsvFlowRequirementTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIs(self.runtime.flow_evaluation_jobs.start.call_args.kwargs["live_source"], source.return_value)
 
+    def test_optional_context_csv_reaches_the_evaluator_separately_from_ground_truth(self):
+        reference = pd.Timestamp("2026-01-01T00:00:00Z")
+        future = self.runtime.state.eventos_validacion_ordenados = pd.DataFrame({
+            "entity_id": ["sensor.a"], "timestamp_dt": [reference + pd.Timedelta(minutes=2)],
+        })
+        self.runtime.state.validation_replay_state.update(labelled=True, filename="ground_truth.csv")
+        self.runtime.flow_store.get.return_value["nodes"].append({"id": "contextual", "type": "contextual"})
+        body = b"entity_id,state,last_changed\nsensor.b,on,2026-01-01T00:01:00Z\n"
+        truth = [{"raw_index": 0}]
+        with patch.object(self.api_module.labelled_evaluation, "read_truth", return_value=truth), \
+             patch.object(self.api_module, "CausalFlowRunner") as runner:
+            response = self.client.post("/flows/flow/runs/context", content=body,
+                                        headers={"X-Filename": "eventos%20de%20contexto.csv"})
+            self.assertEqual(response.status_code, 200, response.text)
+            call = self.runtime.flow_evaluation_jobs.start.call_args
+            source = call.kwargs["context_source"]
+            self.assertEqual(source.status()["filename"], "eventos de contexto.csv")
+            self.assertEqual(source.status()["total"], 1)
+            runner.return_value.evaluate.return_value = ({}, {}, {"source": {}})
+            call.args[1](None, None)
+            evaluation = runner.return_value.evaluate.call_args
+            self.assertIs(evaluation.kwargs["context_source"], source)
+            self.assertIs(evaluation.args[6], truth)
+            pd.testing.assert_frame_equal(evaluation.args[2], future)
+
     def test_live_rejects_legacy_fields_before_starting_a_job(self):
         for field, value in (("url", "http://ha.local"), ("token", "secret"), ("connection_mode", "integration")):
             response = self.client.post("/flows/flow/live/start", json={field: value})

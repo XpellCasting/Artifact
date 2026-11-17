@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 import zlib
 from app.flow.definitions import _json, _now, validate_flow
+from app.flow.measurements import MEASUREMENTS_VERSION, RunMeasurements
 from app.flow.metrics import METRICS_VERSION, reconstruct_metrics, run_timings, saved_support, unavailable_metrics
 from app.flow.result_spool import FORMAT, ALERT_DECISIONS, SpoolRecords, ResultArchive, archive_path, archive_for_run, iter_run_results
 
@@ -336,9 +337,21 @@ class FlowStore:
         db.execute("INSERT INTO flow_alert_state VALUES (1,?) ON CONFLICT(id) DO UPDATE SET execution_id=excluded.execution_id",
                    (execution_id,))
 
-    def begin_alert_execution(self, execution_id: str) -> None:
+    def begin_alert_execution(self, execution_id: str) -> str | None:
         with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute("SELECT execution_id FROM flow_alert_state WHERE id=1").fetchone()
             self._activate_alert_execution(db, execution_id)
+            return previous[0] if previous is not None else None
+
+    def discard_alert_execution(self, execution_id: str, previous: str | None) -> None:
+        with self._database() as db:
+            db.execute("DELETE FROM flow_alerts WHERE execution_id=? AND run_id IS NULL", (execution_id,))
+            if previous is None:
+                db.execute("DELETE FROM flow_alert_state WHERE id=1 AND execution_id=?", (execution_id,))
+            else:
+                db.execute("UPDATE flow_alert_state SET execution_id=? WHERE id=1 AND execution_id=?",
+                           (previous, execution_id))
 
     @staticmethod
     def _insert_alerts(db, execution_id, flow_id, items, run_id=None):
@@ -413,13 +426,22 @@ class FlowStore:
                 raise KeyError(run_id)
             summary, snapshot = map(json.loads, row)
             metrics = summary.get("metrics")
+            measurements = summary.get("measurements")
             if not isinstance(metrics, dict) or metrics.get("version") != METRICS_VERSION:
+                metrics = None
+            if not isinstance(measurements, dict) or measurements.get("version") != MEASUREMENTS_VERSION:
+                measurements = None
+            if metrics is None or measurements is None:
                 # Recovered labels update the saved summary and invalidate previous cache entries.
-                key = (run_id, METRICS_VERSION, sha256(row[0].encode()).digest())
-                metrics = self._reconstruct_metrics(db, run_id, summary, key)
-        return {"run_id": run_id, **metrics, "timings": run_timings(summary, snapshot.get("flow") or {})}
+                key = (run_id, METRICS_VERSION, MEASUREMENTS_VERSION, sha256(row[0].encode()).digest())
+                historical, inferred = self._reconstruct_metrics(db, run_id, summary, key)
+                metrics = metrics if metrics is not None else historical
+                measurements = measurements if measurements is not None else inferred
+        return {"run_id": run_id, **metrics, "timings": run_timings(summary, snapshot.get("flow") or {}),
+                "measurements": {**measurements, "resources": (summary.get("performance") or {}).get("resources")}}
 
     def _reconstruct_metrics(self, db, run_id, summary, key):
+        collector = RunMeasurements()
         try:
             archive = archive_for_run(db, self.path, run_id)
             if archive is not None and not archive.is_file():
@@ -428,18 +450,22 @@ class FlowStore:
                 if key in self._metrics_cache:
                     self._metrics_cache.move_to_end(key)
                     return self._metrics_cache[key]
-            metrics = reconstruct_metrics(summary, iter_run_results(db, self.path, run_id, "output"))
+            metrics = reconstruct_metrics(summary, iter_run_results(db, self.path, run_id, "output"),
+                                          measurements=collector)
         except FileNotFoundError:
-            return unavailable_metrics(saved_support(summary), "Falta el archivo de resultados de esta ejecución.")
+            reason = "Falta el archivo de resultados de esta ejecución."
+            return unavailable_metrics(saved_support(summary), reason), RunMeasurements().finalize(reason)
         except (OSError, sqlite3.Error, ValueError, KeyError, IndexError, TypeError, AttributeError, zlib.error):
             logging.getLogger(__name__).warning("No se pudieron leer las métricas de %s", run_id, exc_info=True)
-            return unavailable_metrics(saved_support(summary), "No se pudieron leer todos los resultados guardados de Salida.")
+            reason = "No se pudieron leer todos los resultados guardados de Salida."
+            return unavailable_metrics(saved_support(summary), reason), RunMeasurements().finalize(reason)
+        result = metrics, collector.finalize(metrics["reason"])
         with self._metrics_lock:
-            self._metrics_cache[key] = metrics
+            self._metrics_cache[key] = result
             self._metrics_cache.move_to_end(key)
             if len(self._metrics_cache) > METRICS_CACHE_SIZE:
                 self._metrics_cache.popitem(last=False)
-        return metrics
+        return result
 
     def results(self, run_id: str, node_id: str = "output", offset: int = 0, limit: int = 100) -> dict[str, Any]:
         with self._database() as db:

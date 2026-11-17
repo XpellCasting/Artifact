@@ -2,7 +2,7 @@ import React, { lazy, Suspense, useEffect, useId, useState } from "react";
 import Tab from "@mui/material/Tab";
 import Tabs from "@mui/material/Tabs";
 import { request } from "../../shared/api.js";
-import { DECISIONS, NODE_LABELS } from "./flow-lab-model.js";
+import { DECISIONS, NODE_LABELS, labelNode } from "./flow-lab-model.js";
 
 const TABS = [
   ["summary", "Resumen"], ["diagnosis", "Diagnóstico"], ["matrix", "Matriz de confusión"],
@@ -19,9 +19,11 @@ const FILTERS = ["statistical_focus", "contextual", "classifier"];
 const COUNT = new Intl.NumberFormat();
 const PERCENT = new Intl.NumberFormat(undefined, { style: "percent", maximumFractionDigits: 2 });
 const MILLISECONDS = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
+const BRIER = new Intl.NumberFormat(undefined, { maximumFractionDigits: 6 });
 const count = (value) => value == null ? "—" : COUNT.format(value);
 const percent = (value) => value == null ? "—" : PERCENT.format(value);
 const duration = (value) => value == null ? "—" : `${MILLISECONDS.format(value)} ms`;
+const seconds = (value) => value == null ? "—" : `${MILLISECONDS.format(value)} s`;
 const Bars = lazy(() => import("./FlowMetricBars.jsx"));
 
 function Card({ label, value, detail }) {
@@ -72,8 +74,9 @@ function SummaryPanel({ metrics }) {
   </>;
 }
 
-function DiagnosisPanel({ diagnosis }) {
+function DiagnosisPanel({ diagnosis, brier, labelled, nodes }) {
   const { by_class: scores } = diagnosis;
+  const nodeNames = new Map(nodes.map((node) => [node.id, labelNode(node)]));
   const colors = ["var(--ha-primary)", "var(--ha-success)", "var(--ha-warning)"];
   const series = SCORES.map(([key, label], index) => ({
     label, color: colors[index], valueFormatter: (value) => value == null ? "Sin valor" : percent(value / 100),
@@ -92,6 +95,19 @@ function DiagnosisPanel({ diagnosis }) {
         <td>{count(scores[kind].support)}</td>
       </tr>)}</tbody>
     </table></div>
+    {brier && <section aria-label="Brier multiclase">
+      <h3>Brier multiclase</h3>
+      {brier.reason ? <p className="fl-muted">{brier.reason}</p> : <>
+        <p className="fl-hint">Va de 0 a 2. Cero indica probabilidades perfectas. Se usan las probabilidades de cada clasificador conservadas en Salida.</p>
+        <div className="fl-table-scroll"><table aria-label="Brier por clasificador">
+          <thead><tr><th scope="col">Clasificador</th><th scope="col">Brier</th><th scope="col">Lecturas con probabilidades / etiquetadas</th></tr></thead>
+          <tbody>{Object.entries(brier.by_node).map(([id, score]) => <tr key={id}>
+            <th scope="row">{nodeNames.get(id) ?? id}</th>
+            <td>{BRIER.format(score.value)}</td><td>{count(score.count)} / {count(labelled)}</td>
+          </tr>)}</tbody>
+        </table></div>
+      </>}
+    </section>}
   </>;
 }
 
@@ -125,7 +141,7 @@ function MatrixPanel({ diagnosis, mode, onModeChange }) {
   </>;
 }
 
-function DetectionPanel({ detection }) {
+function DetectionPanel({ detection, measurements, sensor, onSensorChange }) {
   const classes = ["anomalia", "Falla"];
   const groups = detection.by_class;
   const colors = ["var(--ha-primary)", "var(--ha-muted)", "var(--ha-warning)"];
@@ -150,11 +166,59 @@ function DetectionPanel({ detection }) {
         <tr><th scope="row">Lecturas válidas diagnosticadas como falla</th><td className="fl-run-value"><Score {...detection.valid_as_fault} /></td></tr>
       </tbody>
     </table></div>
+    {measurements && <DetectionMeasurements measurements={measurements} sensor={sensor} onSensorChange={onSensorChange} />}
   </>;
 }
 
-function TimingsPanel({ timings }) {
+function DetectionMeasurements({ measurements, sensor, onSensorChange }) {
+  const delay = measurements.fault_delay_seconds;
+  const alerts = measurements.false_alerts_by_sensor_day;
+  const sensors = [...new Set(alerts.days.map((row) => row.sensor))];
+  const selectedSensor = sensors.includes(sensor) ? sensor : sensors[0];
+  const sensorDays = alerts.days.filter((row) => row.sensor === selectedSensor);
+  return <>
+    <section aria-label="Retraso hasta detectar una falla">
+      <h3>Retraso hasta detectar una falla</h3>
+      <p className="fl-hint">Cada secuencia de lecturas de falla del mismo sensor y tipo forma un episodio. El retraso se mide desde la primera lectura de esa secuencia hasta la primera señal de alteración.</p>
+      <dl className="fl-run-cards">
+        <Card label="Episodios detectados" value={delay.episodes == null ? "—" : `${count(delay.detected)} / ${count(delay.episodes)}`}
+          detail={delay.missed == null ? null : `${count(delay.missed)} sin detectar`} />
+        <Card label="Retraso mediano" value={seconds(delay.median)} />
+        <Card label="Retraso P95" value={seconds(delay.p95)} />
+      </dl>
+      {delay.reason && <p className="fl-muted">{delay.reason}</p>}
+    </section>
+    <section aria-label="Falsas alertas por sensor y día">
+      <h3>Falsas alertas por sensor y día</h3>
+      {alerts.reason ? <p className="fl-muted">{alerts.reason}</p> : <>
+        <p className="fl-hint">Cuenta alertas sobre lecturas normales y alertas de falla sobre lecturas ambientales. Cada día UTC con lecturas de esas clases aporta al promedio.</p>
+        <dl className="fl-run-cards">
+          <Card label="Falsas alertas" value={count(alerts.count)} />
+          <Card label="Falsas alertas de falla" value={count(alerts.fault_count)} />
+          <Card label="Promedio por sensor y día" value={MILLISECONDS.format(alerts.mean)}
+            detail={`${count(alerts.days.length)} días observados por sensor en total`} />
+        </dl>
+        <label className="fl-matrix-mode">Sensor
+          <select value={selectedSensor} onChange={(event) => onSensorChange(event.target.value)}>
+            {sensors.map((id) => <option key={id} value={id}>{id}</option>)}
+          </select>
+        </label>
+        <div className="fl-table-scroll"><table aria-label="Falsas alertas diarias del sensor">
+          <thead><tr><th scope="col">Día UTC</th><th scope="col">Falsas alertas</th><th scope="col">De falla</th><th scope="col">Lecturas normales o ambientales</th></tr></thead>
+          <tbody>{sensorDays.map((row) => <tr key={row.day}>
+            <th scope="row">{row.day}</th><td>{count(row.false_alerts)}</td>
+            <td>{count(row.false_fault_alerts)}</td><td>{count(row.valid_readings)}</td>
+          </tr>)}</tbody>
+        </table></div>
+      </>}
+    </section>
+  </>;
+}
+
+function TimingsPanel({ timings, measurements }) {
   const { total, filters } = timings;
+  const latency = measurements?.latency_ms;
+  const resources = measurements?.resources;
   const series = [{
     label: "Tiempo acumulado", color: "var(--ha-primary)", data: FILTERS.map((key) => filters[key].ms),
     valueFormatter: duration,
@@ -175,12 +239,33 @@ function TimingsPanel({ timings }) {
         </td>
       </tr>)}</tbody>
     </table></div>
+    {latency && <section aria-label="Latencia por lectura">
+      <h3>Latencia por lectura</h3>
+      <dl className="fl-run-cards">
+        <Card label="Mediana" value={duration(latency.median)} />
+        <Card label="P95" value={duration(latency.p95)} />
+      </dl>
+      <p className="fl-hint">{latency.reason ||
+        `${count(latency.count)} lecturas medidas desde que empieza a procesarse su grupo hasta que está disponible la decisión de salida. Las lecturas simultáneas comparten el tiempo del grupo.`}</p>
+    </section>}
+    {measurements && <section aria-label="Consumo de CPU y RAM">
+      <h3>CPU y RAM</h3>
+      <dl className="fl-run-cards">
+        <Card label="Tiempo de CPU" value={seconds(resources?.cpu_seconds)} />
+        <Card label="CPU media" value={resources?.cpu_average_percent == null ? "—" : percent(resources.cpu_average_percent / 100)} />
+        <Card label="Pico de RAM (RSS)" value={resources?.peak_rss_bytes == null ? "—" :
+          `${MILLISECONDS.format(resources.peak_rss_bytes / 1048576)} MiB`} />
+      </dl>
+      <p className="fl-hint">{resources
+        ? `Proceso de la API durante la evaluación. El 100 % de CPU equivale a un núcleo lógico. RAM muestreada cada ${resources.rss_interval_ms} ms.`
+        : "La ejecución no registró el consumo de CPU y RAM."}</p>
+    </section>}
   </>;
 }
 
-function MetricsPanel({ tab, metrics, mode, onModeChange }) {
+function MetricsPanel({ tab, metrics, nodes, mode, onModeChange, sensor, onSensorChange }) {
   if (tab === "summary") return <SummaryPanel metrics={metrics} />;
-  if (tab === "timings") return <TimingsPanel timings={metrics.timings} />;
+  if (tab === "timings") return <TimingsPanel timings={metrics.timings} measurements={metrics.measurements} />;
   if (!metrics.diagnosis) return <>
     <p className="fl-muted" role="status">{metrics.reason}</p>
     {tab === "diagnosis" && metrics.support.by_class && <div className="fl-table-scroll">
@@ -192,9 +277,10 @@ function MetricsPanel({ tab, metrics, mode, onModeChange }) {
       </table>
     </div>}
   </>;
-  if (tab === "diagnosis") return <DiagnosisPanel diagnosis={metrics.diagnosis} />;
+  if (tab === "diagnosis") return <DiagnosisPanel diagnosis={metrics.diagnosis} brier={metrics.measurements?.brier}
+    labelled={metrics.support.labelled} nodes={nodes} />;
   if (tab === "matrix") return <MatrixPanel diagnosis={metrics.diagnosis} mode={mode} onModeChange={onModeChange} />;
-  return <DetectionPanel detection={metrics.detection} />;
+  return <DetectionPanel detection={metrics.detection} measurements={metrics.measurements} sensor={sensor} onSensorChange={onSensorChange} />;
 }
 
 export default function FlowRunResults({ apiBaseUrl, run, activeTab, onTabChange, children }) {
@@ -203,6 +289,7 @@ export default function FlowRunResults({ apiBaseUrl, run, activeTab, onTabChange
   const [attempt, setAttempt] = useState(0);
   const [response, setResponse] = useState(null);
   const [mode, setMode] = useState("count");
+  const [sensor, setSensor] = useState("");
   useEffect(() => {
     if (activeTab !== "detail") setRequested(true);
   }, [activeTab]);
@@ -223,6 +310,7 @@ export default function FlowRunResults({ apiBaseUrl, run, activeTab, onTabChange
         <span>{flow.name}</span>
         <time dateTime={run.created_at}>{new Date(run.created_at).toLocaleString()}</time>
         {source?.fingerprint && <span>Huella <code title={source.fingerprint}>{source.fingerprint.slice(0, 16)}</code></span>}
+        {source?.context_replay && <span>Contexto · {source.context_replay.filename} · {source.context_replay.applied.toLocaleString()} eventos</span>}
       </p>
     </header>
     <Tabs className="fl-run-tabs" aria-label="Resultados de la ejecución" value={activeTab} variant="scrollable"
@@ -240,7 +328,8 @@ export default function FlowRunResults({ apiBaseUrl, run, activeTab, onTabChange
             <span>{response.error}</span>
             <button onClick={() => { setResponse(null); setAttempt((value) => value + 1); }}>Reintentar</button>
           </div>
-            : <MetricsPanel tab={key} metrics={response.metrics} mode={mode} onModeChange={setMode} />
+            : <MetricsPanel tab={key} metrics={response.metrics} nodes={flow.nodes ?? []} mode={mode}
+              onModeChange={setMode} sensor={sensor} onSensorChange={setSensor} />
       )}
     </div>)}
   </div>;

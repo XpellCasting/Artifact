@@ -109,6 +109,30 @@ class FlowAlertsTests(unittest.TestCase):
         self.assertEqual(jobs.get(job["job_id"])["status"], "failed")
         self.assertEqual(FlowStore(self.path).alerts()["items"][0]["result"]["final_decision"], "environmental")
 
+    def test_cancelled_csv_discards_partial_results_and_restores_previous_alerts(self):
+        previous = self.store.save_run("old", {}, {}, {"output": [reading("previous", "suspicion")]})
+        old_alerts = self.store.alerts()
+        jobs = FlowEvaluationJobs(self.store)
+
+        def evaluate(progress, sink):
+            sink({"output": [reading("partial", "fault_compatible")]})
+            self.assertEqual(self.store.alerts()["items"][0]["result"]["observation_id"], "partial")
+            self.assertEqual(jobs.stop(job_id)["phase"], "stopping")
+            self.assertEqual(jobs.stop(job_id)["phase"], "stopping")
+            # Cancellation also wins if requested after the last group, before publication.
+            return {"candidate_count": 1}, None, {"flow": {}}
+
+        with patch("app.flow.evaluacion.Thread") as thread:
+            job_id = jobs.start("csv", evaluate)["job_id"]
+            thread.call_args.kwargs["target"]()
+
+        status = jobs.stop(job_id)
+        self.assertEqual(status["status"], "cancelled")
+        self.assertNotIn("run", status)
+        self.assertEqual(self.store.latest_run_id(), previous)
+        self.assertEqual(self.store.alerts(), old_alerts)
+        self.assertFalse(list(self.path.with_suffix(".results").glob(".pending/*.sqlite3")))
+
     def test_existing_saved_runs_are_imported_once(self):
         item = reading("legacy", "environmental")
         with self.store._database() as db:

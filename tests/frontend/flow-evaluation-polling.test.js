@@ -9,7 +9,7 @@ test("independent clients discover remote executions, progress and results and k
   try {
     const { useFlowEvaluationPolling } = await server.ssrLoadModule("/src/features/flows/use-flow-evaluation-polling.js");
     let shared = { job: null, latest_run_id: "persisted-run" };
-    const requests = [], completed = [[], []], changed = [[], []];
+    const requests = [], completed = [[], []], cancelled = [[], []], changed = [[], []];
     globalThis.fetch = async (url, options) => {
       requests.push(url);
       assert.equal(options.cache, "no-store");
@@ -19,6 +19,7 @@ test("independent clients discover remote executions, progress and results and k
       const [state, setState] = React.useState(null);
       useFlowEvaluationPolling({ apiBaseUrl: "/api", discover: true, onUpdate: setState,
         onComplete: (value) => { completed[index].push(value); setState(null); },
+        onCancelled: (value) => { cancelled[index].push(value.job_id); setState(null); },
         onRunsChanged: (id) => changed[index].push(id),
         onConnectionError: assert.fail, onFailure: assert.fail });
       return React.createElement("output", null, state ? `${state.flow.name}: ${state.processed}/${state.total}` : "Idle");
@@ -38,6 +39,13 @@ test("independent clients discover remote executions, progress and results and k
     await React.act(async () => context.mock.timers.tick(1500));
     assert.deepEqual(completed.map((items) => items.map((item) => item.run.run_id)), [["new-run"], ["new-run"]]);
     assert.deepEqual(changed, [["persisted-run", "new-run"], ["persisted-run", "new-run"]]);
+    shared.job = { job_id: "cancelled-csv", status: "running", phase: "stopping", flow: { name: "Stopping" }, processed: 3, total: 10 };
+    await React.act(async () => context.mock.timers.tick(1500));
+    shared.job = { job_id: "cancelled-csv", status: "cancelled" };
+    await React.act(async () => context.mock.timers.tick(1500));
+    await React.act(async () => context.mock.timers.tick(1500));
+    assert.deepEqual(cancelled, [["cancelled-csv"], ["cancelled-csv"]]);
+    assert.deepEqual([...view.container.querySelectorAll("output")].map((item) => item.textContent), ["Idle", "Idle"]);
     shared.job = { job_id: "remote-live", status: "running", mode: "home_assistant", flow: { name: "Live flow" }, processed: 0, total: 0 };
     await React.act(async () => context.mock.timers.tick(1500));
     assert.deepEqual([...view.container.querySelectorAll("output")].map((item) => item.textContent), ["Live flow: 0/0", "Live flow: 0/0"]);

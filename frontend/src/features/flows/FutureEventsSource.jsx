@@ -3,13 +3,13 @@ import { AlertTriangle, FileSpreadsheet, House, Loader2, Play, Radio, Square } f
 import { homeAssistantConnectionLabel, useHomeAssistantConnection } from "../history/use-home-assistant-connection.js";
 import { DECISIONS } from "./flow-lab-model.js";
 
-export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload = canRun, dirty, job, error, replay, upload, onLabelledUpload, onEvaluate, onStartLive, onStopLive }) {
+export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload = canRun, dirty, job, error, replay, upload, contextFile, onContextFile, onLabelledUpload, onEvaluate, onStartLive, onStopLive, stopPending }) {
   const [source, setSource] = useState("csv");
   const [entities, setEntities] = useState("");
   const connection = useHomeAssistantConnection(apiBaseUrl);
   const connected = Boolean(connection?.bridge_connected);
   const live = job?.mode === "home_assistant" && job?.status === "running";
-  const stopping = live && ["stopping", "saving"].includes(job?.phase);
+  const stopping = live && (stopPending || ["stopping", "saving"].includes(job?.phase));
   useEffect(() => { if (live) setSource("home_assistant"); }, [live]);
 
   async function start(event) {
@@ -25,9 +25,21 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
       <label className={`fl-event-option ${source === "home_assistant" ? "is-selected" : ""}`}><input type="radio" name="future-event-source" checked={source === "home_assistant"} onChange={() => setSource("home_assistant")} /><House size={22} /><span><strong>Home Assistant en directo</strong><small>Evalúa los cambios de estado que lleguen.</small></span></label>
     </fieldset>
     {source === "csv" ? <div className="fl-future-csv">
-      <div className="fl-upload-actions"><label className="file-action">Cargar conjunto etiquetado<input type="file" accept=".csv,text/csv" disabled={busy || !canUpload} onChange={onLabelledUpload} /></label></div>
+      <div className="fl-upload-actions"><label className="file-action">Cargar conjunto etiquetado<input type="file" accept=".csv,text/csv" disabled={busy || !canUpload} onChange={(event) => {
+        if (event.target.files?.length) onContextFile?.(null);
+        onLabelledUpload(event);
+      }} /></label></div>
       {replay?.loaded && <p><strong>{replay.filename}</strong> · {replay.rows} eventos · {replay.labelled ? "Con etiquetas" : "Sin etiquetas"}</p>}
       {upload && <p role="status">{upload.message}</p>}
+      {replay?.loaded && replay.labelled && <div className="fl-context-file">
+        <label className="file-action">CSV de contexto (opcional)<input type="file" accept=".csv,text/csv" disabled={busy || !canUpload} onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) onContextFile?.(file);
+          event.target.value = "";
+        }} /></label>
+        {contextFile && <><strong title={contextFile.name}>{contextFile.name}</strong><button type="button" disabled={busy || !canUpload} onClick={() => onContextFile(null)}>Quitar CSV de contexto</button></>}
+        <p className="fl-hint">Lecturas auxiliares para el filtro contextual durante la evaluación.</p>
+      </div>}
       <button className="fl-primary" type="button" disabled={busy || !canRun || !replay?.loaded || !replay?.labelled} onClick={onEvaluate}><Play size={16} />{busy ? "Evaluando…" : dirty ? "Guardar y evaluar CSV" : "Evaluar CSV"}</button>
     </div> : <form className="fl-live-form" onSubmit={start}>
       <p>Recibe los cambios de las entidades del historial de referencia y evalúalos a medida que llegan. La recepción permanece activa aunque no lleguen eventos y reintenta la conexión si se corta. Al detenerla se guarda la ejecución.</p>

@@ -108,10 +108,15 @@ class StreamingFlowTests(unittest.TestCase):
         streamed_summary, no_outputs, streamed_snapshot = self._run(blocks.append)
         self.assertIsNone(no_outputs)
         streamed_output = [item for block in blocks for item in block["output"]]
+        for output in (streamed_output, regular_outputs["output"]):
+            for item in output:
+                self.assertGreaterEqual(item.pop("latency_ms"), 0)
         self.assertEqual(streamed_output, regular_outputs["output"])
         self.assertEqual(streamed_summary["evaluation"], regular_summary["evaluation"])
         self.assertEqual(streamed_summary["metrics"], regular_summary["metrics"])
         self.assertEqual(streamed_summary["metrics"]["support"]["labelled"], 3)
+        self.assertEqual(streamed_summary["measurements"]["latency_ms"]["count"], 3)
+        self.assertGreaterEqual(streamed_summary["performance"]["resources"]["cpu_seconds"], 0)
         self.assertEqual(streamed_summary["node_counts"], regular_summary["node_counts"])
         self.assertEqual(streamed_snapshot["source"], regular_snapshot["source"])
 

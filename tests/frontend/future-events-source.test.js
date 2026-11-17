@@ -95,6 +95,63 @@ test("live reception requires a prepared reference and a valid flow", async () =
   } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
 });
 
+test("the optional context file is offered after loading a labelled dataset", async () => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+  let view;
+  try {
+    const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
+    view = await renderInteractive(Source, { canRun: true, apiBaseUrl: "/api" });
+    assert.equal(view.container.querySelectorAll('input[type="file"]').length, 1);
+    await view.close();
+    let chosen;
+    view = await renderInteractive(Source, { canRun: true, apiBaseUrl: "/api",
+      replay: { loaded: true, labelled: true, filename: "ground_truth.csv", rows: 12 },
+      onContextFile: (file) => { chosen = file; } });
+    const input = view.container.querySelector('.fl-context-file input[type="file"]');
+    const file = { name: "contexto.csv" };
+    Object.defineProperty(input, "files", { value: [file] });
+    await view.event(input, "change");
+    assert.equal(chosen, file);
+    assert.match(view.container.querySelector(".fl-context-file label").textContent, /CSV de contexto/);
+  } finally { if (view) await view.close(); globalThis.fetch = previousFetch; await server.close(); }
+});
+
+test("the context reception bar can get ahead of the evaluation bar", async () => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  let view;
+  try {
+    const { FlowEvaluationProgress } = await server.ssrLoadModule("/src/features/flows/FlowLab.jsx");
+    view = await renderInteractive(FlowEvaluationProgress, { job: { phase: "evaluation", processed: 2, total: 20,
+      context_replay: { evaluation_percent: 25, reception_percent: 65, received: 8, total: 12, buffered: 4 } } });
+    const [evaluation, reception] = view.container.querySelectorAll('[role="progressbar"]');
+    assert.equal(evaluation.getAttribute("aria-valuenow"), "25");
+    assert.equal(reception.getAttribute("aria-valuenow"), "65");
+    assert.match(reception.getAttribute("aria-valuetext"), /8 de 12/);
+    assert.match(view.container.textContent, /4 en espera/);
+  } finally { if (view) await view.close(); await server.close(); }
+});
+
+test("an active CSV evaluation can be stopped from its progress panel", async () => {
+  const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
+  let view;
+  try {
+    const { FlowEvaluationProgress } = await server.ssrLoadModule("/src/features/flows/FlowLab.jsx");
+    let stopped = false;
+    view = await renderInteractive(FlowEvaluationProgress, { job: { status: "running", phase: "evaluation" },
+      onStop: () => { stopped = true; } });
+    const button = view.container.querySelector("button");
+    assert.match(button.textContent, /Detener evaluación/);
+    await view.event(button, "click");
+    assert.equal(stopped, true);
+    await view.close();
+    view = await renderInteractive(FlowEvaluationProgress, { job: { status: "running", phase: "stopping" } });
+    assert.match(view.container.textContent, /Deteniendo evaluación/);
+    assert.equal(view.container.querySelector("button").disabled, true);
+  } finally { if (view) await view.close(); await server.close(); }
+});
+
 test("live events use the integration automatically and wait for it when disconnected", async () => {
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch;

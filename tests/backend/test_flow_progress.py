@@ -1,9 +1,10 @@
 import unittest
+from threading import Event
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from app.flow.evaluacion import CausalFlowRunner, FLOW_PROGRESS_INTERVAL_SECONDS, FlowEvaluationJobs
+from app.flow.evaluacion import CausalFlowRunner, FLOW_PROGRESS_INTERVAL_SECONDS, FlowEvaluationCancelled, FlowEvaluationJobs
 
 
 class _Clock:
@@ -22,7 +23,7 @@ class FlowProgressTests(unittest.TestCase):
             {"id": "output", "type": "output", "position": {}, "config": {}},
         ], "edges": [{"id": "input-output", "source": "input", "target": "output"}]}
 
-    def evaluate(self, durations, clock, progress=None, sink=None, fail_at=None):
+    def evaluate(self, durations, clock, progress=None, sink=None, fail_at=None, cancel_event=None):
         at = pd.Timestamp("2026-06-01T00:00:00Z")
         development = pd.DataFrame([{"entity_id": "binary.a", "timestamp_dt": at - pd.Timedelta(minutes=1),
                                      "state": "off", "sensor_kind": "binary"}])
@@ -49,7 +50,7 @@ class FlowProgressTests(unittest.TestCase):
 
         with patch.object(runner, "run", side_effect=timed_run):
             return runner.evaluate(self.flow(), development, future, pd.DataFrame(), {}, {},
-                                   truth=truth, progress=progress, result_sink=sink)
+                                   truth=truth, progress=progress, result_sink=sink, cancel_event=cancel_event)
 
     @staticmethod
     def capture(clock, updates):
@@ -121,6 +122,7 @@ class FlowProgressTests(unittest.TestCase):
         def save(flow_id, snapshot, summary, records, execution_id=None):
             self.assertIn(execution_id, jobs.jobs)
             saving_states.append(jobs.get(next(iter(jobs.jobs))))
+            self.assertEqual(jobs.stop(execution_id)["phase"], "saving")
             self.assertTrue(list(records))
             return "fixture-run", 1.
 
@@ -145,6 +147,18 @@ class FlowProgressTests(unittest.TestCase):
         self.assertEqual(saving_states[0]["processed"], 16)
         self.assertEqual(saving_states[0]["elapsed_seconds"], final["elapsed_seconds"])
         self.assertEqual([state["phase"] for state in updates], ["preparation", "evaluation", "evaluation"])
+
+    def test_cancellation_stops_before_the_next_group_even_without_a_progress_update(self):
+        clock, cancelled, blocks = _Clock(), Event(), []
+
+        def sink(block):
+            blocks.append(block)
+            cancelled.set()
+
+        with patch("app.flow.evaluacion.perf_counter", side_effect=clock), self.assertRaises(FlowEvaluationCancelled):
+            self.evaluate([.01] * 8, clock, sink=sink, cancel_event=cancelled)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(clock.now, .01)
 
     def test_failure_is_published_inside_update_interval(self):
         clock, store = _Clock(), Mock()

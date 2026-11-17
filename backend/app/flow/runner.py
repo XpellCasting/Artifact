@@ -29,7 +29,7 @@ class FlowRunner(NodeHandlers):
         return {"checked": checked, "nodes": nodes, "edges_from": edges_from, "edges_to": edges_to,
                 "input_id": next(node_id for node_id, node in nodes.items() if node["type"] == "input")}
 
-    def run(self, flow: dict[str, Any], events: pd.DataFrame, entities: pd.DataFrame, context_map: dict[str, Any], candidate_limit: int = 1000, *, candidate_events=None, source_id=None, compiled=None, events_sorted=False, include_snapshot=True) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    def run(self, flow: dict[str, Any], events: pd.DataFrame, entities: pd.DataFrame, context_map: dict[str, Any], candidate_limit: int = 1000, *, candidate_events=None, source_id=None, compiled=None, events_sorted=False, include_snapshot=True, check_cancelled=None) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, Any]]:
         compiled = compiled or self.compile(flow)
         checked = compiled["checked"]
         if events is None or events.empty:
@@ -63,6 +63,8 @@ class FlowRunner(NodeHandlers):
         started = perf_counter()
         node_timings: dict[str, float] = {}
         for node_id in checked["order"]:
+            if check_cancelled is not None:
+                check_cancelled()
             node = nodes[node_id]
             incoming = delivered[node_id]
             node_started = perf_counter()

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import ctypes
 import gc
 import hashlib
 import importlib.metadata
@@ -14,7 +13,6 @@ import shutil
 import sqlite3
 import tempfile
 import sys
-import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +25,7 @@ from app.services.historial.cargar_historial import CargadorHistorial
 from app.services.diagnostico import DiagnosticWorkbench
 from app.flow.evaluacion import CausalFlowRunner
 from app.flow.evaluacion import FlowResultSpool
+from app.flow.process_usage import WorkingSet
 from app.flow.result_spool import archive_for_run, ResultArchive, iter_run_results
 from app.modulos.contextual.contextual import FiltroContextualEspacioTemporal, ConfiguracionContextual
 from app.modulos.estadistico.filtro import FiltroEstadistico
@@ -36,54 +35,6 @@ from app.services.reproduccion import MotorReproduccionValidacion
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_IDENTITY_KEYS = {"run_id", "diagnosis_id", "execution_id"}
-
-
-class _WorkingSet:
-    class _Counters(ctypes.Structure):
-        _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
-                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
-
-    def __init__(self):
-        self.value = 0
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._sample, daemon=True)
-
-    @classmethod
-    def current(cls):
-        if sys.platform != "win32":
-            for line in Path("/proc/self/status").read_text().splitlines():
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) * 1024
-            raise RuntimeError("No se pudo medir RSS en este sistema")
-        counters = cls._Counters()
-        counters.cb = ctypes.sizeof(counters)
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        psapi = ctypes.WinDLL("psapi", use_last_error=True)
-        kernel.GetCurrentProcess.restype = ctypes.c_void_p
-        get_info = psapi.GetProcessMemoryInfo
-        get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(cls._Counters), ctypes.c_ulong]
-        get_info.restype = ctypes.c_int
-        if not get_info(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return int(counters.WorkingSetSize)
-
-    def _sample(self):
-        while not self.stop.is_set():
-            self.value = max(self.value, self.current())
-            self.stop.wait(.1)
-
-    def __enter__(self):
-        self.value = self.current()
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_):
-        self.stop.set()
-        self.thread.join()
-        self.value = max(self.value, self.current())
 
 
 def _read_json(path):
@@ -124,7 +75,8 @@ def _clean(value):
             for execution in executions:
                 item = item.replace(execution, "<execution>")
         return item
-    return normalize(value)
+    # El tiempo por lectura depende de la variante que se está midiendo.
+    return normalize({key: item for key, item in value.items() if key != "latency_ms"})
 
 
 def chronological_prefix(future, limit):
@@ -295,10 +247,10 @@ def run_one(root, flow_id, flow, summary, development, future, entities, context
                       "processed": processed, "total": total, "phase": phase}}), file=sys.stderr, flush=True)
                 last_progress = now
 
-        rss_start = _WorkingSet.current()
+        rss_start = WorkingSet.current()
         started = time.perf_counter()
         try:
-            with _WorkingSet() as memory, patch("app.modulos.clasificador.runtime.ClassifierProxy",
+            with WorkingSet() as memory, patch("app.modulos.clasificador.runtime.ClassifierProxy",
                                                FullSampleProxy if sample_mode == "full" else ClassifierProxy):
                 result, _, snapshot = runner.evaluate(flow, development.eventos, selected.eventos,
                     entities, context_map, baseline, truth=active_truth, progress=progress, result_sink=sink)

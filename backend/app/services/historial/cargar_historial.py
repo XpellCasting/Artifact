@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
@@ -47,6 +48,13 @@ class CargadorHistorial:
             f"Leyendo {ruta.name}",
         )
         frame = pd.read_csv(ruta, dtype=str, keep_default_na=False).fillna("")
+        return self._normalizar_real(frame, ruta, progress_callback)
+
+    def cargar_real_csv(self, contenido: bytes, filename: str) -> ResultadoHistorial:
+        frame = pd.read_csv(BytesIO(contenido), dtype=str, keep_default_na=False).fillna("")
+        return self._normalizar_real(frame, Path(filename))
+
+    def _normalizar_real(self, frame, ruta, progress_callback=None):
         self._reportar_progreso(
             progress_callback,
             "validating_columns",
