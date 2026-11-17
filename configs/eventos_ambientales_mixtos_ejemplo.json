@@ -1,0 +1,20 @@
+{
+  "environmental_episodes": 0,
+  "environmental_events": [
+    {
+      "name": "ocupacion_inusual_demo",
+      "relation_basis": "Ejemplo artificial: temperatura, movimiento y ocupación de una misma habitación ficticia. Se declara ocupación inusual para probar el generador; no confirma anomalías reales.",
+      "episodes": 2,
+      "durations_seconds": [3600, 7200],
+      "intensities": [1.0, 1.5],
+      "responses": [
+        {"entity": "demo.temperature", "kind": "continuous", "delay_seconds": 900,
+         "pattern": [[0, 0], [0.5, 3], [1, 0]]},
+        {"entity": "demo.motion", "kind": "binary", "delay_seconds": 0,
+         "pattern": [[0, "on"], [0.75, "off"], [1, "off"]]},
+        {"entity": "demo.occupancy", "kind": "multistate", "delay_seconds": 300,
+         "pattern": [[0, "low"], [0.25, "high"], [0.75, "low"], [1, "empty"]]}
+      ]
+    }
+  ]
+}

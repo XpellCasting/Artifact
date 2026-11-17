@@ -22,6 +22,7 @@ from app.modulos.clasificador.config import Config, parse_utc
 from app.modulos.clasificador.digests import sha256_file
 from app.modulos.clasificador.features import fit_preprocessor, _finite_number
 from app.modulos.clasificador.interventions import altered_value
+from app.modulos.clasificador.environmental_events import validate_events, generate_events
 from app.modulos.clasificador.model_constants import FAULT_TYPES
 from app.services.csv_etiquetado import read_label
 from app.services.estados_validos import valid_state
@@ -71,6 +72,7 @@ def partition(at, config):
 
 
 def validate_settings(config):
+    validate_events(config.get("environmental_events", []))
     if config.get("version")!=VERSION or config.get("context_seconds")!=259200:
         raise ValueError("Se requiere el contrato de escenarios v1 con contexto de 72 horas")
     parts=("train_fit","dev_tune","test")
@@ -222,6 +224,8 @@ def generate_scenario(db, part, name, config, prep, *, robust=False, candidate_c
     if part == "train_fit":
         earliest = max(earliest,parse_utc(config["calibration_end"]))
     reserved, usage, episodes, overlays, deficits = defaultdict(list), Counter(), [], [], []
+    if config.get("environmental_events"):
+        episodes, overlays, deficits = generate_events(config, prep, grouped, part, name, rng, reserved, earliest, digest)
     quota = config["quotas"][part]["episodes_per_type"]
     durations = config["robustness_durations"] if robust else config["durations"]
     def available(entity,a,b):
