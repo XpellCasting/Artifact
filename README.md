@@ -384,6 +384,23 @@ filtros utilizados. La confianza sigue siendo un índice operativo sin calibrar.
 Home Assistant gestiona `last_changed` cuando cambia el estado; `evaluated_at`
 identifica cada lectura procesada, aunque conserve el mismo porcentaje.
 
+Desde la versión 0.6.0 de la integración y con el backend actualizado,
+`confidence_change_reason` explica el último cambio y `confidence_change_detail`
+guarda las dos lecturas comparadas, la cobertura, el orden real de ejecución
+y los aportes de cada filtro. Las lecturas consecutivas con igual porcentaje
+conservan el motivo anterior. Una sesión nueva empieza su propia comparación.
+El detalle contextual incluye los sensores relacionados y las referencias a la
+evidencia completa. Si la lista supera el espacio reservado para Recorder, se
+indica el número total de vecinos. Los cambios de disponibilidad de un filtro
+aparecen en el motivo.
+
+En **Paranoid-Confianza → Motivos de los cambios**, selecciona la entidad de
+**En directo** o **Test**, el inicio del intervalo en hora local y **Consultar
+una hora**. Abre una fila para ver los aportes y la evidencia de ese cambio.
+El intervalo usa la hora de publicación en Home Assistant. Dentro de cada
+fila figura también la fecha de la lectura original. Los motivos se pueden
+consultar para estados publicados con esta versión que Recorder conserve.
+
 **Paranoid-Confianza** usa tarjetas nativas `entities` y `history-graph`, con las
 últimas 24 horas y el eje fijado entre 0 % y 100 %. Requiere Recorder e History
 activos y que estos sensores estén incluidos en su configuración de grabación.

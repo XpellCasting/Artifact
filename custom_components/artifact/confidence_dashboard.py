@@ -1,4 +1,4 @@
-"""Managed native Lovelace dashboard; no custom chart renderer or user edits."""
+"""Managed Lovelace dashboard for native confidence graphs and their explanations."""
 from homeassistant.components import frontend
 from homeassistant.components.lovelace import const as lovelace_const
 from homeassistant.components.lovelace.dashboard import LovelaceConfig
@@ -43,6 +43,9 @@ class ConfidenceDashboard(LovelaceConfig):
                     {"type": "history-graph", "title": f"Historial de confianza (%) · {title}", "entities": group,
                      "hours_to_show": 24, "min_y_axis": 0, "max_y_axis": 100, "fit_y_data": False},
                 ])
+            if entities:
+                cards.append({"type": "custom:paranoid-confidence-changes", "entities": entities,
+                              "title": f"Motivos de los cambios · {title}"})
         return {"title": "Paranoid-Confianza", "views": [{"title": "Confianza", "path": "confianza", "cards": cards}]}
 
     async def async_json(self, force):

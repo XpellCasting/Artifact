@@ -11,7 +11,8 @@ from .const import CONF_WEB_URL, DOMAIN
 
 PANEL_MODULE_URL = "/artifact-static/alerts-panel.js"
 DASHBOARD_THEME_URL = "/artifact-static/dashboard-theme.js"
-PANEL_ASSET_VERSION = "0.4.2"
+CONFIDENCE_CARD_URL = "/artifact-static/confidence-changes.js"
+PANEL_ASSET_VERSION = "0.6.0"
 
 
 def app_panel_path(entry):
@@ -31,12 +32,15 @@ async def async_setup_panels(hass, entry):
             await hass.http.async_register_static_paths([
                 StaticPathConfig(PANEL_MODULE_URL, str(Path(__file__).parent / "frontend" / "alerts-panel.js"), False),
                 StaticPathConfig(DASHBOARD_THEME_URL, str(Path(__file__).parent / "frontend" / "dashboard-theme.js"), False),
+                StaticPathConfig(CONFIDENCE_CARD_URL, str(Path(__file__).parent / "frontend" / "confidence-changes.js"), False),
             ])
             data["alerts_module_registered"] = True
     web_url = entry.data[CONF_WEB_URL].rstrip("/")
     dashboard_query = urlencode({"v": PANEL_ASSET_VERSION, "web_url": web_url})
     dashboard_module = f"{DASHBOARD_THEME_URL}?{dashboard_query}"
     modules = data.setdefault("dashboard_theme_modules", {})
+    if not modules:
+        frontend.add_extra_js_url(hass, f"{CONFIDENCE_CARD_URL}?v={PANEL_ASSET_VERSION}")
     if old_module := modules.get(entry.entry_id):
         frontend.remove_extra_js_url(hass, old_module)
     frontend.add_extra_js_url(hass, dashboard_module)
@@ -64,3 +68,5 @@ def async_remove_panels(hass, entry):
     modules = hass.data.get(DOMAIN, {}).get("dashboard_theme_modules", {})
     if module := modules.pop(entry.entry_id, None):
         frontend.remove_extra_js_url(hass, module)
+        if not modules:
+            frontend.remove_extra_js_url(hass, f"{CONFIDENCE_CARD_URL}?v={PANEL_ASSET_VERSION}")

@@ -71,8 +71,16 @@ class ConfidenceCatalogTests(unittest.TestCase):
         self.assertIsNone(restarted.snapshot()["entities"][0]["confidence"])
         row = restarted.record("second", [reading()])[0]
         self.assertEqual(row["flow_id"], "flow-two")
+        self.assertEqual(row["confidence_change_detail"]["kind"], "initial")
         self.assertEqual(row["entity_id"], before["entities"][0]["entity_id"])
         self.assertFalse(restarted.stop("second")[0]["available"])
+
+    def test_an_unavailable_reading_breaks_the_numeric_comparison(self):
+        self.store.start("live", "flow", ["sensor.temperature"])
+        initial, unavailable, resumed = self.store.record("live", [reading(), reading("gap", None), reading("back", .4)])
+        self.assertEqual([row["confidence_change_detail"]["kind"] for row in (initial, unavailable, resumed)],
+                         ["initial", "unavailable", "resumed"])
+        self.assertIsNone(resumed["confidence_change_detail"]["delta_pp"])
 
     def test_invalid_confidence_and_derived_sources_are_rejected_atomically(self):
         self.store.start("live", "flow", ["sensor.temperature"])

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import pandas as pd
 
 from app.database.flows import FlowStore
+from app.database.confidence_entities import ConfidenceEntityStore
 from app.flow.confidence import annotate_confidence
 from app.flow.evaluacion import CausalFlowRunner
 from app.flow.evidence import append_evidence
@@ -234,6 +235,72 @@ class ConfidenceAdapterTests(unittest.TestCase):
 
 
 class ConfidenceIntegrationTests(unittest.TestCase):
+    def test_published_explanations_for_every_filter_order_in_live_and_csv(self):
+        for count in (1, 2, 3):
+            for order in permutations(KINDS, count):
+                for test in (False, True):
+                    with self.subTest(order=order, test=test), tempfile.TemporaryDirectory() as directory:
+                        store = ConfidenceEntityStore(Path(directory) / "test.sqlite")
+                        store.start("session", "flow", ["sensor.a"], test=test)
+                        first = reading(order)
+                        first["execution_trace"]["execution_order"] = list(order)
+                        second = deepcopy(first)
+                        second["observation_id"] = "obs-002"
+                        second["timestamp"] = "2026-11-17T20:01:00Z"
+                        for entry in second["execution_trace"]["evidence"]:
+                            entry["observation_id"] = "obs-002"
+                            data = entry["data"]
+                            if entry["module_type"] == "classifier":
+                                data["class_scores"] = {"normal": .1, "environmental_anomaly": .1, "sensor_fault": .8}
+                            elif entry["module_type"] == "contextual":
+                                data.update(decision_score=4., evidence=[{"neighbor_id": "sensor.hall",
+                                    "observation_status": "contradicts", "observed_value": 1}])
+                            else:
+                                data.update(joint_score=4.)
+                        states = store.record("session", [annotate_confidence(row) for row in (first, second)])
+                        result = states[1]
+                        detail = result["confidence_change_detail"]
+                        self.assertEqual(states[0]["confidence_change_detail"]["kind"], "initial")
+                        self.assertEqual(detail["kind"], "decrease")
+                        self.assertEqual([row["module_type"] for row in detail["filters"]], list(order))
+                        self.assertAlmostEqual(sum(row["impact_pp"] for row in detail["filters"]), detail["delta_pp"], places=4)
+                        if "contextual" in order:
+                            self.assertIn("sensor.hall", result["confidence_change_reason"])
+                        self.assertEqual(detail["previous_observation_id"], "obs-001")
+                        self.assertEqual(store.snapshot()["entities"], [result])
+
+    def test_plateaus_advance_evidence_and_changes_in_coverage_are_explained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfidenceEntityStore(Path(directory) / "test.sqlite")
+            store.start("job", "flow", ["sensor.a"])
+            def publish(identity, classifier, contextual, excluded=False):
+                item = reading(("classifier", "contextual"))
+                item["observation_id"] = identity
+                trace = item["execution_trace"]
+                for entry in trace["evidence"]:
+                    entry["observation_id"] = identity
+                trace["evidence"][0]["data"]["class_scores"] = {
+                    "normal": 1-classifier, "environmental_anomaly": 0, "sensor_fault": classifier}
+                trace["evidence"][1]["data"] = {"context_outcome": "contradicted", "contradiction_score": contextual}
+                if excluded:
+                    trace["filters"]["contextual"]["execution_status"] = "insufficient_data"
+                return store.record("job", [annotate_confidence(item)])[0]
+            a = publish("one", .25, .75)
+            b = publish("two", .125, .875)
+            self.assertEqual(a["confidence_change_detail"], b["confidence_change_detail"])
+            c = publish("three", .125, 0., excluded=True)
+            detail = c["confidence_change_detail"]
+            self.assertEqual(detail["kind"], "increase")
+            self.assertEqual(detail["previous_observation_id"], "two")
+            self.assertEqual(detail["previous_coverage"], 1)
+            self.assertEqual(detail["coverage"], .5)
+            filters = {f["node_id"]: f for f in detail["filters"]}
+            self.assertEqual(filters["classifier"]["before"], .125)
+            self.assertEqual(filters["contextual"]["before"], .875)
+            self.assertIsNone(filters["contextual"]["after"])
+            self.assertIn("datos insuficientes", c["confidence_change_reason"])
+            self.assertIn("empezó a aportar", publish("four", .125, .5)["confidence_change_reason"])
+
     @staticmethod
     def flow(active=KINDS, configured=KINDS, order=None, policy="combine_v1"):
         ordered = tuple(order or configured)

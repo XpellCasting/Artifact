@@ -24,6 +24,20 @@ class BridgeOperationUnsupported(BridgeUnavailable):
     pass
 
 
+def _confidence_batches(entities):
+    """Leave space for the request envelope within the companion's 1 MiB limit."""
+    batch, size = [], 0
+    for entity in entities:
+        encoded_size = len(json.dumps(entity, ensure_ascii=True)) + 2
+        if batch and (len(batch) >= 500 or size + encoded_size > 950_000):
+            yield batch
+            batch, size = [], 0
+        batch.append(entity)
+        size += encoded_size
+    if batch:
+        yield batch
+
+
 class BridgeConnection:
     def __init__(self, socket, *, supports_test_confidence=False):
         self.socket = socket
@@ -175,12 +189,14 @@ class HomeAssistantBridge:
             entities = snapshot["entities"]
             if not connection.supports_test_confidence:
                 entities = [item for item in entities if item.get("source_mode") != "test"]
-            for offset in range(0, max(1, len(entities)), 500):
+            sent = 0
+            for batch in _confidence_batches(entities) if entities else [[]]:
                 await connection.request("confidence_sync", {
                     **{key: value for key, value in snapshot.items() if key != "entities"},
-                    "entities": entities[offset:offset + 500], "reset": offset == 0,
-                    "complete": offset + 500 >= len(entities),
+                    "entities": batch, "reset": sent == 0,
+                    "complete": sent + len(batch) == len(entities),
                 })
+                sent += len(batch)
         except (BridgeUnavailable, ConnectionError, TimeoutError):
             logging.getLogger(__name__).debug("Confidence entities could not be synchronized")
 
@@ -190,11 +206,11 @@ class HomeAssistantBridge:
         connection = self._connection()
         if not connection.supports_test_confidence and any(item.get("source_mode") == "test" for item in entities):
             raise BridgeOperationUnsupported("Actualiza la integración Paranoid para publicar los sensores de confianza test.")
-        for offset in range(0, len(entities), 500):
+        for batch in _confidence_batches(entities):
             try:
                 self._wait(connection, connection.request("confidence_update", {
                     "schema_version": "confidence-entities-v1", "store_id": entities[0]["store_id"],
-                    "entities": entities[offset:offset + 500],
+                    "entities": batch,
                 }), timeout=10)
             except BridgeUnavailable:
                 raise

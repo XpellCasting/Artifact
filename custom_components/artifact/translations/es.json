@@ -34,6 +34,14 @@
     }
   },
   "entity": {
+    "sensor": {
+      "confidence": {
+        "state_attributes": {
+          "confidence_change_reason": { "name": "Motivo del último cambio" },
+          "confidence_change_detail": { "name": "Detalle del último cambio" }
+        }
+      }
+    },
     "binary_sensor": {
       "connection": {
         "name": "Conexión"

@@ -23,6 +23,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
 
 class ConfidenceSensor(SensorEntity):
+    _attr_translation_key = "confidence"
     _attr_has_entity_name = True
     _attr_should_poll = False
     _attr_native_unit_of_measurement = PERCENTAGE
@@ -57,7 +58,8 @@ class ConfidenceSensor(SensorEntity):
         keys = ("entity_id", "source_entity_id", "source_value", "source_state", "source_timestamp",
                 "evaluated_at", "observation_id", "flow_id", "execution_id", "config_hash",
                 "confidence_kind", "confidence_calibrated", "evidence_coverage", "method",
-                "active_filters", "available_filters", "reason", "activity")
+                "active_filters", "available_filters", "reason", "activity",
+                "confidence_change_reason", "confidence_change_detail")
         attributes = {key: item.get(key) for key in keys}
         attributes["confidence_entity_id"] = attributes.pop("entity_id")
         attributes["source_mode"] = item.get("source_mode", "live")

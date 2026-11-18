@@ -587,6 +587,9 @@ async def test_confidence_dashboard_uses_native_graph_bounds_and_preserves_user_
     assert [len(card["entities"]) for card in graphs] == [8, 2, 1]
     assert graphs[-1]["entities"] == ["sensor.confianza_test_sensor_x"]
     assert graphs[-1]["title"].endswith("Test")
+    history = [card for card in config["views"][0]["cards"] if card["type"] == "custom:paranoid-confidence-changes"]
+    assert [len(card["entities"]) for card in history] == [10, 1]
+    assert history[-1]["entities"] == graphs[-1]["entities"]
     assert all(card["min_y_axis"] == 0 and card["max_y_axis"] == 100 and card["fit_y_data"] is False for card in graphs)
     assert dashboard.mode == "yaml"
     assert await dashboard.async_json(False)
@@ -628,6 +631,9 @@ async def test_bridge_synchronizes_persistent_confidence_and_excludes_feedback(h
         readings = [dict(item, observation_id="two", confidence=.55), dict(item, observation_id="three", confidence=.71)]
         await asyncio.to_thread(bridge.publish_confidence, store.record("test", readings))
         assert values == [55, 71]
+        assert test_sensor.extra_state_attributes["confidence_change_detail"]["delta_pp"] == 16
+        assert "Subió de 55 % a 71 %" in test_sensor.extra_state_attributes["confidence_change_reason"]
+        assert live_sensor.extra_state_attributes["confidence_change_detail"]["kind"] == "initial"
         assert live_sensor.native_value == 93
         await asyncio.to_thread(bridge.publish_confidence, store.stop("test"))
         assert not test_sensor.available

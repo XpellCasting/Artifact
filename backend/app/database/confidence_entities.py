@@ -8,6 +8,7 @@ import sqlite3
 from uuid import uuid4
 
 from app.flow.definitions import _json, _now, _time
+from app.flow.confidence_change import explain_confidence_change
 
 
 VERSION = "confidence-entities-v1"
@@ -73,7 +74,7 @@ class ConfidenceEntityStore:
         item.update(store_id=self.store_id, revision=revision)
         db.execute("INSERT OR REPLACE INTO confidence_catalog VALUES (?,?,?,?,?)",
                    (item["source_entity_id"], item.get("source_mode", "live"), session_id, revision, _json(item)))
-        return item
+        return {key: value for key, value in item.items() if key != "_scores"}
 
     def start(self, session_id, flow_id, sources, *, test=False):
         sources = sorted(set(sources))
@@ -100,6 +101,7 @@ class ConfidenceEntityStore:
     def record(self, session_id, readings):
         changed = []
         with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
             for reading in readings:
                 source = reading.get("entity_id")
                 row = db.execute("SELECT payload FROM confidence_catalog WHERE source_entity_id=? AND session_id=?",
@@ -128,6 +130,7 @@ class ConfidenceEntityStore:
                         "reason": fusion.get("reason"), "confidence_kind": reading.get("confidence_kind", "operational_index"),
                         "confidence_calibrated": reading.get("confidence_calibrated") is True,
                         "last_changed": now if value != previous.get("value") else previous["last_changed"]}
+                explain_confidence_change(previous, item, reading)
                 changed.append(self._write(db, session_id, item))
         return changed
 
@@ -145,4 +148,6 @@ class ConfidenceEntityStore:
             db.execute("BEGIN")
             revision = db.execute("SELECT revision FROM confidence_clock WHERE id=1").fetchone()[0]
             items = [json.loads(row[0]) for row in db.execute("SELECT payload FROM confidence_catalog ORDER BY source_entity_id,source_mode")]
+            for item in items:
+                item.pop("_scores", None)
         return {"schema_version": VERSION, "store_id": self.store_id, "revision": revision, "entities": items}
