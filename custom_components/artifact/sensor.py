@@ -74,6 +74,13 @@ class ConfidenceSensor(SensorEntity):
     def _handle_update(self):
         item = self.hub.entities[self.key]
         signature = (item.get("revision"), self.available)
+        if item.get("source_mode", "live") == "live":
+            # A reading can refresh timestamps without changing the confidence
+            # or its explanation. Keep such updates out of HA state history.
+            signature = (self.available, *(item.get(key) for key in (
+                "store_id", "session_id", "flow_id", "execution_id", "config_hash",
+                "activity", "value", "reason", "method", "active_filters",
+                "available_filters", "evidence_coverage", "confidence_change_detail")))
         if signature != self._signature:
             self._signature = signature
             self.async_write_ha_state()

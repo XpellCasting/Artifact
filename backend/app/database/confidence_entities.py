@@ -1,10 +1,12 @@
 """Persistent catalog and current states for live and test confidence sensors."""
 from contextlib import contextmanager
 import json
+import logging
 import math
 from pathlib import Path
 import re
 import sqlite3
+from time import sleep
 from uuid import uuid4
 
 from app.flow.definitions import _json, _now, _time
@@ -60,8 +62,21 @@ class ConfidenceEntityStore:
                     self._write(db, None, item)
 
     @contextmanager
-    def _database(self):
-        db = sqlite3.connect(self.path, timeout=30)
+    def _database(self, *, begin_write=False):
+        for attempt in range(2):
+            db = sqlite3.connect(self.path, timeout=30)
+            try:
+                if begin_write:
+                    db.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.Error as exc:
+                db.close()
+                if attempt or getattr(exc, "sqlite_errorname", None) != "SQLITE_IOERR_SHMOPEN":
+                    raise
+                # No reading has been written. Reopen once if the WAL index was unavailable.
+                logging.getLogger(__name__).warning("SQLite %s (%s) al iniciar la transacción de confianza. Reintentando.",
+                                                    exc.sqlite_errorname, exc.sqlite_errorcode)
+                sleep(.05)
         try:
             with db:
                 yield db
@@ -100,8 +115,9 @@ class ConfidenceEntityStore:
 
     def record(self, session_id, readings):
         changed = []
-        with self._database() as db:
-            db.execute("BEGIN IMMEDIATE")
+        if not readings:
+            return changed
+        with self._database(begin_write=True) as db:
             for reading in readings:
                 source = reading.get("entity_id")
                 row = db.execute("SELECT payload FROM confidence_catalog WHERE source_entity_id=? AND session_id=?",

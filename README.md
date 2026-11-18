@@ -46,6 +46,14 @@ La primera ejecución construye las imágenes, instala las dependencias y restau
 los archivos ausentes del paquete del modelo preentrenado. Conserva la selección
 de modelo activo existente.
 
+En Docker, el primer arranque con un volumen nuevo crea bases SQLite vacías. Los
+flujos, las evaluaciones y los archivos de resultados que se generen se guardan
+en el volumen Linux `active_databases`. Los reinicios y las recreaciones del
+contenedor reutilizan ese volumen. Los datos de instalaciones anteriores siguen
+en `storage/database/` de Windows y quedan fuera del nuevo historial.
+Incluir el volumen en las copias de seguridad. El comando `docker compose down -v`
+elimina los volúmenes del proyecto.
+
 Cuando ambos servicios estén disponibles, abrir:
 
 - Aplicación: [http://localhost:5173](http://localhost:5173).
@@ -437,6 +445,29 @@ de la lectura permanece en `source_timestamp`; los intervalos desconectados no
 se rellenan retrospectivamente en Recorder. Su retención depende de la
 configuración de Home Assistant.
 
+### Retención para funcionamiento continuo
+
+Cada sensor tiene una fila de confianza actual por modo en el catálogo. En directo,
+Home Assistant publica un nuevo estado cuando cambia el porcentaje, la disponibilidad,
+la cobertura o la explicación. Una lectura que solo renueva la fecha o el identificador
+se sigue evaluando y actualiza el catálogo. Recorder conserva los motivos de los cambios
+según `purge_keep_days` y la purga configurada en Home Assistant.
+
+La API guarda por defecto las últimas **10.000 observaciones por sesión en directo**,
+compartidas entre los sensores del flujo. Esta ventana abarca el detalle por nodo,
+el gráfico del backend y las alertas de esas observaciones. Los totales de la sesión
+incluyen todas las lecturas evaluadas. La mediana y el p95 de latencia en directo
+usan las últimas 10.000 latencias válidas. El repositorio del clasificador conserva
+las últimas 10.000 decisiones nuevas en directo entre todas las sesiones.
+
+Se conservan las **10 últimas sesiones en directo completadas** que usen esta
+política, entre todos los flujos. Al guardar la siguiente se retira la sesión
+más antigua junto con su archivo y alertas. Las evaluaciones CSV y las sesiones
+anteriores a la actualización conservan su historial. Configurar los
+enteros positivos `LIVE_HISTORY_READINGS` y `LIVE_HISTORY_SESSIONS` en el
+`.env` de Compose y recrear la API para ajustar estos límites. El volumen ocupado
+depende del tamaño de las evidencias, de los CSV guardados y de las bases existentes.
+
 Las evaluaciones CSV con ground truth publican en el grupo **Test** de
 **Paranoid-Confianza**. Para una lectura de `sensor.x`, el identificador lógico
 es `confianza.test_sensor_x` y la entidad nativa es `sensor.confianza_test_sensor_x`.
@@ -469,7 +500,7 @@ comprimen sin pérdida. Las consultas reconstruyen el detalle completo y las
 métricas frente a las etiquetas conservan su representación habitual.
 
 Durante la evaluación se prepara un archivo privado en
-`storage/database/flow_lab.results/.pending/`. Al terminar se comprueba su
+`flow_lab.results/.pending/`, junto a la base de flujos. Al terminar se comprueba su
 integridad, se sincroniza a disco y se publica junto con los metadatos de la
 ejecución. El archivo publicado permanece inmutable. La base central conserva
 las métricas, las identidades de modelos y la ubicación de ese archivo. Las

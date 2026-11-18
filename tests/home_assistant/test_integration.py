@@ -522,16 +522,19 @@ async def test_native_confidence_sensor_percentage_unknown_disconnect_and_stable
     hub.apply(confidence_payload(0, 2, flow_id="flow-two"))
     assert sensor.native_value == 0
     assert sensor.unique_id == identity
+    writes = sensor.async_write_ha_state.call_count
+    hub.apply(confidence_payload(0, 3, flow_id="flow-two", observation_id="unchanged"))
+    assert sensor.async_write_ha_state.call_count == writes
     assert sensor.extra_state_attributes["flow_id"] == "flow-two"
     assert sensor.extra_state_attributes["confidence_entity_id"] == "confianza.sensor_temperature"
     assert sensor.extra_state_attributes["paranoid_confidence"] is True
-    hub.apply(confidence_payload(None, 3))
+    hub.apply(confidence_payload(None, 4))
     assert sensor.native_value is None and sensor.available
     hub.set_connected(False)
     assert not sensor.available
     hub.set_connected(True)
     assert not sensor.available  # Wait for the new authoritative snapshot.
-    hub.apply(confidence_payload(100, 4), sync=True)
+    hub.apply(confidence_payload(100, 5), sync=True)
     assert sensor.available and sensor.native_value == 100
     assert sensor.async_write_ha_state.call_count >= 4
 

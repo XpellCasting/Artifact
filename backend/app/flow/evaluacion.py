@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
 from threading import Event, Lock, Thread
@@ -13,6 +14,7 @@ from time import perf_counter
 from uuid import uuid4
 
 import pandas as pd
+from app.config import live_history_limit
 
 from app.flow.runner import FlowRunner
 from app.flow.metrics import FlowMetrics
@@ -194,7 +196,8 @@ class CausalFlowRunner(FlowRunner):
         # Labels stay in reporting; reuse this run's lookup across groups and nodes.
         truth_index = {int(row["raw_index"]): row for row in truth}
         metrics = FlowMetrics()
-        measurements = RunMeasurements()
+        live_limit = live_history_limit() if batch_source is not None else None
+        measurements = RunMeasurements(latency_limit=live_limit)
         diagnostic_snapshots = {}
         if hasattr(self.diagnostic, "_run_snapshot"):
             for node in flow["nodes"]:
@@ -289,6 +292,7 @@ class CausalFlowRunner(FlowRunner):
                         reference_end = (ordered["timestamp_dt"].min() if not ordered.empty
                                          else development["timestamp_dt"].max() + pd.Timedelta(microseconds=1))
                         session.prepare_sensor_profiles(development, reference_end)
+                    session.live_decision_limit = live_limit
                     session.add_events(available)
                     self.diagnostic_sessions[node["id"]] = session
         if contextual_nodes:
@@ -317,7 +321,7 @@ class CausalFlowRunner(FlowRunner):
         expected_total = len(ordered) if batch_source is None else 0
         groups_completed = 0
         classifier_inputs = Counter()
-        checkpoints = []
+        checkpoints = deque(maxlen=100 if live_limit else None)
         next_checkpoint = 5000
         history_maintenance_ms = 0.0
         contextual_index_update_ms = 0.0
@@ -488,7 +492,7 @@ class CausalFlowRunner(FlowRunner):
         })
         performance["phases_ms"]["total"] = round((perf_counter() - total_started) * 1000, 3)
         performance["counts"].update(future_rows=processed, groups=groups_completed, statistical_nodes=len(statistical_nodes),
-                                      classifier_inputs=dict(classifier_inputs), checkpoints=checkpoints)
+                                      classifier_inputs=dict(classifier_inputs), checkpoints=list(checkpoints))
         performance["included_in"] = {
             "baseline_preparation": "total", "causal_evaluation": "total",
             "history_initialization": "total",
@@ -590,12 +594,16 @@ class FlowEvaluationJobs:
         if self.confidence_store is not None and live_source is not None:
             confidence_sources = live_source.selected
         publish_states = self.confidence_store is not None and confidence_sources is not None
+        limit = live_history_limit() if live_source is not None else None
+        session_limit = live_history_limit("LIVE_HISTORY_SESSIONS") if limit else None
         with self.lock:
             if any(job["status"] == "running" for job in self.jobs.values()):
                 raise ValueError("Ya hay una evaluación de flujos en curso. Espera a que termine.")
             job_id = uuid4().hex
             previous_alert_execution = self.store.begin_alert_execution(job_id)
             self.jobs[job_id] = {"job_id": job_id, "flow_id": flow_id, "flow": deepcopy(flow), "status": "running", "processed": 0, "total": 0, "phase": "preparation", "mode": "home_assistant" if live_source is not None else "csv"}
+            if limit:
+                self.jobs[job_id]["live_retention"] = {"readings": limit, "sessions": session_limit}
             if live_source is not None:
                 self.sources[job_id] = live_source
             else:
@@ -633,7 +641,7 @@ class FlowEvaluationJobs:
                                          **metadata)
         store_path = getattr(self.store, "path", None)
         spool_directory = Path(store_path).with_suffix(".results") / ".pending" if isinstance(store_path, (str, Path)) else None
-        spool = FlowResultSpool(job_id, directory=spool_directory)
+        spool = FlowResultSpool(job_id, directory=spool_directory, observation_limit=limit)
         def publish_confidence(entities):
             if not entities or self.confidence_publish is None:
                 return
@@ -647,9 +655,9 @@ class FlowEvaluationJobs:
                 self.jobs[job_id]["confidence_publication"] = publication
         def sink(results):
             check_cancellation(cancel_event)
-            spool.write_block(results)
+            expired = spool.write_block(results)
             check_cancellation(cancel_event)
-            self.store.record_alerts(job_id, flow_id, results.get("output", []))
+            self.store.record_alerts(job_id, flow_id, results.get("output", []), expired=expired)
             if publish_states:
                 publish_confidence(self.confidence_store.record(job_id, results.get("output", [])))
             if live_source is not None:
@@ -666,6 +674,9 @@ class FlowEvaluationJobs:
                 progress(summary.get("candidate_count", 0), summary.get("candidate_count", 0),
                          "saving", "Guardando resultados por nodo")
                 spool.finish(snapshot=snapshot)
+                if limit:
+                    summary["live_retention"] = {"readings": limit, "sessions": session_limit,
+                                                 "retained": spool.stats["retained_observations"]}
                 records = spool.records()
                 records.on_progress = lambda stage, detail: progress(
                     summary.get("candidate_count", 0), summary.get("candidate_count", 0), "saving", detail,
@@ -684,6 +695,12 @@ class FlowEvaluationJobs:
             except Exception as exc:
                 logging.getLogger(__name__).exception("Falló la evaluación del flujo %s", flow_id)
                 outcome = {"status": "failed", "error": str(exc)}
+                if isinstance(exc, sqlite3.Error):
+                    code = getattr(exc, "sqlite_errorname", None)
+                    logging.getLogger(__name__).error("SQLite %s (%s), evaluación %s", code,
+                                                      getattr(exc, "sqlite_errorcode", None), job_id)
+                    if code:
+                        outcome["error"] = f"{exc} ({code})"
                 if getattr(exc, "filter_execution_context", None) is not None:
                     outcome["filter_execution_context"] = exc.filter_execution_context
             finally:
@@ -712,6 +729,11 @@ class FlowEvaluationJobs:
                 with self.lock:
                     self.cancel_events.pop(job_id, None)
                     self.jobs[job_id].update(outcome)
+                    if session_limit:
+                        previous_live_jobs = [key for key, job in self.jobs.items()
+                                              if job["mode"] == "home_assistant" and job["status"] != "running"]
+                        for stale in previous_live_jobs[:-session_limit]:
+                            del self.jobs[stale]
         response = {"job_id": job_id, "status": "running"}
         if context_source is not None:
             response["context_replay"] = context_source.status(advance=False)

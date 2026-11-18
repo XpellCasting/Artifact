@@ -84,6 +84,10 @@ class FlowStore:
                     UNIQUE (execution_id, observation_id)
                 );
                 CREATE INDEX IF NOT EXISTS flow_alerts_execution ON flow_alerts(execution_id,alert_id);
+                CREATE TABLE IF NOT EXISTS retained_live_runs (
+                    run_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS expired_live_archives (filename TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS flow_alert_state (
                     id INTEGER PRIMARY KEY CHECK (id=1), execution_id TEXT NOT NULL
                 );
@@ -111,6 +115,18 @@ class FlowStore:
                         SELECT execution_id,MAX(created_at),MAX(alert_id) FROM flow_alerts
                         WHERE run_id IS NULL GROUP BY execution_id
                     ) ORDER BY created_at DESC,sequence DESC LIMIT 1""")
+
+        self._remove_expired_archives()
+
+    def _remove_expired_archives(self):
+        with self._database() as db:
+            for filename, in db.execute("SELECT filename FROM expired_live_archives").fetchall():
+                try:
+                    archive_path(self.path, filename).unlink(missing_ok=True)
+                except OSError:
+                    logging.getLogger(__name__).warning("No se pudo retirar el archivo caducado %s", filename)
+                    continue
+                db.execute("DELETE FROM expired_live_archives WHERE filename=?", (filename,))
 
     def _connect(self):
         return sqlite3.connect(self.path, timeout=30)
@@ -298,6 +314,17 @@ class FlowStore:
             db.execute("INSERT INTO flow_runs VALUES (?,?,?,?,?)", (run_id, flow_id, _json(stored_snapshot), _json(summary), _now()))
             db.execute("INSERT INTO flow_run_archives VALUES (?,?,?,?,?)",
                        (run_id, destination.name, FORMAT, _json(spool.stats), _json(timings)))
+            if spool.observation_limit is not None and execution_id is not None:
+                session_limit = summary["live_retention"]["sessions"]
+                db.execute("INSERT INTO retained_live_runs VALUES (?,?)", (run_id, execution_id))
+                expired = db.execute("""SELECT r.run_id,r.execution_id,a.filename
+                    FROM retained_live_runs r JOIN flow_run_archives a ON a.run_id=r.run_id
+                    ORDER BY r.rowid DESC LIMIT -1 OFFSET ?""", (session_limit,)).fetchall()
+                for old_run, old_execution, filename in expired:
+                    db.execute("INSERT INTO expired_live_archives VALUES (?)", (filename,))
+                    db.execute("DELETE FROM flow_alerts WHERE execution_id=?", (old_execution,))
+                    db.execute("DELETE FROM flow_runs WHERE run_id=?", (old_run,))
+                    db.execute("DELETE FROM retained_live_runs WHERE run_id=?", (old_run,))
             commit_started = perf_counter()
             timings["result_persistence_before_commit"] = (commit_started - started) * 1000
             db.commit()
@@ -318,6 +345,11 @@ class FlowStore:
             except sqlite3.Error:
                 db.rollback()
                 logging.getLogger(__name__).warning("No se pudo guardar el tiempo de confirmación de %s", run_id, exc_info=True)
+            if spool.observation_limit is not None:
+                try:
+                    self._remove_expired_archives()
+                except sqlite3.Error:
+                    logging.getLogger(__name__).warning("Limpieza de archivos caducados pendiente", exc_info=True)
             return run_id, round((perf_counter() - started) * 1000, 3)
         except BaseException:
             if not committed:
@@ -362,12 +394,15 @@ class FlowStore:
             ((execution_id, str(item["observation_id"]), flow_id, run_id, created_at, _json(item))
              for item in items if item.get("final_decision") in ALERT_DECISIONS))
 
-    def record_alerts(self, execution_id: str, flow_id: str, items: list[dict[str, Any]]) -> None:
-        if not any(item.get("final_decision") in ALERT_DECISIONS for item in items):
+    def record_alerts(self, execution_id: str, flow_id: str, items: list[dict[str, Any]], *, expired=()) -> None:
+        if not expired and not any(item.get("final_decision") in ALERT_DECISIONS for item in items):
             return
         with self._database() as db:
             db.execute("INSERT OR IGNORE INTO flow_alert_state VALUES (1,?)", (execution_id,))
             self._insert_alerts(db, execution_id, flow_id, items)
+            if expired:
+                db.executemany("DELETE FROM flow_alerts WHERE execution_id=? AND observation_id=?",
+                               ((execution_id, identity) for identity in expired))
 
     def alerts(self, before_id: int | None = None, limit: int = 50, severity: str | None = None) -> dict[str, Any]:
         conditions, args = ["execution_id=(SELECT execution_id FROM flow_alert_state WHERE id=1)"], []

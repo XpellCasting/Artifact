@@ -95,6 +95,7 @@ class DiagnosticRunSession:
     """
     def __init__(self, workbench, source, run_id, model_id=None):
         self.workbench, self.source, self.run_id = workbench, source, run_id
+        self.live_decision_limit = None
         snapshot_loader = getattr(workbench, "_run_snapshot_for_model", workbench._run_snapshot)
         self.snapshot = (snapshot_loader(source, run_id, model_id=model_id)
                         if model_id is not None and hasattr(workbench, "_run_snapshot_for_model")
@@ -234,7 +235,10 @@ class DiagnosticRunSession:
         if not self.pending: return
         rows = [(result["diagnosis_id"], self.snapshot["run_id"], self.source, result["entity_id"], result["timestamp"], _canonical(result)) for result in self.pending]
         started = time.perf_counter()
-        self.workbench.save_decisions(rows)
+        if self.live_decision_limit is None:
+            self.workbench.save_decisions(rows)
+        else:
+            self.workbench.save_decisions(rows, live_limit=self.live_decision_limit)
         self.stats["decision_writes"] += len(rows); self.stats["flushes"] += 1; self.stats["write_ms"] += round((time.perf_counter() - started) * 1000, 3); self.pending.clear(); self.last_flush = time.monotonic()
 
 

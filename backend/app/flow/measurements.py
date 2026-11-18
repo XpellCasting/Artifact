@@ -1,6 +1,6 @@
 """Measurements of the output readings and their reference labels."""
 from array import array
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from math import floor, isclose, isfinite
 
@@ -39,8 +39,8 @@ def _utc(value):
 
 
 class RunMeasurements:
-    def __init__(self):
-        self.latencies = array("d")
+    def __init__(self, *, latency_limit=None):
+        self.latencies = array("d") if latency_limit is None else deque(maxlen=latency_limit)
         self.delays = array("d")
         self.episodes = 0
         self.active_faults = {}

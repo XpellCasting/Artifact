@@ -219,7 +219,8 @@ class SpoolRecords:
 
 
 class FlowResultSpool:
-    def __init__(self, job_id, directory=None):
+    def __init__(self, job_id, directory=None, *, observation_limit=None):
+        self.observation_limit = observation_limit
         if directory is not None:
             Path(directory).mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(prefix=f"flow-evaluation-{job_id}-", suffix=".sqlite3", dir=directory)
@@ -248,12 +249,14 @@ class FlowResultSpool:
             );
             CREATE INDEX confidence_series_entity ON confidence_series(entity_id,sequence);
         """)
+        if observation_limit is not None:
+            self.db.execute("CREATE INDEX results_observation ON results(observation)")
 
     def write_block(self, results):
         if self.closed:
             raise ValueError("El archivo de resultados ya está cerrado")
         try:
-            self._write_block(results)
+            return self._write_block(results)
         except BaseException:
             self.failed = True
             raise
@@ -295,11 +298,23 @@ class FlowResultSpool:
                                     (record["sequence"], item["entity_id"], item["timestamp"], value))
         self.stats["observations"] += len(grouped)
         self.stats["records"] = ordinal
+        expired = []
+        if grouped and self.observation_limit is not None:
+            cutoff = observation - self.observation_limit
+            if cutoff > 0:
+                expired = [row[0] for row in self.db.execute(
+                    "SELECT identity FROM observations WHERE id<=?", (cutoff,))]
+                self.db.execute("""DELETE FROM confidence_series WHERE sequence IN
+                    (SELECT sequence FROM results INDEXED BY results_observation
+                     WHERE observation<=? AND node_id='output')""", (cutoff,))
+                self.db.execute("DELETE FROM results WHERE observation<=?", (cutoff,))
+                self.db.execute("DELETE FROM observations WHERE id<=?", (cutoff,))
         self.unflushed_inputs += len(grouped)
         if self.unflushed_inputs >= 500:
             self.db.commit()
             self.unflushed_inputs = 0
         self.stats["spooling_ms"] += (perf_counter() - started) * 1000
+        return expired
 
     def finish(self, snapshot=None):
         if self.closed:
@@ -315,7 +330,13 @@ class FlowResultSpool:
             self.stats["audit_uncompressed_bytes"] = len(raw)
             self.stats["audit_compressed_bytes"] = len(blob)
         self.db.execute("INSERT INTO metadata VALUES ('format',?)", (FORMAT,))
-        self.db.execute("INSERT INTO metadata VALUES ('node_counts',?)", (_json(dict(self.sequences)),))
+        counts = dict(self.sequences)
+        if self.observation_limit is not None:
+            counts = dict(self.db.execute("SELECT node_id,COUNT(*) FROM results GROUP BY node_id"))
+            self.stats.update(observation_limit=self.observation_limit,
+                              retained_observations=self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0],
+                              retained_records=sum(counts.values()))
+        self.db.execute("INSERT INTO metadata VALUES ('node_counts',?)", (_json(counts),))
         self.db.commit()
         if self.db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise ValueError("El archivo de resultados no superó la comprobación de integridad")

@@ -12,13 +12,23 @@ class DiagnosticRepository:
                 CREATE TABLE IF NOT EXISTS decisions(decision_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
                     source TEXT NOT NULL, entity_id TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS decisions_source_time ON decisions(source,timestamp);
+                CREATE TABLE IF NOT EXISTS live_decision_history(sequence INTEGER PRIMARY KEY, decision_id TEXT UNIQUE NOT NULL);
                 CREATE TABLE IF NOT EXISTS run_sensor_profiles(run_id TEXT NOT NULL,
                     entity_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(run_id,entity_id));
             """)
 
-    def save_decisions(self, rows):
+    def save_decisions(self, rows, *, live_limit=None):
         with self._connect() as connection:
             connection.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?)", rows)
+            if live_limit is not None and rows:
+                connection.executemany("INSERT OR REPLACE INTO live_decision_history(decision_id) VALUES (?)",
+                                       ((row[0],) for row in rows))
+                cutoff = connection.execute("""SELECT sequence FROM live_decision_history
+                    ORDER BY sequence DESC LIMIT 1 OFFSET ?""", (live_limit,)).fetchone()
+                if cutoff:
+                    connection.execute("""DELETE FROM decisions WHERE decision_id IN
+                        (SELECT decision_id FROM live_decision_history WHERE sequence<=?)""", (cutoff[0],))
+                    connection.execute("DELETE FROM live_decision_history WHERE sequence<=?", (cutoff[0],))
 
     def sensor_profiles_for_run(self, run_id):
         with self._connect() as connection:

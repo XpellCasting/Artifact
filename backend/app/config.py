@@ -45,6 +45,8 @@ ENVIRONMENT_DEFAULTS = {
     'CONTEXT_MAP_CACHE_PATH': CACHE_DIR / "contextual_map.json",
     'CONTINUOUS_CONF_PATH': CACHE_DIR / "conf.txt",
     'FLOW_LAB_DB_PATH': DATABASE_DIR / "flow_lab.sqlite3",
+    'LIVE_HISTORY_READINGS': "10000",
+    'LIVE_HISTORY_SESSIONS': "10",
     'GAT_SEQUENCE_CACHE_DIR': None,
     'HISTORICAL_DATA_DIR': HISTORICAL_DATA_DIR,
     'HISTORY_LOAD_SECONDS_PER_MIB': "0.22",
@@ -61,3 +63,10 @@ ENVIRONMENT_DEFAULTS = {
 
 def setting(name):
     return os.environ.get(name, ENVIRONMENT_DEFAULTS[name])
+
+
+def live_history_limit(name="LIVE_HISTORY_READINGS"):
+    value = int(setting(name))
+    if value < 1:
+        raise ValueError(f"{name} debe ser un entero positivo.")
+    return value
