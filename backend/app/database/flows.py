@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from hashlib import sha256
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -480,3 +481,54 @@ class FlowStore:
             rows = db.execute("SELECT payload FROM flow_results WHERE run_id=? AND node_id=? ORDER BY sequence LIMIT ? OFFSET ?", (run_id, node_id, limit, offset)).fetchall()
         items = [json.loads(row[0]) for row in rows]
         return {"run_id": run_id, "node_id": node_id, "total": total, "offset": offset, "items": items, "next_offset": offset + len(items) if offset + len(items) < total else None}
+
+    def confidence_series(self, run_id, entity_id=None, offset=0, limit=1000):
+        """Read the scalar index without decompressing detector evidence."""
+        with self._database() as db:
+            if not db.execute("SELECT 1 FROM flow_runs WHERE run_id=?", (run_id,)).fetchone():
+                raise KeyError(run_id)
+            archive = archive_for_run(db, self.path, run_id)
+            catalog = points = None
+            selected = entity_id
+            if archive is not None:
+                connection = ResultArchive(archive).connect()
+                try:
+                    indexed = connection.execute("SELECT 1 FROM sqlite_master WHERE name='confidence_series'").fetchone()
+                    if indexed:
+                        catalog = connection.execute("SELECT entity_id,COUNT(*) FROM confidence_series GROUP BY entity_id ORDER BY entity_id").fetchall()
+                        selected = entity_id or (catalog[0][0] if catalog else None)
+                        points = connection.execute("SELECT sequence,timestamp,value FROM confidence_series WHERE entity_id=? ORDER BY sequence LIMIT ? OFFSET ?",
+                                                    (selected, limit, offset)).fetchall()
+                finally:
+                    connection.close()
+            if catalog is None:
+                # Existing archives/SQLite runs stay readable without migration.
+                counts, points = {}, []
+                for record in iter_run_results(db, self.path, run_id, "output"):
+                    item = record["payload"]
+                    if "confidence" not in item:
+                        continue
+                    source = item["entity_id"]
+                    counts[source] = counts.get(source, 0) + 1
+                catalog = sorted(counts.items())
+                selected = entity_id or (catalog[0][0] if catalog else None)
+                matching = 0
+                for record in iter_run_results(db, self.path, run_id, "output"):
+                    item = record["payload"]
+                    if "confidence" not in item or item["entity_id"] != selected:
+                        continue
+                    if offset <= matching < offset + limit:
+                        confidence = item["confidence"]
+                        value = (round(confidence * 100, 6) if type(confidence) in (int, float)
+                                 and math.isfinite(confidence) and 0 <= confidence <= 1 else None)
+                        points.append((record["sequence"], item["timestamp"], value))
+                    matching += 1
+            total = dict(catalog).get(selected, 0)
+        return {"run_id": run_id, "source_entity_id": selected,
+                "entity_id": f"confianza.{selected.replace('.', '_')}" if selected else None,
+                "entities": [{"source_entity_id": source, "entity_id": f"confianza.{source.replace('.', '_')}",
+                              "count": count} for source, count in catalog],
+                "points": [{"sequence": sequence, "timestamp": timestamp, "value": value}
+                           for sequence, timestamp, value in points],
+                "offset": offset, "total": total,
+                "next_offset": offset + len(points) if offset + len(points) < total else None}

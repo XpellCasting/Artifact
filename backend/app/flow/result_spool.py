@@ -8,6 +8,7 @@ from collections import Counter, OrderedDict
 from copy import deepcopy
 import errno
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -45,6 +46,19 @@ def encode_observation(records):
     """Factor common fields and evidence without mutating the live graph."""
     base = {key: value for key, value in records[0]["payload"].items() if key in OBSERVATION_FIELDS}
     evidence, buckets, nodes = [], {}, []
+    def references_for(entries):
+        references = []
+        for entry in entries:
+            identifier = entry.get("evidence_id") or _json(entry)
+            candidates = buckets.setdefault(identifier, [])
+            index = next((index for index in candidates if _same(evidence[index], entry)), None)
+            if index is None:
+                index = len(evidence)
+                candidates.append(index)
+                evidence.append(entry)
+            references.append(index)
+        return references
+
     for record in records:
         item = record["payload"]
         fields = {key: value for key, value in item.items() if key not in base or not _same(value, base[key])}
@@ -55,19 +69,13 @@ def encode_observation(records):
         entries = item.get("evidence")
         if isinstance(entries, list) and all(isinstance(entry, dict) for entry in entries):
             fields.pop("evidence", None)
-            references = []
-            for entry in entries:
-                # An ID identifies an immutable assessment. Retain variants too:
-                # legacy adapters can add module metadata to an earlier envelope.
-                identifier = entry.get("evidence_id") or _json(entry)
-                candidates = buckets.setdefault(identifier, [])
-                index = next((index for index in candidates if _same(evidence[index], entry)), None)
-                if index is None:
-                    index = len(evidence)
-                    candidates.append(index)
-                    evidence.append(entry)
-                references.append(index)
-            node["evidence"] = references
+            # Retain variants too: legacy adapters can enrich an earlier envelope.
+            node["evidence"] = references_for(entries)
+        trace = fields.get("execution_trace")
+        trace_entries = trace.get("evidence") if isinstance(trace, dict) else None
+        if isinstance(trace_entries, list) and all(isinstance(entry, dict) for entry in trace_entries):
+            fields["execution_trace"] = {key: value for key, value in trace.items() if key != "evidence"}
+            node["trace_evidence"] = references_for(trace_entries)
         nodes.append(node)
     raw = _json({"base": base, "evidence": evidence, "nodes": nodes}).encode("utf-8")
     return zlib.compress(raw, level=1), len(raw), len(evidence)
@@ -83,13 +91,17 @@ def materialize(body, slot, *, owned=False):
     for key in node.get("missing", []):
         item.pop(key, None)
     item.update(node["fields"] if owned else deepcopy(node["fields"]))
-    if "evidence" in node:
-        seen = set()
+    seen = set()
+    def entries_for(references):
         entries = []
-        for index in node["evidence"]:
+        for index in references:
             entries.append(body["evidence"][index] if owned and index not in seen else deepcopy(body["evidence"][index]))
             seen.add(index)
-        item["evidence"] = entries
+        return entries
+    if "evidence" in node:
+        item["evidence"] = entries_for(node["evidence"])
+    if "trace_evidence" in node:
+        item["execution_trace"] = {**item["execution_trace"], "evidence": entries_for(node["trace_evidence"])}
     return item
 
 
@@ -231,6 +243,10 @@ class FlowResultSpool:
                                   slot INTEGER NOT NULL,ordinal INTEGER NOT NULL,alert INTEGER NOT NULL,
                                   PRIMARY KEY(node_id,sequence)) WITHOUT ROWID;
             CREATE TABLE metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE confidence_series (
+                sequence INTEGER PRIMARY KEY,entity_id TEXT NOT NULL,timestamp TEXT NOT NULL,value REAL
+            );
+            CREATE INDEX confidence_series_entity ON confidence_series(entity_id,sequence);
         """)
 
     def write_block(self, results):
@@ -266,6 +282,17 @@ class FlowResultSpool:
             self.stats["uncompressed_bytes"] += raw_bytes
             self.stats["evidence_references"] += sum(len(record["payload"].get("evidence", []))
                                                      for record in records if isinstance(record["payload"].get("evidence"), list))
+            self.stats["evidence_references"] += sum(len((record["payload"].get("execution_trace") or {}).get("evidence", []))
+                                                     for record in records
+                                                     if isinstance(record["payload"].get("execution_trace"), dict))
+            for record in records:
+                item = record["payload"]
+                if record["node_id"] == "output" and "confidence" in item:
+                    confidence = item["confidence"]
+                    value = (round(confidence * 100, 6) if type(confidence) in (int, float)
+                             and math.isfinite(confidence) and 0 <= confidence <= 1 else None)
+                    self.db.execute("INSERT INTO confidence_series VALUES (?,?,?,?)",
+                                    (record["sequence"], item["entity_id"], item["timestamp"], value))
         self.stats["observations"] += len(grouped)
         self.stats["records"] = ordinal
         self.unflushed_inputs += len(grouped)

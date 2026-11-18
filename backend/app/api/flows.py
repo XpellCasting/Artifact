@@ -109,7 +109,8 @@ def _start_csv_flow(flow_id, context_csv=None, context_filename=None):
                                                          result_sink=result_sink, context_source=context_source, cancel_event=cancel_event)
             snapshot["source"]["filename"] = filename
             return summary, results, snapshot
-        return flow_evaluation_jobs.start(flow_id, evaluate, flow=flow, context_source=context_source, cancel_event=cancel_event)
+        return flow_evaluation_jobs.start(flow_id, evaluate, flow=flow, context_source=context_source,
+                                         cancel_event=cancel_event, test_sources=future["entity_id"].unique())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Flujo no encontrado.") from exc
     except Exception as exc:
@@ -196,5 +197,14 @@ def flow_run_results(
 def flow_run_metrics(run_id: str) -> dict[str, Any]:
     try:
         return flow_store.run_metrics(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Ejecución no encontrada.") from exc
+
+
+@router.get("/flow-runs/{run_id}/confidence", tags=["flow-lab"])
+def flow_run_confidence(run_id: str, entity_id: str | None = None,
+                        offset: int = Query(default=0, ge=0), limit: int = Query(default=1000, ge=1, le=5000)):
+    try:
+        return flow_store.confidence_series(run_id, entity_id, offset, limit)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Ejecución no encontrada.") from exc

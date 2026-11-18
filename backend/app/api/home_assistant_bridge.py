@@ -29,7 +29,8 @@ def create_bridge_router(bridge):
             await websocket.close(code=1008)
             return
         await websocket.accept()
-        connection = await bridge.attach(websocket)
+        connection = await bridge.attach(
+            websocket, supports_test_confidence=websocket.headers.get("X-Paranoid-Confidence-Test") == "1")
         try:
             while connection.connected:
                 connection.receive(await websocket.receive_json())

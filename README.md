@@ -64,7 +64,8 @@ Los directorios `data/`, `storage/` y `models/` conservan el estado entre reinic
 ### Home Assistant (Marketplace y HACS)
 
 La integración conecta Home Assistant con Paranoid, proporciona históricos y
-cambios de estado, y permite abrir la aplicación y su panel de alertas. Requiere
+cambios de estado, publica sensores de confianza y permite abrir la aplicación y
+sus paneles de alertas e historial de confianza. Requiere
 Home Assistant 2024.12 o posterior. Paranoid debe estar ejecutándose por separado.
 
 1. En Home Assistant 2026.11 o posterior, abrir **Configuración → Marketplace →
@@ -78,7 +79,7 @@ Home Assistant 2024.12 o posterior. Paranoid debe estar ejecutándose por separa
    Reemplazar `<equipo-paranoid>` por su IP o nombre de red. Ambas direcciones
    deben ser accesibles desde Home Assistant y desde el navegador.
 4. Una vez cargada la integración, Home Assistant añade **Paranoid** y
-   **Paranoid-Alertas** a la barra lateral. Ambos accesos se retiran al
+   **Paranoid-Alertas** y **Paranoid-Confianza** a la barra lateral. Los accesos se retiran al
    desactivar o eliminar la configuración. El dispositivo **Paranoid** también ofrece **Visitar**.
 
 Las direcciones se pueden cambiar desde **Reconfigurar** en la integración.
@@ -96,8 +97,9 @@ conexión**, **Integración no configurada** y **Desconectada**.
 Las direcciones `localhost` de los ejemplos de instalación sirven para abrir
 Paranoid desde el mismo equipo donde se ejecuta.
 
-Para incorporar ambos paneles a una instalación existente, actualiza la integración
-a la versión 0.4.2 o posterior desde Marketplace o HACS y reinicia Home Assistant.
+Para incorporar los sensores y los tres paneles a una instalación existente,
+actualiza la integración a la versión 0.5.1 o posterior desde Marketplace o HACS
+y reinicia Home Assistant. Actualiza también el backend y la interfaz de Paranoid.
 Los históricos y vínculos guardados se conservan; no es necesario volver a
 emparejar. Una integración anterior todavía entrega el catálogo plano, con un
 aviso de que los metadatos de áreas no están disponibles.
@@ -223,7 +225,7 @@ cada lectura utiliza solo la información disponible hasta ese instante.
 | Clasificador | Usa el modelo GAT-LSTM preentrenado para distinguir comportamiento normal, anomalía ambiental y posible falla del sensor. Puede devolver un resultado indeterminado cuando la evidencia es insuficiente. |
 | Unión | Aplica una función lógica a los resultados de una misma lectura: «cualquiera positiva» (O) o «todas positivas» (Y). Conserva las evidencias de cada filtro. |
 | Decisión | Evalúa si la señal recibida cumple la condición seleccionada. Devuelve positiva para verdadero y sin señal para falso; seleccionar solo «Sin señal» permite negar una señal evaluable (NO). |
-| Salida | Reúne los resultados finales y conserva el recorrido de evidencias de cada lectura. |
+| Salida | Reúne los resultados finales, conserva su recorrido de evidencias y calcula un índice de confianza por lectura con ponderación uniforme. |
 
 Las señales son `positive` (señal positiva), `negative` (sin señal) y `unknown`
 (no evaluable). Las conexiones pueden dejar pasar todas o solo algunas de ellas.
@@ -248,6 +250,186 @@ Si después de una compuerta se ejecuta otro filtro, ese filtro calcula una nuev
 evaluación con la política de evidencias seleccionada.
 
 ## Guardado de resultados y evidencias
+
+Las lecturas nuevas conservan el contrato diagnóstico `module-envelope-v1` y
+añaden una traza `execution_trace` con versión `filter-execution-v1`. Esta
+información alimenta el cálculo de confianza en Salida y conserva las señales
+y diagnósticos existentes.
+
+Cada resultado de Salida incluye `flow_id`, `execution_id` y `config_hash`.
+`snapshot.execution_context` contiene las mismas referencias y la versión de
+la traza; la configuración completa permanece en `snapshot.flow`. `config_hash`
+es SHA-256 del grafo y las configuraciones de sus nodos serializados de forma
+canónica. Omite nombres visibles, posiciones e identificadores de almacenamiento;
+conserva el orden de las listas. Identifica la configuración, no los datos ni
+los pesos de un modelo: las identidades de modelos, mapas y referencias siguen
+en las evidencias y la instantánea existentes.
+
+La traza de cada lectura contiene:
+
+- `filters`: un registro por nodo de filtro configurado, con tipo, activación,
+  estado de ejecución, motivo, versión disponible, secuencia, grupo y referencias
+  a las evidencias producidas y recibidas.
+- `absent_filter_types`: tipos de filtro que no forman parte del grafo. Un filtro
+  configurado pero desactivado se identifica como `disabled` en `filters`.
+- `availability_mask`: disponibilidad de resultados por nodo; un filtro sin
+  resultado utilizable no equivale a una evaluación normal.
+- `execution_order`: filtros cuya ejecución se intentó para esa lectura.
+- `groups`: llamadas de filtros, sus timestamps, cantidad de observaciones y
+  duración compartida. Son lotes de procesamiento, no grupos de ejecución paralela.
+- `evidence`: evidencias originales de filtros ejecutados, incluidas las ramas
+  que no llegaron a Salida y las evidencias de control que recibieron otros
+  filtros. El archivo reutiliza su conjunto de evidencias compartidas mediante
+  referencias. El campo diagnóstico `evidence` de Salida mantiene su recorrido.
+
+`execution_status` está separado del `status` diagnóstico. Sus valores son
+`pending` durante la llamada, `completed`, `disabled`, `skipped`,
+`insufficient_data` y `error`. Los resultados finales no conservan `pending`.
+Una abstención del clasificador con puntuaciones válidas puede estar `completed`
+y conservar su diagnóstico `indeterminate`.
+
+Las duraciones de `groups` usan `timing_scope=filter_call`; no se dividen entre
+lecturas para simular mediciones individuales. En evaluación causal, la
+preparación estadística se registra aparte en `groups[].preparation`, con ámbito
+`timestamp_group`. La latencia existente añade `latency_scope=timestamp_group`,
+`latency_group_id` y `latency_group_size`, porque es compartida por las lecturas
+del mismo grupo temporal.
+
+Un error de filtro conserva el comportamiento de detener la evaluación. El
+estado del trabajo añade `filter_execution_context`, con una muestra explícita
+de hasta 20 lecturas y el indicador `truncated`; no publica una ejecución
+terminada. Las ejecuciones anteriores continúan leyéndose sin inventar trazas.
+
+Las pruebas específicas cubren las siete combinaciones de uno, dos y tres
+filtros activos, los seis órdenes, filtros ausentes o deshabilitados, ramas,
+datos insuficientes, errores y persistencia. Con el entorno Python del proyecto
+y `PYTHONPATH` apuntando a `backend`, ejecutar:
+
+```powershell
+python -m unittest discover -s tests/backend -p "test_filter_execution_trace.py" -v
+```
+
+### Confianza por lectura en Salida
+
+Salida calcula automáticamente `confidence` para cada lectura nueva, sin añadir
+un nodo al grafo. La política `uniform_v1` aplica `1 - media(sospechas)` a los
+resultados utilizables, con una aportación por nodo de filtro. Los parámetros
+de esta política quedan guardados una vez en `snapshot.confidence_policy`.
+La ponderación aprendida y la calibración se reservan para trabajo futuro.
+
+Los adaptadores usan las magnitudes originales de `execution_trace.evidence`:
+
+- Estadístico: para un puntaje relativo a su umbral, `r / (1 + r)`; los puntajes
+  ya acotados de binarios y multivalor conservan su escala. Una detección
+  explícita de persistencia o indisponibilidad aporta sospecha 1. Un resultado
+  `no_suspicion` sin puntaje numérico aporta 0 y registra ese adaptador explícito.
+- Contextual: apoyo contextual aporta 0; contradicción usa su intensidad relativa
+  al umbral o su indicador acotado. No utiliza `adjusted_suspicion_score`, que
+  podría contar por segunda vez la evidencia estadística.
+- Clasificador: usa `class_scores.sensor_fault`; el máximo de las clases puede
+  corresponder a Normal o a una anomalía ambiental y no se usa como sospecha.
+
+El resultado mantiene `confidence_kind=operational_index` y
+`confidence_calibrated=false`. Un valor `0.90` representa un índice del 90 %,
+no una probabilidad calibrada de funcionamiento correcto. Los filtros omitidos,
+deshabilitados, sin datos o sin un puntaje válido no reciben una aportación cero:
+se excluyen de la media. `evidence_coverage` es la proporción de filtros
+habilitados que aportaron un puntaje válido; no multiplica la confianza. Los
+motivos de exclusión, adaptadores y referencias se guardan en
+`confidence_fusion`, con versión `reading-confidence-v1`.
+
+Sin evidencia utilizable, con una lectura inválida o sin ruta de salida,
+`confidence` es `null` y se registra el motivo. Una ejecución pendiente o con
+error tampoco produce confianza válida. Cada lectura se calcula por separado,
+antes de comparar con ground truth. Las uniones y decisiones no aportan votos
+adicionales ni cambian el índice; las evidencias ejecutadas en ramas descartadas
+siguen disponibles a través de la traza. Los cambios de orden solo afectan al
+índice cuando modifican las evidencias producidas.
+
+Los valores se guardan y se consultan mediante los archivos y endpoints de
+resultados existentes, tanto en CSV como en directo. Las ejecuciones anteriores
+conservan sus datos y no se les asigna retrospectivamente un índice. El benchmark
+de replay sigue comparando resultados originales de detectores y diagnósticos
+con referencias anteriores; comprueba las referencias de las nuevas anotaciones.
+Las pruebas específicas verifican el cálculo de confianza de forma independiente:
+
+```powershell
+python -m unittest discover -s tests/backend -p "test_flow_confidence.py" -v
+```
+
+### Entidades e historial de confianza
+
+Al iniciar un flujo en directo, Paranoid registra una entidad de confianza por
+sensor seleccionado. Por ejemplo, `sensor.temperatura` genera el identificador
+lógico `confianza.sensor_temperatura`. En Home Assistant se publica como
+`sensor.confianza_sensor_temperatura`, con unidad `%` y clase de estado
+`measurement`, para que Recorder conserve su historial y estadísticas. El
+dominio original distingue, por ejemplo, un `sensor.puerta` de un
+`binary_sensor.puerta`. El identificador lógico se conserva en el atributo
+`confidence_entity_id`; si se cambia el nombre de la entidad en Home Assistant,
+el panel utiliza su identificador registrado real.
+
+La entidad muestra `unknown` hasta recibir una lectura evaluable y publica el
+índice entre 0 y 100. Una lectura sin evidencia utilizable vuelve a `unknown`.
+Al detener el flujo, reiniciar el backend o perder la conexión, pasa a
+`unavailable`, evitando utilizar el último valor como si continuase vigente.
+Una reconexión sincroniza el catálogo y los estados actuales. Los identificadores
+permanecen estables al cambiar de flujo; la nueva sesión en directo toma el
+control de los sensores que selecciona. Estas entidades se excluyen de las
+entradas del puente para impedir realimentación.
+
+Los atributos incluyen sensor y valor de origen, fecha de la lectura, fecha de
+evaluación, flujo, ejecución, hash de configuración, cobertura y cantidad de
+filtros utilizados. La confianza sigue siendo un índice operativo sin calibrar.
+Home Assistant gestiona `last_changed` cuando cambia el estado; `evaluated_at`
+identifica cada lectura procesada, aunque conserve el mismo porcentaje.
+
+**Paranoid-Confianza** usa tarjetas nativas `entities` y `history-graph`, con las
+últimas 24 horas y el eje fijado entre 0 % y 100 %. Requiere Recorder e History
+activos y que estos sensores estén incluidos en su configuración de grabación.
+El panel se administra desde la integración. También se pueden añadir los
+sensores a un dashboard propio o utilizarlos en condiciones numéricas de las
+automatizaciones. Ejemplo de tarjeta nativa:
+
+```yaml
+type: history-graph
+title: Confianza de temperatura
+entities:
+  - sensor.confianza_sensor_temperatura
+hours_to_show: 24
+min_y_axis: 0
+max_y_axis: 100
+fit_y_data: false
+```
+
+Recorder registra la hora de publicación en Home Assistant. La fecha original
+de la lectura permanece en `source_timestamp`; los intervalos desconectados no
+se rellenan retrospectivamente en Recorder. Su retención depende de la
+configuración de Home Assistant.
+
+Las evaluaciones CSV con ground truth publican en el grupo **Test** de
+**Paranoid-Confianza**. Para una lectura de `sensor.x`, el identificador lógico
+es `confianza.test_sensor_x` y la entidad nativa es `sensor.confianza_test_sensor_x`.
+Cada evaluación reutiliza la entidad del sensor y publica sus lecturas mientras
+procesa el archivo. Al cerrar la evaluación, la entidad queda `unavailable` y
+Recorder conserva su historial. El atributo `source_mode` vale `test` y
+`source_timestamp` conserva la hora original del CSV. Si Home Assistant está
+desconectado, la evaluación sigue disponible en Paranoid.
+
+En **Resultados → Confianza**, elegir un sensor permite ver su gráfico de 0 a
+100 %, con huecos para lecturas no evaluables y páginas de 1000 lecturas. La
+misma pestaña está disponible al guardar una sesión en directo. Los archivos
+nuevos incluyen un índice escalar para consultar el gráfico sin descomprimir
+las evidencias completas. Los archivos anteriores siguen siendo legibles y
+no reciben valores de confianza inventados.
+
+`GET /confidence/entities` consulta el catálogo actual y
+`GET /flow-runs/{run_id}/confidence` consulta una serie guardada, con parámetros
+`entity_id` (sensor de origen), `offset` y `limit` (hasta 5000). Las pruebas del
+catálogo, persistencia y puente se encuentran en
+`tests/backend/test_home_assistant_confidence.py`; las entidades y tarjetas
+nativas se prueban con Home Assistant real en `tests/home_assistant/`, y el
+gráfico por ejecución en `tests/frontend/confidence-history.test.js`.
 
 Las evaluaciones nuevas escriben un archivo incremental con formato
 `flow-flyweight-v1`. Cada lectura comparte su identidad y un conjunto de

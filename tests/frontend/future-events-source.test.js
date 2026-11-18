@@ -61,7 +61,7 @@ test("restored live reception displays results and keeps stop enabled while the 
     view = await renderInteractive(Source, { apiBaseUrl: "/api", busy: true, canRun: true,
       job: { mode: "home_assistant", status: "running", processed: 4, connection: { status: "connected", received: 5 },
         recent_results: [
-          { observation_id: "one", entity_id: "sensor.temperature", timestamp: "2026-01-01T01:00:00Z", final_decision: "suspicion" },
+          { observation_id: "one", entity_id: "sensor.temperature", timestamp: "2026-01-01T01:00:00Z", final_decision: "suspicion", confidence: .93 },
           { observation_id: "two", entity_id: "sensor.humidity", timestamp: "2026-01-01T01:01:00Z", final_decision: "fault_compatible",
             evidence: [{ status: "compatible", data: { fault_type: "drift", fault_type_status: "identified" } }] },
           { observation_id: "three", entity_id: "sensor.pressure", timestamp: "2026-01-01T01:02:00Z", final_decision: "fault_compatible" },
@@ -70,6 +70,8 @@ test("restored live reception displays results and keeps stop enabled while the 
       onStopLive: () => { stopped = true; } });
     assert.match(view.container.textContent, /5 recibidos · 4 evaluados/);
     assert.match(view.container.textContent, /sensor.temperature/);
+    assert.match(view.container.textContent, /93\s*%/);
+    assert.match(view.container.textContent, /No evaluable/);
     assert.equal(view.container.querySelectorAll(".fl-output-alert").length, 0);
     assert.match(view.container.textContent, /Compatible con falla/);
     assert.equal(view.container.querySelector('input[type="password"]'), null);

@@ -35,6 +35,14 @@ from app.services.reproduccion import MotorReproduccionValidacion
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_IDENTITY_KEYS = {"run_id", "diagnosis_id", "execution_id"}
+# These fields describe execution, not detector behavior. Older reference runs
+# lack them, and new runs have different measured durations and call identities.
+EXECUTION_METADATA_KEYS = {"execution_trace", "flow_id", "config_hash", "latency_scope",
+                           "latency_group_id", "latency_group_size"}
+# Detector replay comparisons also support references saved before confidence
+# existed. Compare detector outputs, while still checking annotation references.
+CONFIDENCE_ANNOTATION_KEYS = {"confidence", "confidence_kind", "confidence_calibrated",
+                              "evidence_coverage", "confidence_fusion"}
 
 
 def _read_json(path):
@@ -51,15 +59,27 @@ def _reference_connection(path):
 def _clean(value):
     """Normalize operational IDs, validating every retained evidence reference."""
     identifiers, executions = {}, set()
-    for entry in value.get("evidence", []):
-        identifier = entry.get("evidence_id")
-        if identifier:
-            canonical = f"{entry.get('observation_id')}:{entry['node_id']}"
-            if identifier in identifiers:
-                raise AssertionError(f"Evidencia duplicada: {identifier}")
-            identifiers[identifier] = canonical
-        if entry.get("execution_id"):
-            executions.add(entry["execution_id"])
+    collections = [value.get("evidence", []), (value.get("execution_trace") or {}).get("evidence", [])]
+    for collection in collections:
+        seen = set()
+        for entry in collection:
+            identifier = entry.get("evidence_id")
+            if identifier:
+                canonical = f"{entry.get('observation_id')}:{entry['node_id']}"
+                if identifier in seen or (identifier in identifiers and identifiers[identifier] != canonical):
+                    raise AssertionError(f"Evidencia duplicada: {identifier}")
+                seen.add(identifier)
+                identifiers[identifier] = canonical
+            if entry.get("execution_id"):
+                executions.add(entry["execution_id"])
+    for record in ((value.get("execution_trace") or {}).get("filters") or {}).values():
+        for identifier in record.get("evidence_ids", []) + record.get("input_evidence_ids", []):
+            if identifier not in identifiers:
+                raise AssertionError(f"Referencia de evidencia ausente: {identifier}")
+    for record in ((value.get("confidence_fusion") or {}).get("contributions") or {}).values():
+        for identifier in record.get("evidence_ids", []):
+            if identifier not in identifiers:
+                raise AssertionError(f"Referencia de evidencia ausente: {identifier}")
 
     def normalize(item, field=None):
         if isinstance(item, dict):
@@ -76,7 +96,9 @@ def _clean(value):
                 item = item.replace(execution, "<execution>")
         return item
     # El tiempo por lectura depende de la variante que se está midiendo.
-    return normalize({key: item for key, item in value.items() if key != "latency_ms"})
+    return normalize({key: item for key, item in value.items()
+                      if key != "latency_ms" and key not in EXECUTION_METADATA_KEYS
+                      and key not in CONFIDENCE_ANNOTATION_KEYS})
 
 
 def chronological_prefix(future, limit):

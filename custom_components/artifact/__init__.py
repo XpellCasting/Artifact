@@ -10,8 +10,9 @@ from .coordinator import ArtifactCoordinator
 from .api import InvalidArtifactResponse
 from .bridge import ArtifactBridge
 from .panel import async_remove_panels, async_setup_panels
+from .confidence_dashboard import async_remove_confidence_dashboard, async_setup_confidence_dashboard
 
-PLATFORMS = [Platform.BINARY_SENSOR]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -28,9 +29,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady("Unable to establish the Paranoid bridge") from err
     try:
         await async_setup_panels(hass, entry)
+        async_setup_confidence_dashboard(hass, entry, coordinator.bridge.confidence)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except BaseException:
         async_remove_panels(hass, entry)
+        async_remove_confidence_dashboard(hass, entry)
         await coordinator.bridge.async_close()
         raise
     return True
@@ -41,5 +44,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         async_remove_panels(hass, entry)
+        async_remove_confidence_dashboard(hass, entry)
         await entry.runtime_data.bridge.async_close()
     return unloaded

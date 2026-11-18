@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -99,8 +100,9 @@ class StreamingFlowTests(unittest.TestCase):
         ])
         truth = [{"raw_index": i, "entity": "sensor.a", "tipo": "normal", "synthetic": "false",
                   "fault_type": None} for i in range(3)]
-        return CausalFlowRunner(None, None, None).evaluate(
-            self._flow(), development, future, pd.DataFrame(), {}, {}, truth=truth, result_sink=sink)
+        with patch("app.flow.evaluacion.uuid4", return_value=Mock(hex="streaming-fixture")):
+            return CausalFlowRunner(None, None, None).evaluate(
+                self._flow(), development, future, pd.DataFrame(), {}, {}, truth=truth, result_sink=sink)
 
     def test_streamed_outputs_and_reports_match_compatibility_return(self):
         regular_summary, regular_outputs, regular_snapshot = self._run()

@@ -21,6 +21,8 @@ from app.flow.process_usage import ProcessUsage
 from app.flow.result_spool import FlowResultSpool
 from app.flow.definitions import _time
 from app.flow.definitions import observation_valid
+from app.flow.execution import execution_context
+from app.flow.confidence import confidence_policy
 from app.services.reproduccion import MotorReproduccionValidacion
 from app.modulos.clasificador.disponibilidad import CLASSIFIER_MODEL_REQUIRED
 
@@ -181,6 +183,8 @@ class CausalFlowRunner(FlowRunner):
         if not future.empty and future["timestamp_dt"].min() < development["timestamp_dt"].max():
             raise ValueError("Los eventos de evaluación deben ser posteriores al histórico de Desarrollo.")
         self.execution_id = uuid4().hex
+        self._trace_group_sequence = 0
+        compiled["execution_context"] = execution_context(flow, self.execution_id)
         self.context_states = {}
         self.diagnostic_sessions = {}
         if progress:
@@ -357,23 +361,34 @@ class CausalFlowRunner(FlowRunner):
                     contextual_index_update_ms += (perf_counter() - context_started) * 1000
                 history_maintenance_ms += (perf_counter() - batch_started) * 1000
                 statistical_started = perf_counter()
+                self._filter_preparation_timings = {}
                 for node in flow["nodes"]:
                     if node["id"] in self.baselines:
                         check_cancellation(cancel_event)
                         method = "residual_focus_v1"
+                        detector_started = perf_counter()
                         self.statistical_results[node["id"]] = motor.analizar_lote(batch, self.baselines[node["id"]], node.get("config", {}).get("suspicion_threshold", .6), continuous_method=method)
+                        self._filter_preparation_timings[node["id"]] = {
+                            "duration_ms": round((perf_counter() - detector_started) * 1000, 6),
+                            "timing_scope": "timestamp_group", "observation_count": len(batch),
+                            "timestamp": _time(batch["timestamp_dt"].iloc[0]),
+                        }
                 statistical_preparation_ms += (perf_counter() - statistical_started) * 1000
                 graph_started = perf_counter()
                 run_events = available if available is not None else batch
                 summary, batch_outputs, _ = self.run(
                     flow, run_events, entities, context_map, candidate_events=batch, source_id=source_id,
-                    compiled=compiled, events_sorted=True, include_snapshot=False, check_cancelled=check_cancelled)
+                    compiled=compiled, events_sorted=True, include_snapshot=False, check_cancelled=check_cancelled,
+                    execution_id=self.execution_id)
                 check_cancellation(cancel_event)
                 output_ready = perf_counter()
                 graph_execution_ms += (output_ready - graph_started) * 1000
                 latency_ms = round((output_ready - batch_started) * 1000, 6)
                 for item in batch_outputs.get("output", []):
                     item["latency_ms"] = latency_ms
+                    item["latency_scope"] = "timestamp_group"
+                    item["latency_group_id"] = f"{self.execution_id}:timestamp:{_time(batch['timestamp_dt'].iloc[0])}"
+                    item["latency_group_size"] = len(batch)
                 if result_sink is None:
                     for node_id, items in batch_outputs.items():
                         outputs[node_id].extend(items)
@@ -495,6 +510,9 @@ class CausalFlowRunner(FlowRunner):
         run_baseline_id = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
         performance["counts"]["diagnostic_sessions"] = {node_id: session.stats for node_id, session in self.diagnostic_sessions.items()}
         snapshot = {"flow": deepcopy(flow), "execution_mode": "causal_live" if batch_source is not None else "causal_future", "statistical_evaluation_version": "pre_suppression_v1", "source": {"rows": processed, "fingerprint": source_id, "sample_start": _time(sample_start) if sample_start is not None else None, "sample_end": _time(sample_end) if sample_end is not None else None}, "development_end": _time(development["timestamp_dt"].max()), "context_map_version": context_map.get("map_version"), "baseline_version": baseline.get("version"), "baseline_id": run_baseline_id, "baseline_provenance": {**(provenance or {}), "continuous_models": continuous_models}, "diagnostic_snapshots": diagnostic_snapshots}
+        if "execution_context" in compiled:
+            snapshot["execution_context"] = deepcopy(compiled["execution_context"])
+        snapshot["confidence_policy"] = confidence_policy()
         if context_source is not None:
             reception = context_source.status(advance=False)
             snapshot["source"]["context_replay"] = reception
@@ -556,15 +574,22 @@ class CausalFlowRunner(FlowRunner):
 
 class FlowEvaluationJobs:
     """Run outside HTTP requests; completed results persist in FlowStore."""
-    def __init__(self, store):
+    def __init__(self, store, *, confidence_store=None, confidence_publish=None):
         self.store = store
+        self.confidence_store = confidence_store
+        self.confidence_publish = confidence_publish
         self.jobs = {}
         self.sources = {}
         self.context_sources = {}
         self.cancel_events = {}
         self.lock = Lock()
 
-    def start(self, flow_id, evaluate, live_source=None, flow=None, context_source=None, cancel_event=None):
+    def start(self, flow_id, evaluate, live_source=None, flow=None, context_source=None, cancel_event=None,
+              *, test_sources=None):
+        confidence_sources = test_sources
+        if self.confidence_store is not None and live_source is not None:
+            confidence_sources = live_source.selected
+        publish_states = self.confidence_store is not None and confidence_sources is not None
         with self.lock:
             if any(job["status"] == "running" for job in self.jobs.values()):
                 raise ValueError("Ya hay una evaluación de flujos en curso. Espera a que termine.")
@@ -609,11 +634,24 @@ class FlowEvaluationJobs:
         store_path = getattr(self.store, "path", None)
         spool_directory = Path(store_path).with_suffix(".results") / ".pending" if isinstance(store_path, (str, Path)) else None
         spool = FlowResultSpool(job_id, directory=spool_directory)
+        def publish_confidence(entities):
+            if not entities or self.confidence_publish is None:
+                return
+            try:
+                self.confidence_publish(entities)
+                publication = {"status": "published"}
+            except (ValueError, ConnectionError, TimeoutError) as exc:
+                # Publishing does not invalidate an otherwise valid detector run.
+                publication = {"status": "unavailable", "error": str(exc)}
+            with self.lock:
+                self.jobs[job_id]["confidence_publication"] = publication
         def sink(results):
             check_cancellation(cancel_event)
             spool.write_block(results)
             check_cancellation(cancel_event)
             self.store.record_alerts(job_id, flow_id, results.get("output", []))
+            if publish_states:
+                publish_confidence(self.confidence_store.record(job_id, results.get("output", [])))
             if live_source is not None:
                 with self.lock:
                     job = self.jobs[job_id]
@@ -621,6 +659,9 @@ class FlowEvaluationJobs:
         def work():
             try:
                 check_cancellation(cancel_event)
+                if publish_states:
+                    entities = self.confidence_store.start(job_id, flow_id, confidence_sources, test=live_source is None)
+                    publish_confidence(entities)
                 summary, _, snapshot = evaluate(progress, sink)
                 progress(summary.get("candidate_count", 0), summary.get("candidate_count", 0),
                          "saving", "Guardando resultados por nodo")
@@ -643,6 +684,8 @@ class FlowEvaluationJobs:
             except Exception as exc:
                 logging.getLogger(__name__).exception("Falló la evaluación del flujo %s", flow_id)
                 outcome = {"status": "failed", "error": str(exc)}
+                if getattr(exc, "filter_execution_context", None) is not None:
+                    outcome["filter_execution_context"] = exc.filter_execution_context
             finally:
                 if context_source is not None:
                     with self.lock:
@@ -650,6 +693,12 @@ class FlowEvaluationJobs:
                         self.context_sources.pop(job_id, None)
                 if live_source is not None:
                     live_source.stop()
+                if publish_states:
+                    try:
+                        publish_confidence(self.confidence_store.stop(job_id))
+                    except Exception:
+                        logging.getLogger(__name__).exception("No se pudo cerrar la publicación de confianza")
+                if live_source is not None:
                     with self.lock:
                         connection = live_source.status()
                         if connection["status"] == "stopping":

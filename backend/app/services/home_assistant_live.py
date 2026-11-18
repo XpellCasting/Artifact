@@ -16,7 +16,8 @@ class HomeAssistantEventSource:
         bridge.require_connected()
         self.bridge = bridge
         self.entities = {str(row["entity_id"]): dict(row) for row in entities.to_dict("records")
-                         if row.get("sensor_kind") in {"continuous", "binary", "multistate"}}
+                         if row.get("sensor_kind") in {"continuous", "binary", "multistate"}
+                         and not str(row["entity_id"]).startswith("sensor.confianza_")}
         selected = set(entity_ids) or set(self.entities)
         if not selected or selected - self.entities.keys():
             raise ValueError("Selecciona entidades que estén presentes en el historial de referencia.")

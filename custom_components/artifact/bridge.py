@@ -17,6 +17,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import InvalidArtifactResponse
 from .const import CONF_BRIDGE_TOKEN
+from .confidence import ConfidenceHub
 
 _LOGGER = logging.getLogger(__name__)
 DOMAINS = {"sensor", "binary_sensor", "switch", "input_boolean", "select", "input_select"}
@@ -28,6 +29,7 @@ class ArtifactBridge:
         self.task = None
         self.token = entry.data.get(CONF_BRIDGE_TOKEN) or secrets.token_urlsafe(32)
         self.unsubscribers = {}
+        self.confidence = ConfidenceHub()
 
     async def async_start(self):
         """Provision a private, scoped link without creating a Home Assistant token."""
@@ -38,6 +40,7 @@ class ArtifactBridge:
         self.task = self.entry.async_create_background_task(self.hass, self._run(), "Paranoid bridge")
 
     async def async_close(self):
+        self.confidence.set_connected(False)
         if self.task is not None:
             self.task.cancel()
             with suppress(asyncio.CancelledError):
@@ -58,6 +61,7 @@ class ArtifactBridge:
                 if not await self.client.async_register_bridge(self.entry.entry_id, self.token):
                     raise InvalidArtifactResponse("The Paranoid server does not support the bridge")
                 async with self.client.bridge_socket(self.token) as socket:
+                    self.confidence.set_connected(True)
                     queue = asyncio.Queue(maxsize=5000)
                     delay = 1
 
@@ -84,6 +88,7 @@ class ArtifactBridge:
             except (ClientError, TimeoutError, ValueError, InvalidArtifactResponse):
                 _LOGGER.debug("Paranoid bridge disconnected; retrying")
             finally:
+                self.confidence.set_connected(False)
                 self._clear_subscriptions()
                 if writer is not None:
                     writer.cancel()
@@ -101,8 +106,11 @@ class ArtifactBridge:
         arguments = message.get("arguments") or {}
         try:
             result = []
-            if operation == "states":
-                rows = [state.as_dict() for state in self.hass.states.async_all() if state.domain in DOMAINS]
+            if operation in {"confidence_sync", "confidence_update"}:
+                self.confidence.apply(arguments, sync=operation == "confidence_sync")
+            elif operation == "states":
+                rows = [state.as_dict() for state in self.hass.states.async_all()
+                        if state.domain in DOMAINS and not state.attributes.get("paranoid_confidence")]
                 for index in range(0, len(rows), 500):
                     await queue.put({"type": "result_chunk", "request_id": identifier, "items": rows[index:index + 500]})
             elif operation == "entity_catalog":
@@ -156,7 +164,8 @@ class ArtifactBridge:
 
     def _entity_catalog(self):
         """Resolve entity overrides and device inheritance once, without per-sensor I/O."""
-        rows = [dict(state.as_dict()) for state in self.hass.states.async_all() if state.domain in DOMAINS]
+        rows = [dict(state.as_dict()) for state in self.hass.states.async_all()
+                if state.domain in DOMAINS and not state.attributes.get("paranoid_confidence")]
         try:
             from homeassistant.helpers import area_registry, device_registry, entity_registry
             entities = entity_registry.async_get(self.hass).entities

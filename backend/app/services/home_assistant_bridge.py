@@ -7,6 +7,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 import hashlib
 import hmac
 import json
+import logging
 from pathlib import Path
 from queue import Empty, Full, Queue
 import re
@@ -24,8 +25,9 @@ class BridgeOperationUnsupported(BridgeUnavailable):
 
 
 class BridgeConnection:
-    def __init__(self, socket):
+    def __init__(self, socket, *, supports_test_confidence=False):
         self.socket = socket
+        self.supports_test_confidence = supports_test_confidence
         self.loop = asyncio.get_running_loop()
         self.pending = {}
         self.subscriptions = {}
@@ -110,6 +112,7 @@ class HomeAssistantBridge:
         self.lock = Lock()
         self.connection = None
         self.registration = None
+        self.confidence_provider = None
         if self.path.exists():
             # A damaged registration must not reopen automatic pairing.
             self.registration = json.loads(self.path.read_text(encoding="utf-8"))
@@ -143,21 +146,60 @@ class HomeAssistantBridge:
             return {"bridge_configured": self.registration is not None,
                     "bridge_connected": bool(self.connection and self.connection.connected)}
 
-    async def attach(self, socket):
-        connection = BridgeConnection(socket)
+    async def attach(self, socket, *, supports_test_confidence=False):
+        connection = BridgeConnection(socket, supports_test_confidence=supports_test_confidence)
         with self.lock:
             previous, self.connection = self.connection, connection
         if previous is not None:
             previous.disconnect()
             with suppress(RuntimeError):
                 await previous.socket.close(code=1001)
+        if self.confidence_provider is not None:
+            connection.confidence_sync_task = asyncio.create_task(self._sync_confidence(connection))
         return connection
 
     def detach(self, connection):
+        if task := getattr(connection, "confidence_sync_task", None):
+            task.cancel()
         connection.disconnect()
         with self.lock:
             if self.connection is connection:
                 self.connection = None
+
+    def set_confidence_provider(self, provider):
+        self.confidence_provider = provider
+
+    async def _sync_confidence(self, connection):
+        try:
+            snapshot = await asyncio.to_thread(self.confidence_provider)
+            entities = snapshot["entities"]
+            if not connection.supports_test_confidence:
+                entities = [item for item in entities if item.get("source_mode") != "test"]
+            for offset in range(0, max(1, len(entities)), 500):
+                await connection.request("confidence_sync", {
+                    **{key: value for key, value in snapshot.items() if key != "entities"},
+                    "entities": entities[offset:offset + 500], "reset": offset == 0,
+                    "complete": offset + 500 >= len(entities),
+                })
+        except (BridgeUnavailable, ConnectionError, TimeoutError):
+            logging.getLogger(__name__).debug("Confidence entities could not be synchronized")
+
+    def publish_confidence(self, entities):
+        if not entities:
+            return
+        connection = self._connection()
+        if not connection.supports_test_confidence and any(item.get("source_mode") == "test" for item in entities):
+            raise BridgeOperationUnsupported("Actualiza la integración Paranoid para publicar los sensores de confianza test.")
+        for offset in range(0, len(entities), 500):
+            try:
+                self._wait(connection, connection.request("confidence_update", {
+                    "schema_version": "confidence-entities-v1", "store_id": entities[0]["store_id"],
+                    "entities": entities[offset:offset + 500],
+                }), timeout=10)
+            except BridgeUnavailable:
+                raise
+            except Exception as exc:
+                raise BridgeUnavailable("No se pudo publicar la confianza en Home Assistant.") from exc
 
     def _connection(self):
         with self.lock:

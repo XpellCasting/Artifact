@@ -3,10 +3,11 @@ import Tab from "@mui/material/Tab";
 import Tabs from "@mui/material/Tabs";
 import { request } from "../../shared/api.js";
 import { DECISIONS, NODE_LABELS, labelNode } from "./flow-lab-model.js";
+const ConfidenceHistory = lazy(() => import("./FlowConfidenceHistory.jsx"));
 
 const TABS = [
   ["summary", "Resumen"], ["diagnosis", "Diagnóstico"], ["matrix", "Matriz de confusión"],
-  ["detection", "Detección"], ["timings", "Tiempos"], ["detail", "Detalle"],
+  ["detection", "Detección"], ["timings", "Tiempos"], ["confidence", "Confianza"], ["detail", "Detalle"],
 ];
 const CLASS_LABELS = { normal: "Normal", anomalia: "Anomalía ambiental", Falla: "Falla de sensor" };
 const CLASSES = Object.keys(CLASS_LABELS);
@@ -291,7 +292,7 @@ export default function FlowRunResults({ apiBaseUrl, run, activeTab, onTabChange
   const [mode, setMode] = useState("count");
   const [sensor, setSensor] = useState("");
   useEffect(() => {
-    if (activeTab !== "detail") setRequested(true);
+    if (!["detail", "confidence"].includes(activeTab)) setRequested(true);
   }, [activeTab]);
   useEffect(() => {
     if (!requested) return;
@@ -322,7 +323,9 @@ export default function FlowRunResults({ apiBaseUrl, run, activeTab, onTabChange
     </Tabs>
     {TABS.map(([key]) => <div key={key} className="fl-run-panel" role="tabpanel"
       id={`${id}-panel-${key}`} aria-labelledby={`${id}-tab-${key}`} hidden={key !== activeTab} tabIndex={0}>
-      {key === "detail" ? children : key === activeTab && (
+      {key === "detail" ? children : key === "confidence" && key === activeTab ?
+        <Suspense fallback={<p role="status">Cargando historial de confianza…</p>}><ConfidenceHistory apiBaseUrl={apiBaseUrl} run={run} /></Suspense>
+        : key === activeTab && (
         !response ? <p role="status" className="fl-muted">Cargando métricas…</p>
           : response.error ? <div className="fl-notice fl-error" role="alert">
             <span>{response.error}</span>

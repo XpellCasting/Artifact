@@ -9,6 +9,7 @@ from app.modulos.contextual import FiltroContextualEspacioTemporal
 from app.modulos.estadistico.filtro import FiltroEstadistico
 from app.services.diagnostico import DiagnosticWorkbench
 from app.database.flows import FlowStore
+from app.database.confidence_entities import ConfidenceEntityStore
 from app.flow.evaluacion import FlowEvaluationJobs
 from app.services.aplicacion import EstadoAplicacion
 from app.config import ARTIFACT_ROOT
@@ -45,8 +46,11 @@ state = EstadoAplicacion(
     diagnostic_workbench=DiagnosticWorkbench(REVIEW_DATA_DIRECTORY),
 )
 flow_store = FlowStore(Path(setting('FLOW_LAB_DB_PATH')))
-flow_evaluation_jobs = FlowEvaluationJobs(flow_store)
 home_assistant_bridge = HomeAssistantBridge(STORAGE_DIR / "home_assistant_bridge.json")
+confidence_entities = ConfidenceEntityStore(flow_store.path)
+home_assistant_bridge.set_confidence_provider(confidence_entities.snapshot)
+flow_evaluation_jobs = FlowEvaluationJobs(flow_store, confidence_store=confidence_entities,
+                                         confidence_publish=home_assistant_bridge.publish_confidence)
 history_candidates = HistoryCandidates(STORAGE_DIR / "history_candidates")
 
 

@@ -5,10 +5,13 @@ from dataclasses import dataclass
 import hashlib
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 import pandas as pd
 from app.flow.definitions import _clean, _now, _observation_key, _time, observation_valid, validate_flow
 from app.nodos.handlers import NodeHandlers
 from app.flow.definitions import SIGNALS
+from app.flow.execution import FILTER_TYPES, FilterExecutionTrace, execution_context
+from app.flow.confidence import annotate_confidence, confidence_policy
 
 @dataclass
 class FlowRunner(NodeHandlers):
@@ -29,7 +32,7 @@ class FlowRunner(NodeHandlers):
         return {"checked": checked, "nodes": nodes, "edges_from": edges_from, "edges_to": edges_to,
                 "input_id": next(node_id for node_id, node in nodes.items() if node["type"] == "input")}
 
-    def run(self, flow: dict[str, Any], events: pd.DataFrame, entities: pd.DataFrame, context_map: dict[str, Any], candidate_limit: int = 1000, *, candidate_events=None, source_id=None, compiled=None, events_sorted=False, include_snapshot=True, check_cancelled=None) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    def run(self, flow: dict[str, Any], events: pd.DataFrame, entities: pd.DataFrame, context_map: dict[str, Any], candidate_limit: int = 1000, *, candidate_events=None, source_id=None, compiled=None, events_sorted=False, include_snapshot=True, check_cancelled=None, execution_id=None) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, Any]]:
         compiled = compiled or self.compile(flow)
         checked = compiled["checked"]
         if events is None or events.empty:
@@ -56,6 +59,42 @@ class FlowRunner(NodeHandlers):
             }))
         nodes, edges_from, edges_to = compiled["nodes"], compiled["edges_from"], compiled["edges_to"]
         self._evidence_nodes = nodes
+        self.execution_id = execution_id or uuid4().hex
+        context = compiled.get("execution_context")
+        if context is None or context["execution_id"] != self.execution_id:
+            context = execution_context(flow, self.execution_id)
+            compiled["execution_context"] = context
+        if execution_id is None:
+            self._trace_group_sequence = 0
+        trace = FilterExecutionTrace(nodes, candidates, context, getattr(self, "_trace_group_sequence", 0))
+
+        def execute_filter(node, incoming, history):
+            if not incoming:
+                return []
+            node_id = node["id"]
+            group_id = trace.start(node_id, incoming)
+            call_started = perf_counter()
+            try:
+                if node["type"] == "statistical_focus":
+                    produced = self._statistical(node_id, incoming, history, entities, node.get("config", {}))
+                elif node["type"] == "contextual":
+                    produced = self._contextual(node_id, incoming, history, entities, context_map)
+                else:
+                    produced = self._classifier(node_id, incoming, history)
+            except Exception as exc:
+                trace.failed(node_id, group_id, round((perf_counter() - call_started) * 1000, 6), exc)
+                # Keep the original exception/fail-fast behavior. Failed jobs can
+                # expose a bounded diagnostic sample instead of losing the trace.
+                exc.filter_execution_context = {
+                    **context, "failed_filter": node_id, "observation_count": len(incoming),
+                    "truncated": len(incoming) > 20,
+                    "observations": [trace.finish(deepcopy(item), aborted=True) for item in incoming[:20]],
+                }
+                raise
+            preparation = getattr(self, "_filter_preparation_timings", {}).get(node_id)
+            trace.complete(node_id, incoming, produced, group_id,
+                           round((perf_counter() - call_started) * 1000, 6), preparation)
+            return produced
         delivered: dict[str, list[dict[str, Any]]] = defaultdict(list)
         outputs: dict[str, list[dict[str, Any]]] = {}
         input_id = compiled["input_id"]
@@ -72,7 +111,7 @@ class FlowRunner(NodeHandlers):
                 produced = incoming
             elif node.get("config", {}).get("enabled") is False:
                 produced = [self._with_evidence(item, node_id, item.get("signal", "unknown"), "omitted", {}) for item in incoming]
-            elif node["type"] in {"statistical_focus", "contextual", "classifier"} and node.get("config", {}).get("evidence_policy", "legacy") != "legacy":
+            elif node["type"] in FILTER_TYPES and node.get("config", {}).get("evidence_policy", "legacy") != "legacy":
                 produced = []
                 groups = defaultdict(list)
                 for item in incoming:
@@ -80,18 +119,9 @@ class FlowRunner(NodeHandlers):
                 for timestamp in sorted(groups):
                     candidates_at = groups[timestamp]
                     history = ordered[ordered["timestamp_dt"] <= pd.Timestamp(timestamp)]
-                    if node["type"] == "statistical_focus":
-                        produced.extend(self._statistical(node_id, candidates_at, history, entities, node.get("config", {})))
-                    elif node["type"] == "contextual":
-                        produced.extend(self._contextual(node_id, candidates_at, history, entities, context_map))
-                    else:
-                        produced.extend(self._classifier(node_id, candidates_at, history))
-            elif node["type"] in {"statistical_focus"}:
-                produced = self._statistical(node_id, incoming, ordered, entities, node.get("config", {}))
-            elif node["type"] == "contextual":
-                produced = self._contextual(node_id, incoming, ordered, entities, context_map)
-            elif node["type"] == "classifier":
-                produced = self._classifier(node_id, incoming, ordered)
+                    produced.extend(execute_filter(node, candidates_at, history))
+            elif node["type"] in FILTER_TYPES:
+                produced = execute_filter(node, incoming, ordered)
             elif node["type"] == "merge":
                 produced = self._merge(node_id, incoming, {**node.get("config", {}), "expected_inputs": len(edges_to[node_id])})
             elif node["type"] == "decision":
@@ -116,10 +146,15 @@ class FlowRunner(NodeHandlers):
                 final.append({**deepcopy(last), "final_decision": "not_routed"})
         for item in final:
             item.setdefault("final_decision", self._final_decision(item))
+            trace.finish(item)
+            annotate_confidence(item)
+        self._trace_group_sequence = trace.next_group
         outputs["output"] = final
         counts = Counter(item.get("final_decision") for item in final)
         summary = {"candidate_count": len(candidates), "output_count": len(final), "by_final_decision": dict(counts), "node_counts": {key: len(value) for key, value in outputs.items()}, "node_timings_ms": node_timings, "elapsed_ms": round((perf_counter() - started) * 1000, 3)}
-        snapshot = {"flow": deepcopy(flow), "execution_mode": "retrospective", "candidate_limit": limit, "source": {"rows": len(events), "sample": "latest_chronological_rows", "sample_rows": len(sample), "sample_start": _time(sample["timestamp_dt"].min()), "sample_end": _time(sample["timestamp_dt"].max()), "fingerprint": source_hash}, "context_map_version": context_map.get("map_version"), "created_at": _now()} if include_snapshot else {}
+        snapshot = {"flow": deepcopy(flow), "execution_context": deepcopy(context), "execution_mode": "retrospective", "candidate_limit": limit, "source": {"rows": len(events), "sample": "latest_chronological_rows", "sample_rows": len(sample), "sample_start": _time(sample["timestamp_dt"].min()), "sample_end": _time(sample["timestamp_dt"].max()), "fingerprint": source_hash}, "context_map_version": context_map.get("map_version"), "created_at": _now()} if include_snapshot else {}
+        if include_snapshot:
+            snapshot["confidence_policy"] = confidence_policy()
         return summary, outputs, snapshot
 
 

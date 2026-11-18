@@ -60,9 +60,11 @@ class CsvFlowRequirementTests(unittest.TestCase):
 
     def test_labelled_csv_starts_and_live_reception_requires_no_csv(self):
         self.runtime.state.validation_replay_state["labelled"] = True
+        self.runtime.state.eventos_validacion_ordenados = pd.DataFrame({"entity_id": ["sensor.x", "sensor.y", "sensor.x"]})
         with patch.object(self.api_module.labelled_evaluation, "read_truth", return_value=[{"raw_index": 0}]):
             response = self.client.post("/flows/flow/runs", json={})
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(list(self.runtime.flow_evaluation_jobs.start.call_args.kwargs["test_sources"]), ["sensor.x", "sensor.y"])
         self.runtime.state.validation_replay_state = {}
         self.runtime.state.eventos_validacion_ordenados = None
         with patch.object(self.api_module, "HomeAssistantEventSource") as source:
@@ -85,6 +87,7 @@ class CsvFlowRequirementTests(unittest.TestCase):
                                         headers={"X-Filename": "eventos%20de%20contexto.csv"})
             self.assertEqual(response.status_code, 200, response.text)
             call = self.runtime.flow_evaluation_jobs.start.call_args
+            self.assertEqual(list(call.kwargs["test_sources"]), ["sensor.a"])
             source = call.kwargs["context_source"]
             self.assertEqual(source.status()["filename"], "eventos de contexto.csv")
             self.assertEqual(source.status()["total"], 1)

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { AlertTriangle, FileSpreadsheet, House, Loader2, Play, Radio, Square } from "lucide-react";
 import { homeAssistantConnectionLabel, useHomeAssistantConnection } from "../history/use-home-assistant-connection.js";
 import { DECISIONS } from "./flow-lab-model.js";
+import { confidencePercent } from "./confidence-history-model.js";
 
 export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload = canRun, dirty, job, error, replay, upload, contextFile, onContextFile, onLabelledUpload, onEvaluate, onStartLive, onStopLive, stopPending }) {
   const [source, setSource] = useState("csv");
@@ -41,6 +42,7 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
         <p className="fl-hint">Lecturas auxiliares para el filtro contextual durante la evaluación.</p>
       </div>}
       <button className="fl-primary" type="button" disabled={busy || !canRun || !replay?.loaded || !replay?.labelled} onClick={onEvaluate}><Play size={16} />{busy ? "Evaluando…" : dirty ? "Guardar y evaluar CSV" : "Evaluar CSV"}</button>
+      {replay?.loaded && connected && <p className="fl-hint">Home Assistant recibe la confianza de esta evaluación en entidades <code>sensor.confianza_test_…</code>.</p>}
     </div> : <form className="fl-live-form" onSubmit={start}>
       <p>Recibe los cambios de las entidades del historial de referencia y evalúalos a medida que llegan. La recepción permanece activa aunque no lleguen eventos y reintenta la conexión si se corta. Al detenerla se guarda la ejecución.</p>
       {!live && <fieldset disabled={busy}>
@@ -57,9 +59,10 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
         {job.connection?.last_event_at && <p className="fl-hint">Último evento: {new Date(job.connection.last_event_at).toLocaleString()}</p>}
         {job.connection?.late > 0 && <p className="fl-required">{job.connection.late} eventos llegaron fuera de orden y quedaron fuera de la evaluación.</p>}
         <button type="button" disabled={stopping} onClick={onStopLive}>{stopping ? <Loader2 size={16} /> : <Square size={16} />}{stopping ? "Guardando ejecución…" : "Detener recepción y guardar"}</button>
-        {!!job.recent_results?.length && <div className="fl-table-scroll"><table aria-label="Últimos resultados en directo"><thead><tr><th>Entidad</th><th>Fecha y hora</th><th>Resultado</th></tr></thead><tbody>{job.recent_results.slice(-20).map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{new Date(item.timestamp).toLocaleString()}</td><td>{DECISIONS[item.final_decision] || "Sin conclusión"}</td></tr>)}</tbody></table></div>}
+        {!!job.recent_results?.length && <div className="fl-table-scroll"><table aria-label="Últimos resultados en directo"><thead><tr><th>Entidad</th><th>Fecha y hora</th><th>Resultado</th><th>Confianza</th></tr></thead><tbody>{job.recent_results.slice(-20).map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{new Date(item.timestamp).toLocaleString()}</td><td>{DECISIONS[item.final_decision] || "Sin conclusión"}</td><td>{confidencePercent(item.confidence)}</td></tr>)}</tbody></table></div>}
       </> : <button className="fl-primary" type="submit" disabled={busy || !canRun || !connected}><Radio size={16} />{dirty ? "Guardar e iniciar recepción" : "Iniciar recepción"}</button>}
     </form>}
+    {job?.confidence_publication?.status === "unavailable" && (job.mode === "home_assistant" || connected) && <p className="fl-required" role="status">No se pudo publicar la confianza en Home Assistant. {job.confidence_publication.error}</p>}
     {error && <div className="fl-notice fl-error" role="alert"><AlertTriangle size={18} /><span>{error}</span></div>}
   </div>;
 }

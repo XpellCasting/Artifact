@@ -93,6 +93,7 @@ class ResultArchiveTests(unittest.TestCase):
         block = self.block()
         block["input"][0]["value"] = float("nan")
         block["input"][0]["extra"] = (1, 2)
+        block["input"][0]["execution_trace"] = "legacy opaque metadata"
         block["stat"][0]["value"] = None
         block["output"][0]["evidence"] = "legacy opaque evidence"
         spool = self.spool()

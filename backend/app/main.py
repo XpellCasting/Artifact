@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import CORS_ORIGINS
-from app.services.runtime import state, REVIEW_DATA_DIRECTORY, home_assistant_bridge
+from app.services.runtime import state, REVIEW_DATA_DIRECTORY, home_assistant_bridge, confidence_entities
+from app.api.confidence import create_confidence_router
 from app.api.home_assistant_bridge import create_bridge_router
 from app.api.revision import crear_router_revision
 from app.api.diagnostico import crear_router_diagnostico
@@ -38,6 +39,7 @@ def crear_app():
     api.include_router(contextual_router)
     api.include_router(flows_router)
     api.include_router(create_bridge_router(home_assistant_bridge))
+    api.include_router(create_confidence_router(confidence_entities))
     return api
 
 app = crear_app()

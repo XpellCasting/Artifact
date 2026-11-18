@@ -48,7 +48,8 @@ class FlowProgressTests(unittest.TestCase):
             group += 1
             return result
 
-        with patch.object(runner, "run", side_effect=timed_run):
+        with patch.object(runner, "run", side_effect=timed_run), \
+                patch("app.flow.evaluacion.uuid4", return_value=Mock(hex="progress-fixture")):
             return runner.evaluate(self.flow(), development, future, pd.DataFrame(), {}, {},
                                    truth=truth, progress=progress, result_sink=sink, cancel_event=cancel_event)
 

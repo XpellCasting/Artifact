@@ -51,7 +51,7 @@ test("run tabs load on demand, preserve controls, retry and ignore an obsolete r
     const chooseTab = (label) => view.event(
       [...view.container.querySelectorAll('[role="tab"]')].find((tab) => tab.textContent === label), "click");
     assert.equal(requests.length, 0);
-    assert.equal(view.container.querySelectorAll('[role="tab"]').length, 6);
+    assert.equal(view.container.querySelectorAll('[role="tab"]').length, 7);
     await chooseTab("Resumen");
     assert.match(activePanel().textContent, /Cargando métricas/);
     await view.event(view.container.querySelector("button"), "click");

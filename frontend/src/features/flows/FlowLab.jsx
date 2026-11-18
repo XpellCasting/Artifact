@@ -8,6 +8,7 @@ import "./flow-lab.css";
 import FutureEventsSource from "./FutureEventsSource.jsx";
 import FlowRunResults from "./FlowRunResults.jsx";
 import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
+import { confidencePercent } from "./confidence-history-model.js";
 
 const PRESETS = templates();
 const PAGE_SIZE = 50;
@@ -365,11 +366,11 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
           <span>{resultError}</span><button onClick={() => loadPage(activeRunId, resultNode, page.offset)}>Reintentar</button>
         </div> : <div className="fl-table-scroll">
           <table><thead><tr><th>Entidad</th><th>Fecha y hora UTC</th><th>Resultado</th><th>Etiqueta y detección</th>
-            {resultNode === "output" && <th>Latencia</th>}<th>Evidencia</th>
+            {resultNode === "output" && <><th>Confianza</th><th>Latencia</th></>}<th>Evidencia</th>
           </tr></thead><tbody>{page.items.map((item) => <tr key={item.observation_id}>
             <td>{item.entity_id}</td><td>{item.timestamp}</td><td>{DECISIONS[item.final_decision] || SIGNAL_LABELS[item.signal] || "No evaluable"}</td>
             <td>{item.evaluation ? `${item.evaluation.expected} · ${EVALUATION_LABELS[item.evaluation.outcome]}${item.evaluation.type_identified ? " · Tipo identificado" : ""}` : "—"}</td>
-            {resultNode === "output" && <td>{item.latency_ms == null ? "—" : `${item.latency_ms.toLocaleString(undefined, { maximumFractionDigits: 3 })} ms`}</td>}
+            {resultNode === "output" && <><td>{confidencePercent(item.confidence)}</td><td>{item.latency_ms == null ? "—" : `${item.latency_ms.toLocaleString(undefined, { maximumFractionDigits: 3 })} ms`}</td></>}
             <td><button onClick={() => setSelectedResult(item)}>Ver {item.evidence?.length || 0} etapas</button></td>
           </tr>)}</tbody></table>
           {!resultBusy && !page.items.length && <p className="fl-empty-row">Este nodo no recibió lecturas en la ejecución.</p>}

@@ -23,6 +23,10 @@ from custom_components.artifact.api import ArtifactClient, InvalidArtifactRespon
 from custom_components.artifact.binary_sensor import ArtifactConnection
 from custom_components.artifact.config_flow import ArtifactConfigFlow
 from custom_components.artifact.bridge import ArtifactBridge
+from custom_components.artifact.confidence import ConfidenceHub
+from custom_components.artifact.confidence_dashboard import confidence_panel_path, async_setup_confidence_dashboard, async_remove_confidence_dashboard
+from custom_components.artifact.sensor import ConfidenceSensor, async_setup_entry as setup_confidence_sensors
+from app.database.confidence_entities import ConfidenceEntityStore
 from app.services.home_assistant_bridge import HomeAssistantBridge
 from custom_components.artifact.panel import alerts_panel_path, app_panel_path, async_remove_panels, async_setup_panels
 from homeassistant.components.frontend import DATA_PANELS, DATA_EXTRA_MODULE_URL, UrlManager, async_register_built_in_panel
@@ -64,7 +68,8 @@ async def endpoint(tmp_path) -> AsyncIterator[tuple[str, dict]]:
             raise web.HTTPUnauthorized()
         socket = web.WebSocketResponse()
         await socket.prepare(request)
-        connection = await state["bridge"].attach(socket)
+        connection = await state["bridge"].attach(
+            socket, supports_test_confidence=request.headers.get("X-Paranoid-Confidence-Test") == "1")
         try:
             async for message in socket:
                 if message.type == web.WSMsgType.TEXT:
@@ -99,6 +104,7 @@ async def session():
 async def hass(tmp_path):
     instance = HomeAssistant(str(tmp_path))
     instance.http = SimpleNamespace(async_register_static_paths=AsyncMock())
+    instance.data["lovelace"] = {"dashboards": {}}
     instance.data[DATA_EXTRA_MODULE_URL] = UrlManager(lambda *_: None, [])
     instance.config_entries = SimpleNamespace(
         async_forward_entry_setups=AsyncMock(),
@@ -251,6 +257,7 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     panel = hass.data[DATA_PANELS][alerts_panel_path(entry)]
     assert panel.sidebar_title == "Paranoid-Alertas"
     assert panel.config["url"] == "http://artifact.example:5173/alertas"
+    assert hass.data[DATA_PANELS][confidence_panel_path(entry)].sidebar_title == "Paranoid-Confianza"
     assert any("dashboard-theme.js" in url for url in hass.data[DATA_EXTRA_MODULE_URL].urls)
     sensor = ArtifactConnection(entry.runtime_data, entry)
     assert sensor.available and sensor.is_on
@@ -267,6 +274,7 @@ async def test_setup_link_outage_recovery_and_unload(hass, endpoint, session, mo
     assert await async_unload_entry(hass, entry)
     assert app_panel_path(entry) not in hass.data[DATA_PANELS]
     assert alerts_panel_path(entry) not in hass.data[DATA_PANELS]
+    assert confidence_panel_path(entry) not in hass.data[DATA_PANELS]
     assert not hass.data[DATA_EXTRA_MODULE_URL].urls
     await entry.runtime_data.async_shutdown()
     assert not session.closed
@@ -480,5 +488,156 @@ async def test_bridge_refuses_service_calls_and_unbounded_history(hass, endpoint
             await asyncio.to_thread(bridge.request, "call_service", {})
         with pytest.raises(ValueError, match="intervalo"):
             await asyncio.to_thread(bridge.request, "history", {"start": "2026-01-01T00:00:00Z", "end": "2026-01-05T00:00:00Z", "entity_ids": ["sensor.temperature"]})
+    finally:
+        await integration.async_close()
+
+
+def confidence_payload(value=90, revision=1, source="sensor.temperature", **changes):
+    item = {"entity_id": f"confianza.{source.replace('.', '_')}", "source_entity_id": source,
+            "value": value, "confidence": value / 100 if type(value) in (int, float) else None,
+            "store_id": "store-one", "revision": revision, "available": True,
+            "confidence_kind": "operational_index", "confidence_calibrated": False,
+            "evaluated_at": "2026-11-18T01:00:00+00:00", "flow_id": "flow-one"}
+    item.update(changes)
+    return {"schema_version": "confidence-entities-v1", "store_id": item["store_id"],
+            "revision": revision, "entities": [item], "reset": True, "complete": True}
+
+
+@pytest.mark.asyncio
+async def test_native_confidence_sensor_percentage_unknown_disconnect_and_stable_identity(hass):
+    hub = ConfidenceHub()
+    hub.set_connected(True)
+    hub.apply(confidence_payload(), sync=True)
+    entry = make_entry("http://artifact.example")
+    sensor = ConfidenceSensor(hub, entry, "confianza.sensor_temperature")
+    sensor.hass = hass
+    sensor.async_write_ha_state = Mock()
+    await sensor.async_added_to_hass()
+    assert sensor.entity_id == "sensor.confianza_sensor_temperature"
+    assert sensor.native_unit_of_measurement == "%"
+    assert sensor.state_class == "measurement"
+    assert sensor.native_value == 90
+    assert sensor.available
+    identity = sensor.unique_id
+    hub.apply(confidence_payload(0, 2, flow_id="flow-two"))
+    assert sensor.native_value == 0
+    assert sensor.unique_id == identity
+    assert sensor.extra_state_attributes["flow_id"] == "flow-two"
+    assert sensor.extra_state_attributes["confidence_entity_id"] == "confianza.sensor_temperature"
+    assert sensor.extra_state_attributes["paranoid_confidence"] is True
+    hub.apply(confidence_payload(None, 3))
+    assert sensor.native_value is None and sensor.available
+    hub.set_connected(False)
+    assert not sensor.available
+    hub.set_connected(True)
+    assert not sensor.available  # Wait for the new authoritative snapshot.
+    hub.apply(confidence_payload(100, 4), sync=True)
+    assert sensor.available and sensor.native_value == 100
+    assert sensor.async_write_ha_state.call_count >= 4
+
+
+@pytest.mark.asyncio
+async def test_dynamic_sensor_discovery_only_adds_each_source_once(hass):
+    hub = ConfidenceHub()
+    entry = make_entry("http://artifact.example")
+    entry.runtime_data = SimpleNamespace(bridge=SimpleNamespace(confidence=hub))
+    add = Mock()
+    await setup_confidence_sensors(hass, entry, add)
+    add.assert_not_called()
+    hub.apply(confidence_payload(), sync=True)
+    assert add.call_count == 1
+    hub.apply(confidence_payload(75, 2))
+    assert add.call_count == 1
+    hub.apply(confidence_payload(80, 3, source="binary_sensor.door"))
+    assert add.call_count == 2
+    assert add.call_args.args[0][0].entity_id == "sensor.confianza_binary_sensor_door"
+
+
+@pytest.mark.asyncio
+async def test_confidence_hub_rejects_invalid_states_and_ignores_older_publications(hass):
+    hub = ConfidenceHub()
+    hub.apply(confidence_payload(80, 5), sync=True)
+    hub.apply(confidence_payload(10, 4))
+    assert hub.entities["confianza.sensor_temperature"]["value"] == 80
+    for invalid in (-1, 101, float("nan"), float("inf"), True, "90"):
+        with pytest.raises(ValueError):
+            hub.apply(confidence_payload(invalid, 6))
+    with pytest.raises(ValueError):
+        hub.apply(confidence_payload(source="sensor.confianza_sensor_temperature"))
+    hub.apply(confidence_payload(60, 1, store_id="replacement"), sync=True)
+    assert hub.entities["confianza.sensor_temperature"]["value"] == 60
+
+
+@pytest.mark.asyncio
+async def test_confidence_dashboard_uses_native_graph_bounds_and_preserves_user_dashboards(hass):
+    entry = make_entry("http://artifact.example")
+    hub = ConfidenceHub()
+    user_dashboard = object()
+    path = confidence_panel_path(entry)
+    hass.data["lovelace"]["dashboards"][path] = user_dashboard
+    async_setup_confidence_dashboard(hass, entry, hub)
+    dashboard = hass.data["artifact"]["confidence_dashboards"][entry.entry_id]
+    assert dashboard.url_path != path
+    for index in range(10):
+        hub.register_entity(f"confianza.sensor_s{index}", f"sensor.confianza_sensor_s{index}")
+    hub.apply(confidence_payload(source_mode="test", entity_id="confianza.test_sensor_x", source="sensor.x"))
+    hub.register_entity("confianza.test_sensor_x", "sensor.confianza_test_sensor_x")
+    config = await dashboard.async_load(False)
+    graphs = [card for card in config["views"][0]["cards"] if card["type"] == "history-graph"]
+    assert [len(card["entities"]) for card in graphs] == [8, 2, 1]
+    assert graphs[-1]["entities"] == ["sensor.confianza_test_sensor_x"]
+    assert graphs[-1]["title"].endswith("Test")
+    assert all(card["min_y_axis"] == 0 and card["max_y_axis"] == 100 and card["fit_y_data"] is False for card in graphs)
+    assert dashboard.mode == "yaml"
+    assert await dashboard.async_json(False)
+    async_remove_confidence_dashboard(hass, entry)
+    assert hass.data["lovelace"]["dashboards"][path] is user_dashboard
+    assert dashboard.url_path not in hass.data[DATA_PANELS]
+
+
+@pytest.mark.asyncio
+async def test_bridge_synchronizes_persistent_confidence_and_excludes_feedback(hass, endpoint, session, tmp_path):
+    store = ConfidenceEntityStore(tmp_path / "confidence.sqlite3")
+    store.start("live", "flow", ["sensor.temperature"])
+    endpoint[1]["bridge"].set_confidence_provider(store.snapshot)
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        for _ in range(100):
+            if integration.confidence.synchronized:
+                break
+            await asyncio.sleep(.01)
+        assert integration.confidence.synchronized
+        item = {"entity_id": "sensor.temperature", "observation_id": "one", "execution_id": "execution",
+                "timestamp": "2026-11-18T01:00:00+00:00", "confidence": .93,
+                "confidence_fusion": {"active_filters": 2, "available_filters": 2, "method": "uniform_v1"}}
+        await asyncio.to_thread(bridge.publish_confidence, store.record("live", [item]))
+        assert integration.confidence.entities["confianza.sensor_temperature"]["value"] == 93
+        entry = integration.entry
+        entry.runtime_data = SimpleNamespace(bridge=integration)
+        add = Mock()
+        await setup_confidence_sensors(hass, entry, add)
+        live_sensor = add.call_args.args[0][0]
+        await asyncio.to_thread(bridge.publish_confidence, store.start("test", "flow", ["sensor.temperature"], test=True))
+        test_sensor = add.call_args.args[0][0]
+        assert test_sensor.entity_id == "sensor.confianza_test_sensor_temperature"
+        assert test_sensor.unique_id != live_sensor.unique_id
+        assert test_sensor.extra_state_attributes["source_mode"] == "test"
+        assert test_sensor.native_value is None
+        values = []
+        integration.confidence.listen(lambda: values.append(test_sensor.native_value))
+        readings = [dict(item, observation_id="two", confidence=.55), dict(item, observation_id="three", confidence=.71)]
+        await asyncio.to_thread(bridge.publish_confidence, store.record("test", readings))
+        assert values == [55, 71]
+        assert live_sensor.native_value == 93
+        await asyncio.to_thread(bridge.publish_confidence, store.stop("test"))
+        assert not test_sensor.available
+        assert live_sensor.available
+        hass.states.async_set("sensor.temperature", 24.5)
+        hass.states.async_set("sensor.confianza_sensor_temperature", 93, {"paranoid_confidence": True})
+        hass.states.async_set("sensor.confianza_test_sensor_temperature", 71, {"paranoid_confidence": True})
+        states = await asyncio.to_thread(bridge.request, "states", {})
+        assert {row["entity_id"] for row in states} == {"sensor.temperature"}
+        await asyncio.to_thread(bridge.publish_confidence, store.stop("live"))
+        assert not live_sensor.available
     finally:
         await integration.async_close()

@@ -50,6 +50,30 @@ class CausalBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "ausente"):
             benchmark._clean(item)
 
+    def test_execution_metadata_preserves_older_reference_comparisons_and_validates_trace_links(self):
+        original = self.evidence_result("first")
+        traced = deepcopy(original)
+        traced.update(flow_id="flow", config_hash="configuration", latency_scope="timestamp_group",
+                      latency_group_id="first:timestamp:one", latency_group_size=2)
+        traced["execution_trace"] = {"groups": [{"duration_ms": 10}],
+                                     "evidence": deepcopy(traced["evidence"]),
+                                     "filters": {"a": {"evidence_ids": ["first:evidence"], "input_evidence_ids": []}}}
+        self.assertEqual(benchmark._clean(original), benchmark._clean(traced))
+        traced["execution_trace"]["filters"]["a"]["input_evidence_ids"] = ["missing"]
+        with self.assertRaisesRegex(AssertionError, "ausente"):
+            benchmark._clean(traced)
+
+    def test_confidence_annotations_preserve_detector_comparison_and_validate_used_evidence(self):
+        original = self.evidence_result("first")
+        annotated = deepcopy(original)
+        annotated.update(confidence=.8, confidence_kind="operational_index", confidence_calibrated=False,
+                         evidence_coverage=1., confidence_fusion={"method": "uniform_v1", "contributions": {
+                             "a": {"suspicion_score": .2, "evidence_ids": ["first:evidence"]}}})
+        self.assertEqual(benchmark._clean(original), benchmark._clean(annotated))
+        annotated["confidence_fusion"]["contributions"]["a"]["evidence_ids"] = ["missing"]
+        with self.assertRaisesRegex(AssertionError, "ausente"):
+            benchmark._clean(annotated)
+
     def test_prepared_cache_rejects_another_history_or_altered_parameters(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
