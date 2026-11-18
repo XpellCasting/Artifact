@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import unittest
+import math
 from unittest.mock import patch
 
 import torch
@@ -9,6 +10,7 @@ from app.modulos.clasificador.config import Config
 from app.modulos.clasificador.features import fit_preprocessor
 from app.modulos.clasificador.network_segments import SegmentGATLSTM
 from app.modulos.clasificador.runtime import ClassifierProxy, predict_at
+from app.flow.confidence_change import _window_impacts
 from app.modulos.clasificador.segments import FEATURE_NAMES, fit_spec
 from app.modulos.clasificador.temporal import build_causal_sample
 
@@ -58,6 +60,20 @@ class ClassifierProxyTests(unittest.TestCase):
                                  [row[index] for row in full[field]])
             self.assertEqual(partial["metadata"]["scale_coverage"][entity], full["metadata"]["scale_coverage"][entity])
             self.assertEqual(partial["metadata"]["input_provenance"], full["metadata"]["input_provenance"])
+
+    def test_window_contributions_reconstruct_the_actual_fault_score_and_change(self):
+        a, b = [predict_at(self.snapshot, self.provider, "sensor.a", when.isoformat())
+                for when in (self.target, self.target + timedelta(hours=1))]
+        for reading in (a, b):
+            windows = reading["window_evidence"]["windows"]
+            logits = [bias + sum(w["logits"][i] for w in windows)
+                      for i, bias in enumerate(reading["window_evidence"]["bias"])]
+            expected = math.exp(logits[2]) / sum(math.exp(x) for x in logits)
+            self.assertAlmostEqual(expected, reading["class_scores"]["sensor_fault"], places=6)
+        impacts = _window_impacts(a, b)
+        self.assertEqual(set(impacts), {"3600", "86400", "259200"})
+        self.assertAlmostEqual(sum(impacts.values()),
+            100 * (b["class_scores"]["sensor_fault"] - a["class_scores"]["sensor_fault"]), places=4)
 
     def test_sparse_and_simultaneous_predictions_match_full_sample(self):
         original_prep, original_graph = deepcopy(self.prep), deepcopy(self.graph)

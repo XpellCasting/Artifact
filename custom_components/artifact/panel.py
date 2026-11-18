@@ -12,7 +12,7 @@ from .const import CONF_WEB_URL, DOMAIN
 PANEL_MODULE_URL = "/artifact-static/alerts-panel.js"
 DASHBOARD_THEME_URL = "/artifact-static/dashboard-theme.js"
 CONFIDENCE_CARD_URL = "/artifact-static/confidence-changes.js"
-PANEL_ASSET_VERSION = "0.6.0"
+PANEL_ASSET_VERSION = "0.6.1"
 
 
 def app_panel_path(entry):

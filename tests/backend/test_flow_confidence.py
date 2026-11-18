@@ -235,6 +235,25 @@ class ConfidenceAdapterTests(unittest.TestCase):
 
 
 class ConfidenceIntegrationTests(unittest.TestCase):
+    def test_temporal_context_attributes_only_evaluated_neighbors_in_the_deciding_family(self):
+        item = reading(("contextual",))
+        check = {"status": "evaluated", "ratio": 2., "predictor_value": 18., "expected_value": 20.}
+        item["execution_trace"]["evidence"][0]["data"].update(
+            decision_method="calibrated_max_weighted_family_ratio", available_families=["level"],
+            family_scores={"level": {"status": "available", "score": 2., "evaluated_weight": .5}},
+            evidence=[{"neighbor_id": "sensor.old", "observation_status": "contradicts"},
+                      {"neighbor_id": "sensor.near", "evidence_method": "v5_temporal_feature_models",
+                       "weight": .5, "level_check": check, "observation_status": "supports"}])
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfidenceEntityStore(Path(directory) / "db")
+            store.start("job", "flow", ["sensor.a"])
+            state = store.record("job", [annotate_confidence(item)])[0]
+            facts = state["confidence_change_detail"]["filters"][0]["evidence"]
+            self.assertEqual(facts["decision_family"], "level")
+            self.assertEqual([n["neighbor_id"] for n in facts["neighbors"]], ["sensor.near"])
+            self.assertEqual(facts["neighbors"][0]["decision_term"], 2.)
+            self.assertNotIn("observation_status", facts["neighbors"][0])
+
     def test_published_explanations_for_every_filter_order_in_live_and_csv(self):
         for count in (1, 2, 3):
             for order in permutations(KINDS, count):
@@ -266,6 +285,7 @@ class ConfidenceIntegrationTests(unittest.TestCase):
                         self.assertAlmostEqual(sum(row["impact_pp"] for row in detail["filters"]), detail["delta_pp"], places=4)
                         if "contextual" in order:
                             self.assertIn("sensor.hall", result["confidence_change_reason"])
+                            self.assertIn("valor 1", result["confidence_change_reason"])
                         self.assertEqual(detail["previous_observation_id"], "obs-001")
                         self.assertEqual(store.snapshot()["entities"], [result])
 
@@ -296,6 +316,8 @@ class ConfidenceIntegrationTests(unittest.TestCase):
             self.assertEqual(detail["coverage"], .5)
             filters = {f["node_id"]: f for f in detail["filters"]}
             self.assertEqual(filters["classifier"]["before"], .125)
+            self.assertEqual(filters["classifier"]["previous_evidence"]["class_scores"]["sensor_fault"], .125)
+            self.assertEqual(filters["contextual"]["previous_evidence"]["contradiction_score"], .875)
             self.assertEqual(filters["contextual"]["before"], .875)
             self.assertIsNone(filters["contextual"]["after"])
             self.assertIn("datos insuficientes", c["confidence_change_reason"])

@@ -394,6 +394,19 @@ evidencia completa. Si la lista supera el espacio reservado para Recorder, se
 indica el número total de vecinos. Los cambios de disponibilidad de un filtro
 aparecen en el motivo.
 
+Con la integración 0.6.1, cada filtro muestra su evidencia al abrir un cambio.
+El contextual compara, por entidad relacionada, los valores observados y su
+respaldo o contradicción. En el modelo temporal compara sus comprobaciones
+de nivel, innovación y tendencia. El estadístico muestra los indicadores que
+registró, incluido el valor previsto y la desviación cuando corresponda.
+El clasificador de segmentos descompone el cambio en su puntuación de falla
+entre las tres ventanas temporales del propio sensor. Calcula el aporte medio
+de sustituir cada representación anterior por la nueva en los seis órdenes
+posibles en la capa final del modelo. Los conteos de lecturas y transiciones
+describen las entradas de cada ventana. La comparación usa la lectura inmediatamente
+anterior de la misma sesión, incluso cuando había repetido el porcentaje.
+Los registros antiguos muestran la evidencia que guardaron en su momento.
+
 En **Paranoid-Confianza → Motivos de los cambios**, selecciona la entidad de
 **En directo** o **Test**, el inicio del intervalo en hora local y **Consultar
 una hora**. Abre una fila para ver los aportes y la evidencia de ese cambio.

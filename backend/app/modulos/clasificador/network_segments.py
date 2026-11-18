@@ -27,6 +27,18 @@ class SegmentGATLSTM(nn.Module):
         self.fault_type_classifier = nn.Linear(3*config.lstm_hidden+3, len(FAULT_TYPES))
         self.register_buffer("kind_ids", torch.tensor([KIND_TO_ID[k] for k in entity_kinds], dtype=torch.long))
 
+    def scale_logits(self, representation):
+        """Split the linear classification head across its three independent encoders."""
+        hidden = self.lstm.hidden_size
+        weight = self.classifier.weight
+        parts = []
+        for scale in range(3):
+            block = slice(scale * hidden, (scale + 1) * hidden)
+            presence = 3 * hidden + scale
+            parts.append(F.linear(representation[..., block], weight[:, block])
+                         + representation[..., presence, None] * weight[:, presence])
+        return torch.stack(parts, dim=-2)
+
     def forward(self, x, state_ids, adjacency, node_present, kind_ids=None, return_encoder=False):
         b, steps, n, _ = x.shape
         if steps != 3*MAX_SEGMENTS:

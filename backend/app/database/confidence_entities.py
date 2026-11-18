@@ -74,7 +74,7 @@ class ConfidenceEntityStore:
         item.update(store_id=self.store_id, revision=revision)
         db.execute("INSERT OR REPLACE INTO confidence_catalog VALUES (?,?,?,?,?)",
                    (item["source_entity_id"], item.get("source_mode", "live"), session_id, revision, _json(item)))
-        return {key: value for key, value in item.items() if key != "_scores"}
+        return {key: value for key, value in item.items() if key not in ("_scores", "_facts")}
 
     def start(self, session_id, flow_id, sources, *, test=False):
         sources = sorted(set(sources))
@@ -150,4 +150,5 @@ class ConfidenceEntityStore:
             items = [json.loads(row[0]) for row in db.execute("SELECT payload FROM confidence_catalog ORDER BY source_entity_id,source_mode")]
             for item in items:
                 item.pop("_scores", None)
+                item.pop("_facts", None)
         return {"schema_version": VERSION, "store_id": self.store_id, "revision": revision, "entities": items}

@@ -171,7 +171,14 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
             from app.modulos.clasificador.model_constants import KIND_TO_ID
             kinds = torch.tensor([KIND_TO_ID[preprocessor["entities"][key]["kind"]]
                                   for key in preprocessor["entity_ids"]], dtype=torch.long)
-            class_logits, type_logits = model(x, state_ids, adjacency, node_present, kinds)
+            if hasattr(model, "scale_logits"):
+                representation = model(x, state_ids, adjacency, node_present, kinds, return_encoder=True)
+                class_logits = model.classifier(representation)
+                type_logits = model.fault_type_classifier(representation)
+                cache_entry["window_logits"] = model.scale_logits(representation)[0].tolist()
+                cache_entry["bias"] = model.classifier.bias.tolist()
+            else:
+                class_logits, type_logits = model(x, state_ids, adjacency, node_present, kinds)
             scores_by_node = torch.softmax(class_logits[0], dim=-1).tolist()
             type_scores_by_node = torch.softmax(type_logits[0], dim=-1).tolist()
         cache_entry["scores_by_node"] = scores_by_node
@@ -203,6 +210,30 @@ def predict_at(snapshot, event_provider, entity_id, timestamp, sensor_profiles=N
             and type_validation.get("independent_episodes_by_type", {}).get(type_name, 0) >= 3
             and (type_validation.get("recall_by_type", {}).get(type_name) or 0) >= .5)
     reasons = ["score_below_rejection_policy"] if choice is None else []
+    if "window_logits" in cache_entry:
+        from app.modulos.clasificador.segments import MAX_SEGMENTS
+        windows = []
+        names = preprocessor["feature_names"]
+        for i, (scale, logits) in enumerate(zip(coverage["scales"], cache_entry["window_logits"][index])):
+            start = i * MAX_SEGMENTS
+            segments = [sample["X"][slot][index] for slot in range(start, start + MAX_SEGMENTS)
+                        if sample["node_present"][slot][index]]
+            window = {"seconds": scale["horizon_seconds"], "usable": scale["usable"], "logits": logits,
+                      "records": int(sum(segment[names.index("records")] for segment in segments)),
+                      "changes": int(sum(segment[names.index("changes")] for segment in segments))}
+            if segments:
+                last = segments[-1]
+                window["last_segment"] = {feature: last[names.index(feature)] for feature in
+                                          ("known_fraction", "invalid_fraction", "transition_ratio")}
+                info = preprocessor["entities"][entity_id]
+                if info["kind"] == "continuous":
+                    # The encoder receives numeric values standardized with this entity's training profile.
+                    if last[names.index(f"valid_{graph['segment_steps'][i] - 1}")]:
+                        window["last_segment"]["last_value"] = last[names.index("value")] * info["scale"] + info["median"]
+                else:
+                    window["last_segment"]["dominant_fraction"] = last[names.index("dominant_fraction")]
+            windows.append(window)
+        base["window_evidence"] = {"bias": cache_entry["bias"], "windows": windows}
     return {**base, "status": status,
             "fault_type_status": ("identified" if type_identified else "unknown") if is_sensor_fault else "not_applicable",
             "fault_type": type_name if type_identified else None,
