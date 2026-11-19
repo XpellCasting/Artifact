@@ -89,7 +89,7 @@ class ConfidenceEntityStore:
         item.update(store_id=self.store_id, revision=revision)
         db.execute("INSERT OR REPLACE INTO confidence_catalog VALUES (?,?,?,?,?)",
                    (item["source_entity_id"], item.get("source_mode", "live"), session_id, revision, _json(item)))
-        return {key: value for key, value in item.items() if key not in ("_scores", "_facts")}
+        return {key: value for key, value in item.items() if key not in ("_scores", "_facts", "_excluded")}
 
     def start(self, session_id, flow_id, sources, *, test=False):
         sources = sorted(set(sources))
@@ -167,4 +167,5 @@ class ConfidenceEntityStore:
             for item in items:
                 item.pop("_scores", None)
                 item.pop("_facts", None)
+                item.pop("_excluded", None)
         return {"schema_version": VERSION, "store_id": self.store_id, "revision": revision, "entities": items}

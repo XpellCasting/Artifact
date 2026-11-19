@@ -30,7 +30,7 @@ class ConfidenceDashboard(LovelaceConfig):
         return {"mode": self.mode, "views": 1}
 
     async def async_load(self, force):
-        cards = [{"type": "markdown", "content": "## Confianza por lectura\nÍndice operativo de 0 % a 100 %. Historial nativo de Home Assistant mediante Recorder."}]
+        cards = []
         if not self.hub.entity_ids:
             cards.append({"type": "markdown", "content": "Evalúa un CSV o inicia un flujo en directo desde Paranoid para crear los sensores de confianza."})
         for mode, title in (("live", "En directo"), ("test", "Test")):

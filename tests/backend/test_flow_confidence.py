@@ -321,7 +321,11 @@ class ConfidenceIntegrationTests(unittest.TestCase):
             self.assertEqual(filters["contextual"]["before"], .875)
             self.assertIsNone(filters["contextual"]["after"])
             self.assertIn("datos insuficientes", c["confidence_change_reason"])
-            self.assertIn("empezó a aportar", publish("four", .125, .5)["confidence_change_reason"])
+            self.assertEqual(filters["classifier"]["score_effect_pp"], 0)
+            self.assertEqual(filters["classifier"]["participation_effect_pp"], -6.25)
+            resumed = publish("four", .125, .5)["confidence_change_reason"]
+            self.assertIn("empezó a aportar", resumed)
+            self.assertIn("Antes estaba excluido por datos insuficientes", resumed)
 
     @staticmethod
     def flow(active=KINDS, configured=KINDS, order=None, policy="combine_v1"):

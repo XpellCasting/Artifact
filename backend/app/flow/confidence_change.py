@@ -181,6 +181,7 @@ def explain_confidence_change(previous, current, reading):
     votes = fusion.get("contributions") or {}
     scores = {node: vote["suspicion_score"] for node, vote in votes.items()}
     current["_scores"] = scores
+    current["_excluded"] = fusion.get("excluded_filters") or {}
     evidence = {entry["evidence_id"]: entry for entry in trace.get("evidence", []) if entry.get("evidence_id")}
     modules = trace.get("filters", {})
     contextual_count = sum(modules.get(node, {}).get("module_type") == "contextual" for node in votes)
@@ -247,17 +248,31 @@ def explain_confidence_change(previous, current, reading):
                     sentences.append(explanation)
             elif comparable and before is None and old_scores:
                 sentences.append(f"{label} empezó a aportar (sospecha {_number(after)}).")
+                prior = previous.get("_excluded", {}).get(node)
+                if prior:
+                    sentences.append(f"Antes estaba excluido por {EXCLUSIONS.get(prior, prior)}.")
         elif comparable:
             reason = excluded.get(node, "sin resultado")
             sentences.append(f"{label} dejó de aportar ({EXCLUSIONS.get(reason, reason)}).")
         if comparable and scores and old_scores and fusion.get("method") == "uniform_v1":
             # Change of each normalized vote including the change of denominator.
             row["impact_pp"] = round(100 * ((before or 0) / len(old_scores) - (after or 0) / len(scores)), 6)
+            # Change membership first, then update the scores of continuing voters.
+            score_effect = 100 * (before - after) / len(scores) if before is not None and after is not None else 0.
+            row["score_effect_pp"] = round(score_effect, 6)
+            row["participation_effect_pp"] = round(row["impact_pp"] - row["score_effect_pp"], 6)
         rows.append(row)
     if comparable and (not scores or not old_scores):
         sentences.append("Evidencia insuficiente para atribuir el cambio a un filtro.")
     if comparable and scores.keys() != old_scores.keys() and old_scores and scores:
-        sentences.append(f"Filtros con aporte: {len(old_scores)} → {len(scores)}.")
+        sentences.append(f"Filtros con aporte: {len(old_scores)} → {len(scores)}. "
+                         f"Cada filtro pasó de pesar {_number(100 / len(old_scores), 2)} % "
+                         f"a {_number(100 / len(scores), 2)} % en el promedio.")
+        if all("participation_effect_pp" in row for row in rows):
+            participation = sum(row["participation_effect_pp"] for row in rows)
+            suspicion = sum(row["score_effect_pp"] for row in rows)
+            sentences.append(f"El cambio de participantes explica {_number(participation)} puntos porcentuales "
+                             f"y el cambio de sospecha de los filtros que siguieron aportando, {_number(suspicion)}.")
     current["confidence_change_reason"] = " ".join(sentences)
     current["confidence_change_detail"] = {
         "kind": kind, "before_pct": old_value, "after_pct": value, "delta_pp": delta,

@@ -21,7 +21,13 @@ function filterDetails(change) {
   for (const filter of change.filters || []) {
     const item = document.createElement("li");
     item.textContent = (names[filter.module_type] || filter.node_id) + " · " + comparison("sospecha", filter.before, filter.after);
-    if (filter.impact_pp != null) item.append(" · " + display(filter.impact_pp) + " puntos de confianza");
+    if (filter.score_effect_pp != null) {
+      if (filter.before == null) item.append(" · empezó a aportar");
+      else if (filter.after == null) item.append(" · dejó de aportar");
+      else item.append(" · cambio por sospecha: " + display(filter.score_effect_pp) + " puntos porcentuales");
+      if (filter.participation_effect_pp || filter.before == null || filter.after == null)
+        item.append(" · cambio por participación: " + display(filter.participation_effect_pp) + " puntos porcentuales");
+    } else if (filter.impact_pp != null) item.append(" · aporte al cambio total: " + display(filter.impact_pp) + " puntos porcentuales");
     const lines = document.createElement("ul");
     function line(parts) {
       const text = parts.filter(Boolean).join(" · ");
