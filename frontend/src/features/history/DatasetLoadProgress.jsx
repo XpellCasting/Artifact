@@ -15,7 +15,7 @@ export default function DatasetLoadProgress({ job, onRetry }) {
       <span>{Math.round(percent)} %</span>
     </div>
     <progress max="100" value={percent} aria-label="Avance de preparación del dataset" />
-    <p>{ready ? "Las secuencias se guardaron y el dataset ya está disponible para entrenar, si tiene las clases requeridas."
+    <p>{ready ? "Las secuencias se guardaron. El dataset ya está disponible para descargar."
       : failed ? job.error || job.message
       : paused ? "No se pudo consultar el avance. Reintenta el seguimiento para saber cuándo termina."
       : job.message || "Iniciando la preparación del dataset…"}</p>

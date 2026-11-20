@@ -30,7 +30,7 @@ test("saving a repeated name loads the saved design and CSV or live evaluation w
       stored.set("flow-lab-selected-draft-v1", JSON.stringify({ draft, savedKey: "" }));
       const requests = [];
       globalThis.fetch = async (url, options) => {
-        requests.push({ url, method: options.method || "GET" });
+        requests.push({ url, method: options.method || "GET", body: options.body });
         let payload;
         if (url === "/api/flows" && options.method === "POST") payload = { ...saved, loaded_existing: true };
         else if (url === "/api/flows") payload = { items: [saved] };
@@ -38,6 +38,11 @@ test("saving a repeated name loads the saved design and CSV or live evaluation w
         else if (url === "/api/flow-evaluations") payload = { job: null, latest_run_id: null };
         else if (url === "/api/diagnostics/classifier-models") payload = { models: [] };
         else if (url === "/api/history/home-assistant/config") payload = { bridge_configured: true, bridge_connected: true };
+        else if (url === "/api/flows/live/entities") payload = { entities: [
+          { entity_id: "sensor.temperature", friendly_name: "Temperatura", unavailable_reason: null },
+          { entity_id: "sensor.door", unavailable_reason: null },
+          { entity_id: "sensor.other", unavailable_reason: "La entidad sensor.other no se encuentra en el historial de referencia utilizado." },
+        ] };
         else if (url === "/api/flows/saved-flow/runs" || url === "/api/flows/saved-flow/live/start") payload = { job_id: "reviewed-run", status: "running" };
         else assert.fail(`Unexpected request: ${url}`);
         return { ok: true, json: async () => structuredClone(payload) };
@@ -53,6 +58,17 @@ test("saving a repeated name loads the saved design and CSV or live evaluation w
       else if (action === "csv") await view.event(view.container.querySelector(".fl-future-csv button"), "click");
       else {
         await view.event(view.container.querySelectorAll('input[type="radio"]')[1], "click");
+        const selector = view.container.querySelector(".fl-live-form select");
+        const add = view.container.querySelector(".fl-live-form .fl-result-controls button");
+        selector.value = "sensor.other";
+        await view.event(selector, "change");
+        await view.event(add, "click");
+        assert.match(view.container.querySelector(".fl-live-form [role=alert]").textContent, /no se encuentra en el historial/);
+        assert.equal(view.container.querySelector(".fl-live-form button[type=submit]").disabled, true);
+        selector.value = "sensor.temperature";
+        await view.event(selector, "change");
+        await view.event(add, "click");
+        assert.match(view.container.querySelector(".fl-entity-selection").textContent, /sensor.temperature/);
         await view.event(view.container.querySelector(".fl-live-form"), "submit");
       }
       assert.match(view.container.textContent, /Ya existe un flujo llamado «Flujo existente». Se cargó el guardado/);
@@ -65,6 +81,10 @@ test("saving a repeated name loads the saved design and CSV or live evaluation w
         if (action === "csv") await view.event(view.container.querySelector(".fl-future-csv button"), "click");
         else await view.event(view.container.querySelector(".fl-live-form"), "submit");
         assert.equal(requests.filter((item) => item.method === "POST" && /\/runs$|\/live\/start$/.test(item.url)).length, 1);
+        if (action === "live") {
+          const started = requests.find((item) => item.url.endsWith("/live/start"));
+          assert.deepEqual(JSON.parse(started.body).entity_ids, ["sensor.temperature"]);
+        }
       }
       await view.close(); view = undefined;
       context.mock.timers.reset();

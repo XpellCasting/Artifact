@@ -63,28 +63,58 @@ def observation_valid(item: dict[str, Any]) -> bool:
     return True
 
 
+def _node(key, kind, x, y=180, **config):
+    return {"id": key, "type": kind, "position": {"x": x, "y": y},
+            "config": {"evidence_policy": "independent", **config}}
+
+
+def _edge(source, target, *signals):
+    edge = {"id": f"{source}-{target}", "source": source, "target": target}
+    if signals:
+        edge["when"] = list(signals)
+    return edge
+
+
+def _statistical_node(x, y=180):
+    return _node("statistical", "statistical_focus", x, y, suspicion_threshold=0.6,
+                 continuous_method="residual_focus_v1", signal_policy="detection_before_suppression")
+
+
 def default_flow() -> dict[str, Any]:
-    flow = {
-        "name": "Flujo secuencial de referencia",
-        "nodes": [
-            {"id": "input", "type": "input", "position": {"x": 30, "y": 180}, "config": {}},
-            {"id": "statistical", "type": "statistical_focus", "position": {"x": 260, "y": 180}, "config": {"suspicion_threshold": 0.6, "continuous_method": "residual_focus_v1", "signal_policy": "detection_before_suppression"}},
-            {"id": "contextual", "type": "contextual", "position": {"x": 510, "y": 180}, "config": {}},
-            {"id": "classifier", "type": "classifier", "position": {"x": 760, "y": 180}, "config": {}},
-            {"id": "output", "type": "output", "position": {"x": 1010, "y": 180}, "config": {}},
-        ],
-        "edges": [
-            {"id": "input-statistical", "source": "input", "target": "statistical"},
-            {"id": "statistical-contextual", "source": "statistical", "target": "contextual", "when": ["positive", "unknown"]},
-            {"id": "statistical-output", "source": "statistical", "target": "output", "when": ["negative"]},
-            {"id": "contextual-classifier", "source": "contextual", "target": "classifier", "when": ["positive", "unknown"]},
-            {"id": "contextual-output", "source": "contextual", "target": "output", "when": ["negative"]},
-            {"id": "classifier-output", "source": "classifier", "target": "output"},
-        ],
+    return {
+        "name": "Tesis · Secuencial",
+        "nodes": [_node("input", "input", 0), _statistical_node(260),
+                  _node("contextual", "contextual", 520), _node("classifier", "classifier", 780),
+                  _node("output", "output", 1040, verdict_policy="sequential_v1")],
+        "edges": [_edge("input", "statistical"), _edge("statistical", "contextual", "positive"),
+                  _edge("statistical", "output", "negative", "unknown"),
+                  _edge("contextual", "output", "negative"),
+                  _edge("contextual", "classifier", "positive", "unknown"), _edge("classifier", "output")],
     }
-    for node in flow["nodes"]:
-        node["config"]["evidence_policy"] = "combine_v1"
-    return flow
+
+
+def thesis_flows():
+    parallel = {
+        "name": "Tesis · Paralelo",
+        "nodes": [_node("input", "input", 0), _statistical_node(260, 50),
+                  _node("contextual", "contextual", 260, 310),
+                  _node("scores", "merge", 520, mode="any", label="Reunir puntajes"),
+                  _node("classifier", "classifier", 780, verdict_policy="parallel_v1"),
+                  _node("output", "output", 1040, verdict_policy="classifier_v1")],
+        "edges": [_edge("input", "statistical"), _edge("input", "contextual"),
+                  _edge("statistical", "scores"), _edge("contextual", "scores"),
+                  _edge("scores", "classifier"), _edge("classifier", "output")],
+    }
+    hybrid = {
+        "name": "Tesis · Híbrido",
+        "nodes": [_node("input", "input", 0), _statistical_node(260),
+                  _node("contextual", "contextual", 520, 50), _node("classifier", "classifier", 520, 310),
+                  _node("output", "output", 780, verdict_policy="hybrid_v1", label="Fusión de veredictos")],
+        "edges": [_edge("input", "statistical"), _edge("statistical", "output", "negative", "unknown"),
+                  _edge("statistical", "contextual", "positive"), _edge("statistical", "classifier", "positive"),
+                  _edge("contextual", "output"), _edge("classifier", "output")],
+    }
+    return [default_flow(), parallel, hybrid]
 
 
 def validate_flow(payload: dict[str, Any]) -> dict[str, Any]:
@@ -117,6 +147,12 @@ def validate_flow(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(config, dict):
             errors.append(f"La configuración de {node['id']} debe ser un objeto.")
             continue
+        if "verdict_policy" in config:
+            policies = {"output": ("sequential_v1", "classifier_v1", "hybrid_v1"), "classifier": ("parallel_v1",)}
+            if config["verdict_policy"] not in policies.get(node["type"], ()):
+                errors.append("La regla de diagnóstico no corresponde al tipo de nodo.")
+            if config.get("evidence_policy") != "independent":
+                errors.append("La regla de diagnóstico requiere la evaluación propia de cada filtro.")
         if config.get("evidence_policy", "legacy") not in {"legacy", "independent", "combine_v1"}:
             errors.append("La política de evidencias debe ser independent o combine_v1.")
         if "enabled" in config and not isinstance(config["enabled"], bool):

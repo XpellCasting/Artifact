@@ -11,6 +11,12 @@ import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
 import { confidencePercent } from "./confidence-history-model.js";
 
 const PRESETS = templates();
+const VERDICT_DESCRIPTIONS = {
+  sequential_v1: "El respaldo contextual de un cambio sospechoso resuelve la lectura como anomalía ambiental. Los demás cambios sospechosos pasan al clasificador.",
+  parallel_v1: "El clasificador recibe las dos evidencias. Una contradicción entre la clase aceptada y los filtros para un cambio sospechoso deja el diagnóstico indeterminado.",
+  classifier_v1: "Se publica el veredicto del clasificador para cada lectura.",
+  hybrid_v1: "En cada lectura sospechosa se reúnen el contexto y la clase aceptada por el modelo. Un desacuerdo deja el diagnóstico indeterminado.",
+};
 const PAGE_SIZE = 50;
 const DRAFT_STORAGE_KEY = "flow-lab-selected-draft-v1";
 const DESCRIPTIONS = { input: "Lecturas del histórico seleccionado", statistical_focus: "Cambios secuenciales en residuos", contextual: "Coherencia entre entidades", classifier: "Compatibilidad con patrones", merge: "Combina señales con lógica O / Y", decision: "Evalúa una condición lógica sobre la señal", output: "Resultado final por lectura" };
@@ -96,6 +102,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
   const [draft, setDraft] = useState(() => restoreFlowDraft().draft);
   const [savedKey, setSavedKey] = useState(() => restoreFlowDraft().savedKey);
   const [flows, setFlows] = useState([]);
+  const [presets, setPresets] = useState(PRESETS);
   const [runs, setRuns] = useState([]);
   const [runsLoaded, setRunsLoaded] = useState(false);
   const [classifierModels, setClassifierModels] = useState([]);
@@ -144,7 +151,12 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     const revision = ++refreshRequest.current;
     const current = () => revision === refreshRequest.current;
     await Promise.all([
-      request(apiBaseUrl, "/flows").then((f) => { if (current()) setFlows(f.items || []); }),
+      request(apiBaseUrl, "/flows").then((f) => {
+        if (current()) {
+          setFlows(f.items || []);
+          setPresets([...(f.thesis_templates || []), ...PRESETS]);
+        }
+      }),
       request(apiBaseUrl, "/flow-runs?compact=true").then((r) => {
         if (!current()) return;
         setRuns(r.items || []);
@@ -315,7 +327,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     </> : <>
       <label className="fl-name">Nombre del flujo<input aria-label="Nombre del flujo" value={draft.name} disabled={busy} onChange={(event) => change((next) => { next.name = event.target.value; })} /></label>
       <label>Abrir guardado<select aria-label="Abrir flujo guardado" disabled={busy} value={draft.flow_id || ""} onChange={(event) => { const item = flows.find((item) => item.flow_id === event.target.value); if (item) choose(item, true); }}><option value="">Seleccionar…</option>{flows.map((item) => <option key={item.flow_id} value={item.flow_id}>{item.name}</option>)}</select></label>
-      <label>Nuevo desde plantilla<select aria-label="Nueva plantilla" disabled={busy} value="" onChange={(event) => choose(PRESETS[Number(event.target.value)])}><option value="" disabled>Seleccionar…</option>{PRESETS.map((item, index) => <option key={item.name} value={index}>{item.name}</option>)}</select></label>
+      <label>Nuevo desde plantilla<select aria-label="Nueva plantilla" disabled={busy} value="" onChange={(event) => choose(presets[Number(event.target.value)])}><option value="" disabled>Seleccionar…</option>{presets.map((item, index) => <option key={item.name} value={index}>{item.name}</option>)}</select></label>
       <button disabled={busy} onClick={() => choose({ ...clone(draft), flow_id: null, name: `${draft.name} (copia)` })}><Copy size={16} />Duplicar</button><button className="fl-primary" disabled={busy || !!errors.length} onClick={save}><Save size={16} />Guardar</button>
     </>}</div>
     <div className="fl-editor"><div className="fl-canvas-column">
@@ -331,7 +343,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
     </div><aside className="fl-inspector" aria-label="Inspector del flujo"><h3>{node ? labelNode(node) : edge ? "Configurar conexión" : "Inspector"}</h3>
       {node ? <fieldset disabled={busy || inspecting} className="fl-fields"><span className="fl-muted">{DESCRIPTIONS[node.type]}</span><label>Nombre visible<input value={node.config?.label || ""} placeholder={NODE_LABELS[node.type]} onChange={(event) => configure({ label: event.target.value })} /></label>
         {["statistical_focus", "contextual", "classifier"].includes(node.type) && <label className="fl-check"><input type="checkbox" checked={node.config?.enabled !== false} onChange={(event) => configure({ enabled: event.target.checked })} />Filtro activado</label>}
-        {["merge", "decision"].includes(node.type) ? <p className="fl-hint">El resultado lógico determina la señal enviada. Las evidencias de los filtros se conservan para consultar su diagnóstico.</p> : <label>Uso de evidencias<select value={node.config?.evidence_policy || "legacy"} onChange={(event) => configure({ evidence_policy: event.target.value })}><option value="legacy">Comportamiento guardado</option><option value="independent">Evaluación propia</option><option value="combine_v1">Evaluación propia y combinada</option></select><span className="fl-hint">Recibe las evidencias de sus predecesores y conserva su procedencia.</span></label>}{node.type === "statistical_focus" && <><label>Umbral para binarios y multivalor<input type="number" min="0.01" max="0.99" step="0.01" value={node.config?.suspicion_threshold ?? .6} onChange={(event) => configure({ suspicion_threshold: Number(event.target.value) })} /></label><p><strong>Continuos:</strong> FOCuS sobre residuos normalizados</p><span className="fl-hint">Combina FOCuS con canales puntual, energía y constancia. Un aviso puede originarse en cualquiera de ellos; no confirma un tipo de falla.</span></>}
+        {node.config?.verdict_policy ? <p className="fl-hint">{VERDICT_DESCRIPTIONS[node.config.verdict_policy]}</p> : ["merge", "decision"].includes(node.type) ? <p className="fl-hint">El resultado lógico determina la señal enviada. Las evidencias de los filtros se conservan para consultar su diagnóstico.</p> : <label>Uso de evidencias<select value={node.config?.evidence_policy || "legacy"} onChange={(event) => configure({ evidence_policy: event.target.value })}><option value="legacy">Comportamiento guardado</option><option value="independent">Evaluación propia</option><option value="combine_v1">Evaluación propia y combinada</option></select><span className="fl-hint">Recibe las evidencias de sus predecesores y conserva su procedencia.</span></label>}{node.type === "statistical_focus" && <><label>Umbral para binarios y multivalor<input type="number" min="0.01" max="0.99" step="0.01" value={node.config?.suspicion_threshold ?? .6} onChange={(event) => configure({ suspicion_threshold: Number(event.target.value) })} /></label><p><strong>Continuos:</strong> FOCuS sobre residuos normalizados</p><span className="fl-hint">Combina FOCuS con canales puntual, energía y constancia. Un aviso puede originarse en cualquiera de ellos; no confirma un tipo de falla.</span></>}
         {node.type === "classifier" && <label>Modelo<select aria-label="Modelo del clasificador" value={node.config?.model_id || ""} onChange={(event) => configure({ model_id: event.target.value || null })}>{node.config?.model_id && !classifierModels.some((item) => item.model_id === node.config.model_id) && <option value={node.config.model_id} disabled>Versión no disponible · selecciona otro modelo</option>}<option value="">Modelo activo{activeClassifierModelId ? ` · ${activeClassifierModelId.slice(0, 12)}` : " · ninguno"}</option>{classifierModels.map((model) => <option key={model.model_id} value={model.model_id}>{model.architecture_version === "gat_lstm_v3_segments_multiscale" ? "GAT-LSTM segmentos" : "GAT-LSTM v2"} · {model.model_id.slice(0, 12)}{model.active ? " (activo)" : ""}</option>)}</select><span className="fl-hint">La elección queda guardada en este nodo. “Modelo activo” usa el seleccionado en Diagnóstico.</span></label>}
         {node.type === "merge" && <label>Función lógica<select value={node.config?.mode || "any"} onChange={(event) => configure({ mode: event.target.value })}><option value="any">Cualquiera positiva (O)</option><option value="all">Todas positivas (Y)</option></select><span className="fl-hint">Combina los resultados de una misma lectura. Una rama ausente cuenta como no evaluable. Puedes encadenar uniones para comparar fórmulas como (A O B) Y C.</span></label>}
         {node.type === "decision" && <><Signals legend="Resultado verdadero cuando recibe" value={node.config?.accept || ["positive"]} onChange={(accept) => configure({ accept })} /><p className="fl-hint">Verdadero produce señal positiva; falso, sin señal. Selecciona solo «Sin señal» para negar una señal evaluable (NO). Una entrada no evaluable permanece desconocida salvo que la selecciones explícitamente. Configura en cada conexión qué resultados pueden pasar.</p></>}

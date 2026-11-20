@@ -9,19 +9,58 @@ import pandas as pd
 
 from app.services.estados_validos import valid_state
 from app.services.historial.cargar_historial import ESTADOS_ACTIVOS
+from app.services.home_assistant_history import ENTITY_ID, SUPPORTED_DOMAINS
+from app.services.tipos_entidad import KINDS
+
+
+def reference_entities(entities):
+    return {str(row["entity_id"]): row for row in entities.to_dict("records")} if entities is not None else {}
+
+
+def live_entity_catalog(bridge, reference):
+    metadata = bridge.entity_catalog()
+    states = metadata.get("entities") if isinstance(metadata, dict) else None
+    if not isinstance(states, list):
+        raise ValueError("Home Assistant no devolvió un catálogo de entidades válido.")
+    catalog = {}
+    for state in states:
+        entity_id = state.get("entity_id") if isinstance(state, dict) else None
+        if (not isinstance(entity_id, str) or not ENTITY_ID.fullmatch(entity_id)
+                or entity_id.split(".", 1)[0] not in SUPPORTED_DOMAINS
+                or entity_id.startswith("sensor.confianza_")):
+            continue
+        attributes = state.get("attributes") or {}
+        if attributes.get("paranoid_confidence"):
+            continue
+        if entity_id not in reference:
+            reason = f"La entidad {entity_id} no se encuentra en el historial de referencia utilizado."
+        elif reference[entity_id].get("sensor_kind") not in KINDS:
+            reason = f"La entidad {entity_id} no tiene un tipo compatible en el historial de referencia."
+        else:
+            reason = None
+        catalog[entity_id] = {"entity_id": entity_id, "friendly_name": attributes.get("friendly_name") or "",
+                              "unavailable_reason": reason}
+    return catalog
 
 
 class HomeAssistantEventSource:
     def __init__(self, entities, development_end, entity_ids=(), *, bridge):
         bridge.require_connected()
         self.bridge = bridge
-        self.entities = {str(row["entity_id"]): dict(row) for row in entities.to_dict("records")
-                         if row.get("sensor_kind") in {"continuous", "binary", "multistate"}
-                         and not str(row["entity_id"]).startswith("sensor.confianza_")}
-        selected = set(entity_ids) or set(self.entities)
-        if not selected or selected - self.entities.keys():
-            raise ValueError("Selecciona entidades que estén presentes en el historial de referencia.")
-        self.selected = selected
+        reference = reference_entities(entities)
+        catalog = live_entity_catalog(bridge, reference)
+        if entity_ids:
+            for entity_id in dict.fromkeys(entity_ids):
+                if entity_id not in catalog:
+                    raise ValueError(f"La entidad {entity_id} no está disponible como sensor compatible en Home Assistant.")
+                if reason := catalog[entity_id]["unavailable_reason"]:
+                    raise ValueError(reason)
+            self.selected = set(entity_ids)
+        else:
+            self.selected = {entity_id for entity_id, item in catalog.items() if not item["unavailable_reason"]}
+        if not self.selected:
+            raise ValueError("No hay entidades compatibles del historial de referencia disponibles en Home Assistant.")
+        self.entities = {entity_id: reference[entity_id] for entity_id in self.selected}
         self.development_end = pd.Timestamp(development_end)
         self.queue = Queue(maxsize=5000)
         self.stop_event = Event()

@@ -204,7 +204,11 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
         from app.services.home_assistant_live import HomeAssistantEventSource
         class Socket:
             async def send_json(self, message):
-                data = [{"entity_id": "binary_sensor.door"}] if message["operation"] == "states" else []
+                states = [{"entity_id": "binary_sensor.door"}]
+                operation = message["operation"]
+                if operation == "entity_catalog":
+                    self.connection.receive({"type": "result_chunk", "request_id": message["request_id"], "items": states})
+                data = states if operation == "states" else {}
                 self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True, "data": data})
             async def close(self, **kwargs):
                 pass
@@ -218,7 +222,7 @@ class BridgeProtocolTests(unittest.IsolatedAsyncioTestCase):
             bridge = HomeAssistantBridge(Path(folder) / "bridge.json")
             first_socket = Socket()
             first = first_socket.connection = await bridge.attach(first_socket)
-            source = HomeAssistantEventSource(pd.DataFrame([
+            source = await asyncio.to_thread(HomeAssistantEventSource, pd.DataFrame([
                 {"entity_id": "binary_sensor.door", "sensor_kind": "binary"}]),
                 pd.Timestamp("2026-01-01T00:00:00Z"), bridge=bridge)
             reception = asyncio.create_task(asyncio.to_thread(lambda: list(source.batches())))

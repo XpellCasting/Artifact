@@ -114,6 +114,29 @@ class CsvFlowRequirementTests(unittest.TestCase):
             source.assert_not_called()
         self.runtime.flow_evaluation_jobs.start.assert_not_called()
 
+    def test_live_catalog_and_start_share_reference_and_availability_validation(self):
+        self.runtime.state.historial.entidades = pd.DataFrame([
+            {"entity_id": "sensor.a", "sensor_kind": "continuous"},
+            {"entity_id": "sensor.b", "sensor_kind": "continuous"},
+            {"entity_id": "sensor.csv_only", "sensor_kind": "continuous"},
+        ])
+        self.runtime.home_assistant_bridge.entity_catalog.return_value = {"entities": [
+            {"entity_id": "sensor.a"}, {"entity_id": "sensor.b"}, {"entity_id": "sensor.other"},
+        ]}
+        catalog = self.client.get("/flows/live/entities")
+        self.assertEqual(catalog.status_code, 200, catalog.text)
+        items = {item["entity_id"]: item["unavailable_reason"] for item in catalog.json()["entities"]}
+        self.assertEqual(set(items), {"sensor.a", "sensor.b", "sensor.other"})
+        self.assertIsNone(items["sensor.a"])
+        for entity, detail in [("sensor.other", "no se encuentra en el historial"), ("sensor.csv_only", "no está disponible")]:
+            response = self.client.post("/flows/flow/live/start", json={"entity_ids": [entity]})
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn(detail, response.json()["detail"])
+        self.runtime.flow_evaluation_jobs.start.assert_not_called()
+        response = self.client.post("/flows/flow/live/start", json={"entity_ids": ["sensor.a"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.runtime.flow_evaluation_jobs.start.call_args.kwargs["live_source"].selected, {"sensor.a"})
+
 
 class RecoverFlowLabelsTests(unittest.TestCase):
     def setUp(self):

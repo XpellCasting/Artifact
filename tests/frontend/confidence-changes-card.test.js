@@ -38,6 +38,9 @@ test("recorded decreases and increases retain their own evidence across plateaus
     } };
     await card.load();
     assert.match(requests[0], /filter_entity_id=sensor.test/);
+    const query = new URL(requests[0], "http://localhost/");
+    const start = Date.parse(query.pathname.split("/").at(-1));
+    assert.equal(Date.parse(query.searchParams.get("end_time")) - start, 15 * 60 * 1000);
     assert.ok(!requests[0].includes("no_attributes"));
     const root = card.shadowRoot;
     assert.equal(root.querySelectorAll(".rows > details").length, 2);

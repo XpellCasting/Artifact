@@ -6,6 +6,7 @@ from uuid import uuid4
 import pandas as pd
 from app.flow.definitions import _time, observation_valid
 from app.flow.evidence import append_evidence, merge_evidence
+from app.flow.verdicts import DECISION_SIGNALS, output_verdict, parallel_diagnosis
 from app.modulos.estadistico.disponibilidad import availability_detection
 
 class NodeHandlers:
@@ -108,7 +109,9 @@ class NodeHandlers:
         contexts, statistical = [], []
         for item in incoming:
             identity = {key: item.get(key) for key in ("observation_id", "entity_id", "timestamp", "sensor_kind", "source_raw_index")}
-            f1 = next((e for e in reversed(item.get("evidence", [])) if e.get("status") in {"suspicion", "no_suspicion"}), None)
+            f1 = next((e for e in reversed(item.get("evidence", []))
+                       if e.get("status") in {"suspicion", "no_suspicion", "detected_suppressed"}
+                       or (e.get("module_type") == "statistical_focus" and e.get("status") != "omitted")), None)
             f2 = next((e.get("data", {}) for e in reversed(item.get("evidence", [])) if "context_outcome" in e.get("data", {})), {})
             contexts.append({**deepcopy(f2), **identity, "event_id": item["observation_id"], "routing": {"terminal": False}})
             candidate = {**(deepcopy(f1.get("data", {})) if f1 else {}), **identity}
@@ -120,8 +123,11 @@ class NodeHandlers:
         enriched = self.diagnostic.enrich_contextual(statistical, contexts, events=None if session is not None else events, source="flow_evaluation", run_id=run_id, session=session)
         indexed = {str(item.get("observation_id")): item.get("diagnosis", {}) for item in enriched}
         output = []
+        config = getattr(self, "_evidence_nodes", {}).get(node_id, {}).get("config", {})
         for item in incoming:
             diagnosis = indexed.get(item["observation_id"], {})
+            if config.get("verdict_policy") == "parallel_v1":
+                diagnosis = parallel_diagnosis(item["evidence"], diagnosis)
             status = diagnosis.get("status")
             signal = "positive" if status == "compatible" else "negative" if status == "no_fault_evidence" else "unknown"
             if status == "environmental_anomaly" and getattr(self, "_evidence_nodes", {}).get(node_id, {}).get("config", {}).get("evidence_policy", "legacy") != "legacy":
@@ -150,7 +156,15 @@ class NodeHandlers:
                 logical = next((item["logical_evaluation"] for item in items if item.get("logical_evaluation")), None)
                 if logical:
                     base["logical_evaluation"] = deepcopy(logical)
-            output.append(self._with_evidence(base, node_id, signal, f"merge_{mode}", {"signals": signals, "missing_branches": missing}))
+            data = {"signals": signals, "missing_branches": missing}
+            policy = getattr(self, "_evidence_nodes", {}).get(node_id, {}).get("config", {}).get("verdict_policy")
+            if mode == "output" and policy:
+                decision, reason = output_verdict(policy, base["evidence"])
+                signal = DECISION_SIGNALS[decision]
+                base.pop("logical_evaluation", None)
+                base["final_decision"] = decision
+                data.update(verdict_policy=policy, final_decision=decision, reason=reason)
+            output.append(self._with_evidence(base, node_id, signal, f"merge_{mode}", data))
         return output
     def _decision(self, node_id: str, incoming: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
         accepted = set(config.get("accept", ["positive"]))

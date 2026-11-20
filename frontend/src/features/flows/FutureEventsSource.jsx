@@ -1,23 +1,55 @@
 import React, { useEffect, useState } from "react";
 import { AlertTriangle, FileSpreadsheet, House, Loader2, Play, Radio, Square } from "lucide-react";
+import { request } from "../../shared/api.js";
 import { homeAssistantConnectionLabel, useHomeAssistantConnection } from "../history/use-home-assistant-connection.js";
 import { DECISIONS } from "./flow-lab-model.js";
 import { confidencePercent } from "./confidence-history-model.js";
 
 export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload = canRun, dirty, job, error, replay, upload, contextFile, onContextFile, onLabelledUpload, onEvaluate, onStartLive, onStopLive, stopPending }) {
   const [source, setSource] = useState("csv");
-  const [entities, setEntities] = useState("");
+  const [entities, setEntities] = useState([]);
+  const [candidateId, setCandidateId] = useState("");
+  const [selectionError, setSelectionError] = useState("");
+  const [catalog, setCatalog] = useState(null);
+  const [catalogError, setCatalogError] = useState("");
+  const [catalogAttempt, setCatalogAttempt] = useState(0);
   const connection = useHomeAssistantConnection(apiBaseUrl);
   const connected = Boolean(connection?.bridge_connected);
   const live = job?.mode === "home_assistant" && job?.status === "running";
   const stopping = live && (stopPending || ["stopping", "saving"].includes(job?.phase));
   useEffect(() => { if (live) setSource("home_assistant"); }, [live]);
+  useEffect(() => {
+    setCatalog(null);
+    setCatalogError("");
+    if (source !== "home_assistant" || !connected || live) return;
+    const controller = new AbortController();
+    request(apiBaseUrl, "/flows/live/entities", { signal: controller.signal })
+      .then(({ entities: items }) => { if (!controller.signal.aborted) setCatalog(items); })
+      .catch((failure) => { if (!controller.signal.aborted) setCatalogError(failure.message); });
+    return () => controller.abort();
+  }, [apiBaseUrl, source, connected, live, catalogAttempt]);
+
+  const catalogById = new Map((catalog || []).map((item) => [item.entity_id, item]));
+  const selectedIds = new Set(entities);
+  const compatibleCount = (catalog || []).filter((item) => !item.unavailable_reason).length;
+  const invalidId = catalog && entities.find((id) => !catalogById.has(id) || catalogById.get(id).unavailable_reason);
+  const canStart = connected && !busy && canRun && !live && compatibleCount > 0 && !invalidId;
+
+  function addEntity() {
+    const item = catalogById.get(candidateId);
+    if (!item) return;
+    if (item.unavailable_reason) {
+      setSelectionError(item.unavailable_reason);
+      return;
+    }
+    setEntities((previous) => [...previous, item.entity_id]);
+    setCandidateId("");
+    setSelectionError("");
+  }
 
   async function start(event) {
     event.preventDefault();
-    if (!connected || busy || !canRun || live) return;
-    await onStartLive({
-      entity_ids: entities.split(/[,\s]+/).map((value) => value.trim()).filter(Boolean) });
+    if (canStart && !candidateId) await onStartLive({ entity_ids: entities });
   }
 
   return <div className="fl-future-source" aria-label="Origen de los eventos futuros">
@@ -48,7 +80,29 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
       {!live && <fieldset disabled={busy}>
         <div className="fl-live-status" role="status"><House size={18} /><strong>{homeAssistantConnectionLabel(connection)}</strong></div>
         {!connected && <p className="fl-hint">Configura la integración Paranoid en Home Assistant y comprueba su conexión para iniciar la recepción.</p>}
-        <label>Entidades (opcional)<input value={entities} onChange={(event) => setEntities(event.target.value)} placeholder="sensor.temperatura, binary_sensor.puerta" /><span className="fl-hint">Deja vacío para recibir todas las entidades compatibles del historial de referencia.</span></label>
+        {connected && <>
+          <div className="fl-result-controls">
+            <label>Entidades de Home Assistant
+              <select value={candidateId} disabled={!catalog?.length} onChange={(event) => { setCandidateId(event.target.value); setSelectionError(""); }}>
+                <option value="">Seleccionar entidad…</option>
+                {catalog?.filter((item) => !selectedIds.has(item.entity_id)).map((item) => <option key={item.entity_id} value={item.entity_id}>
+                  {item.friendly_name ? `${item.friendly_name} · ${item.entity_id}` : item.entity_id}
+                </option>)}
+              </select>
+            </label>
+            <button type="button" disabled={!catalogById.has(candidateId)} onClick={addEntity}>Agregar entidad</button>
+            <button type="button" onClick={() => { setCandidateId(""); setSelectionError(""); setCatalogAttempt((value) => value + 1); }}>Actualizar lista</button>
+          </div>
+          {!catalog && !catalogError && <p role="status">Consultando entidades de Home Assistant…</p>}
+          {catalogError && <p className="fl-required" role="alert">{catalogError}</p>}
+          {selectionError && <p className="fl-required" role="alert">{selectionError}</p>}
+          {invalidId && <p className="fl-required" role="alert">{catalogById.get(invalidId)?.unavailable_reason || `La entidad ${invalidId} ya no está disponible en Home Assistant.`}</p>}
+          {entities.length > 0 ? <ul className="fl-entity-selection" aria-label="Entidades a evaluar">
+            {entities.map((id) => <li key={id}><code>{id}</code><button type="button" aria-label={`Quitar ${id}`} onClick={() => setEntities((previous) => previous.filter((entity) => entity !== id))}>Quitar</button></li>)}
+          </ul> : catalog && <p className="fl-hint">{compatibleCount
+            ? `Con la selección vacía se evalúan todas las coincidencias con el historial (${compatibleCount}).`
+            : "Ninguna entidad de Home Assistant coincide con un sensor compatible del historial de referencia."}</p>}
+        </>}
       </fieldset>}
       {live ? <>
         {job.live_retention && <p className="fl-hint">Se conserva el detalle de las últimas {job.live_retention.readings.toLocaleString()} lecturas de esta sesión. Se guardan hasta {job.live_retention.sessions} sesiones en directo con esta política.</p>}
@@ -61,7 +115,7 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
         {job.connection?.late > 0 && <p className="fl-required">{job.connection.late} eventos llegaron fuera de orden y quedaron fuera de la evaluación.</p>}
         <button type="button" disabled={stopping} onClick={onStopLive}>{stopping ? <Loader2 size={16} /> : <Square size={16} />}{stopping ? "Guardando ejecución…" : "Detener recepción y guardar"}</button>
         {!!job.recent_results?.length && <div className="fl-table-scroll"><table aria-label="Últimos resultados en directo"><thead><tr><th>Entidad</th><th>Fecha y hora</th><th>Resultado</th><th>Confianza</th></tr></thead><tbody>{job.recent_results.slice(-20).map((item) => <tr key={item.observation_id}><td>{item.entity_id}</td><td>{new Date(item.timestamp).toLocaleString()}</td><td>{DECISIONS[item.final_decision] || "Sin conclusión"}</td><td>{confidencePercent(item.confidence)}</td></tr>)}</tbody></table></div>}
-      </> : <button className="fl-primary" type="submit" disabled={busy || !canRun || !connected}><Radio size={16} />{dirty ? "Guardar e iniciar recepción" : "Iniciar recepción"}</button>}
+      </> : <button className="fl-primary" type="submit" disabled={!canStart || Boolean(candidateId)}><Radio size={16} />{dirty ? "Guardar e iniciar recepción" : "Iniciar recepción"}</button>}
     </form>}
     {job?.confidence_publication?.status === "unavailable" && (job.mode === "home_assistant" || connected) && <p className="fl-required" role="status">No se pudo publicar la confianza en Home Assistant. {job.confidence_publication.error}</p>}
     {error && <div className="fl-notice fl-error" role="alert"><AlertTriangle size={18} /><span>{error}</span></div>}

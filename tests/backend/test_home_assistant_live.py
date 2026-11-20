@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
+from app.database.confidence_entities import ConfidenceEntityStore
 from app.database.flows import FlowStore
 from app.flow.evaluacion import CausalFlowRunner, FlowEvaluationJobs
 from app.services.home_assistant_live import HomeAssistantEventSource
@@ -28,7 +29,13 @@ class LiveEventsTests(unittest.TestCase):
 
     def source(self, **changes):
         entities = changes.pop("entities", self.entities)
-        return HomeAssistantEventSource(entities, self.start, bridge=changes.pop("bridge", Mock()), **changes)
+        bridge = changes.pop("bridge", Mock())
+        bridge.entity_catalog = Mock(return_value={"entities": [
+            {"entity_id": "binary_sensor.door"}, {"entity_id": "sensor.temperature"},
+            {"entity_id": "light.room"}, {"entity_id": "sensor.outside_reference"},
+            {"entity_id": "sensor.renamed", "attributes": {"paranoid_confidence": True}},
+        ]})
+        return HomeAssistantEventSource(entities, self.start, bridge=bridge, **changes)
 
     def message(self, at, state="on", entity="binary_sensor.door", old="off"):
         return {"type": "event", "event": {"event_type": "state_changed", "data": {
@@ -52,7 +59,7 @@ class LiveEventsTests(unittest.TestCase):
         self.assertNotIn("secret", repr(source))
 
     def test_unknown_entity_selection_and_buffer_overflow_fail_explicitly(self):
-        with self.assertRaisesRegex(ValueError, "historial de referencia"):
+        with self.assertRaisesRegex(ValueError, "no está disponible"):
             self.source(entity_ids=["sensor.unknown"])
         source = self.source()
         source.queue = Queue(maxsize=1)
@@ -60,15 +67,16 @@ class LiveEventsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ritmo de entrada"):
             source.accept(self.message("2026-01-01T00:00:02Z", state="off", old="on"))
 
-    def test_bridge_default_subscription_preserves_mixed_csv_reference(self):
+    def test_bridge_default_subscription_intersects_compatible_catalog_with_mixed_csv_reference(self):
         entities = pd.concat([self.entities, pd.DataFrame([
             {"entity_id": "light.room", "sensor_kind": "binary"},
-            {"entity_id": "media_player.tv", "sensor_kind": "multistate"},
+            {"entity_id": "sensor.csv_only", "sensor_kind": "multistate"},
+            {"entity_id": "sensor.renamed", "sensor_kind": "continuous"},
         ])], ignore_index=True)
         original = entities.copy(deep=True)
         source = self.source(entities=entities, bridge=Mock())
-        self.assertEqual(source.selected, set(entities["entity_id"]))
-        self.assertEqual(set(source.entities), set(entities["entity_id"]))
+        self.assertEqual(source.selected, set(self.entities["entity_id"]))
+        self.assertEqual(set(source.entities), source.selected)
         pd.testing.assert_frame_equal(entities, original)
         source.accept(self.message("2026-01-01T00:00:02Z", "23.4", "sensor.temperature"))
         self.assertEqual(source.queue.get_nowait()["value"], 23.4)
@@ -192,8 +200,9 @@ class LiveEventsTests(unittest.TestCase):
             selected["edges"] = [{"id": "in-classifier", "source": "input", "target": "classifier"},
                                  {"id": "classifier-out", "source": "classifier", "target": "output"}]
             saved = store.create(selected)
-            jobs = FlowEvaluationJobs(store)
-            source = self.source(bridge=Bridge())
+            confidence_store = ConfidenceEntityStore(directory / "confidence.sqlite")
+            jobs = FlowEvaluationJobs(store, confidence_store=confidence_store)
+            source = self.source(bridge=Bridge(), entity_ids=["binary_sensor.door"])
             history = pd.DataFrame([{"entity_id": "binary_sensor.door", "timestamp_dt": self.start,
                                      "state": "off", "sensor_kind": "binary", "_raw_index": 0}])
             workbench = DiagnosticWorkbench(directory / "diagnostics")
@@ -209,6 +218,8 @@ class LiveEventsTests(unittest.TestCase):
                 self.assertEqual(status["status"], "running", status)
                 self.assertEqual(status["connection"]["status"], "connected")
                 self.assertEqual(status["processed"], 0)
+                self.assertEqual([item["source_entity_id"] for item in confidence_store.snapshot()["entities"]],
+                                 ["binary_sensor.door"])
             finally:
                 jobs.stop(job["job_id"])
             for _ in range(200):

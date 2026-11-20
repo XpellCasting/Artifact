@@ -2,10 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, renderInteractive } from "../../frontend/test-runtime.js";
 
+const liveCatalog = { entities: [{ entity_id: "sensor.temperature", unavailable_reason: null }] };
+
 test("CSV accepts only labelled uploads, while live events start without an uploaded CSV", async () => {
   const server = await createServer({ server: { middlewareMode: true }, appType: "custom" });
   const previousFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ bridge_configured: true, bridge_connected: true }) });
+  globalThis.fetch = async (url) => ({ ok: true, json: async () => url.endsWith("/flows/live/entities")
+    ? liveCatalog : { bridge_configured: true, bridge_connected: true } });
   let view;
   try {
     const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
@@ -161,8 +164,9 @@ test("live events use the integration automatically and wait for it when disconn
   try {
     const { default: Source } = await server.ssrLoadModule("/src/features/flows/FutureEventsSource.jsx");
     for (const connected of [true, false]) {
-      globalThis.fetch = async () => ({ ok: true, json: async () => ({ url: "http://ha.local:8123", token_configured: false,
-        bridge_configured: true, bridge_connected: connected }) });
+      globalThis.fetch = async (url) => ({ ok: true, json: async () => url.endsWith("/flows/live/entities")
+        ? liveCatalog : { url: "http://ha.local:8123", token_configured: false,
+          bridge_configured: true, bridge_connected: connected } });
       let started;
       view = await renderInteractive(Source, { apiBaseUrl: "/api", canRun: true, onStartLive: async (value) => { started = value; return true; } });
       await view.event(view.container.querySelectorAll('input[type="radio"]')[1], "click");

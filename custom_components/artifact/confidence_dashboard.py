@@ -6,6 +6,8 @@ from homeassistant.helpers.json import json_dumps, json_fragment
 
 from .const import DOMAIN
 
+HISTORY_MINUTES = 15
+
 
 def confidence_panel_path(entry):
     return f"paranoid-confianza-{entry.entry_id}"
@@ -40,11 +42,14 @@ class ConfidenceDashboard(LovelaceConfig):
                 group = entities[offset:offset + 8]
                 cards.extend([
                     {"type": "entities", "title": f"Sensores de confianza ({title})", "entities": group, "show_header_toggle": False},
-                    {"type": "history-graph", "title": f"Historial de confianza (%) · {title}", "entities": group,
-                     "hours_to_show": 24, "min_y_axis": 0, "max_y_axis": 100, "fit_y_data": False},
+                    {"type": "history-graph",
+                     "title": f"Historial de confianza (%) · {title} · Últimos {HISTORY_MINUTES} min",
+                     "entities": group, "hours_to_show": HISTORY_MINUTES / 60,
+                     "min_y_axis": 0, "max_y_axis": 100, "fit_y_data": False},
                 ])
             if entities:
                 cards.append({"type": "custom:paranoid-confidence-changes", "entities": entities,
+                              "history_minutes": HISTORY_MINUTES,
                               "title": f"Motivos de los cambios · {title}"})
         return {"title": "Paranoid-Confianza", "views": [{"title": "Confianza", "path": "confianza", "cards": cards}]}
 

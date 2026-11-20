@@ -423,8 +423,11 @@ python -m unittest discover -s tests/backend -p "test_flow_confidence.py" -v
 
 ### Entidades e historial de confianza
 
-Al iniciar un flujo en directo, Paranoid registra una entidad de confianza por
-sensor seleccionado. Por ejemplo, `sensor.temperatura` genera el identificador
+Al iniciar un flujo en directo, el selector lista los sensores existentes en Home
+Assistant. Al agregar uno que no está en el historial de referencia, aparece un
+aviso. Paranoid evalúa y registra una entidad de confianza por sensor agregado.
+Con la selección vacía, evalúa todos los sensores compatibles que coinciden en
+Home Assistant y el historial de referencia. Por ejemplo, `sensor.temperatura` genera el identificador
 lógico `confianza.sensor_temperatura`. En Home Assistant se publica como
 `sensor.confianza_sensor_temperatura`, con unidad `%` y clase de estado
 `measurement`, para que Recorder conserve su historial y estadísticas. El
@@ -473,13 +476,13 @@ Los registros antiguos muestran la evidencia que guardaron en su momento.
 
 En **Paranoid-Confianza → Motivos de los cambios**, selecciona la entidad de
 **En directo** o **Test**, el inicio del intervalo en hora local y **Consultar
-una hora**. Abre una fila para ver los aportes y la evidencia de ese cambio.
+15 minutos**. Abre una fila para ver los aportes y la evidencia de ese cambio.
 El intervalo usa la hora de publicación en Home Assistant. Dentro de cada
 fila figura también la fecha de la lectura original. Los motivos se pueden
 consultar para estados publicados con esta versión que Recorder conserve.
 
 **Paranoid-Confianza** usa tarjetas nativas `entities` y `history-graph`, con las
-últimas 24 horas y el eje fijado entre 0 % y 100 %. Requiere Recorder e History
+últimos 15 minutos y el eje fijado entre 0 % y 100 %. Requiere Recorder e History
 activos y que estos sensores estén incluidos en su configuración de grabación.
 El panel se administra desde la integración. También se pueden añadir los
 sensores a un dashboard propio o utilizarlos en condiciones numéricas de las
@@ -490,7 +493,7 @@ type: history-graph
 title: Confianza de temperatura
 entities:
   - sensor.confianza_sensor_temperatura
-hours_to_show: 24
+hours_to_show: 0.25
 min_y_axis: 0
 max_y_axis: 100
 fit_y_data: false

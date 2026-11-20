@@ -10,6 +10,9 @@
 .fl-history-summary strong { font-size: 14px; }
 .fl-history-summary p { color: var(--fl-muted); font-size: 12px; }
 .fl-future-source, .fl-future-csv, .fl-live-form, .fl-live-form fieldset { display: grid; gap: 16px; }
+.fl-entity-selection { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.fl-entity-selection li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.fl-entity-selection code { overflow-wrap: anywhere; }
 .fl-future-source { margin: 18px 0; }
 .flow-lab .fl-event-sources { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .flow-lab .fl-event-option { display: flex; align-items: center; gap: 12px; padding: 15px; background: var(--fl-surface); border: 1px solid var(--fl-border); cursor: pointer; }

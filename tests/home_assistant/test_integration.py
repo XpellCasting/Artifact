@@ -589,10 +589,12 @@ async def test_confidence_dashboard_uses_native_graph_bounds_and_preserves_user_
     graphs = [card for card in config["views"][0]["cards"] if card["type"] == "history-graph"]
     assert [len(card["entities"]) for card in graphs] == [8, 2, 1]
     assert graphs[-1]["entities"] == ["sensor.confianza_test_sensor_x"]
-    assert graphs[-1]["title"].endswith("Test")
+    assert "Test" in graphs[-1]["title"]
+    assert all(card["hours_to_show"] == 0.25 for card in graphs)
     history = [card for card in config["views"][0]["cards"] if card["type"] == "custom:paranoid-confidence-changes"]
     assert [len(card["entities"]) for card in history] == [10, 1]
     assert history[-1]["entities"] == graphs[-1]["entities"]
+    assert all(card["history_minutes"] == 15 for card in history)
     assert all(card["min_y_axis"] == 0 and card["max_y_axis"] == 100 and card["fit_y_data"] is False for card in graphs)
     assert dashboard.mode == "yaml"
     assert await dashboard.async_json(False)

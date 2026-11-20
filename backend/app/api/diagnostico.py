@@ -85,14 +85,6 @@ def crear_router_diagnostico(workbench: DiagnosticWorkbench):
         path = translate(workbench.export_dataset, dataset_id)
         return FileResponse(path, media_type="application/zip", filename=f"diagnostic-examples-{dataset_id}.zip", background=BackgroundTask(path.unlink, missing_ok=True))
 
-    @router.post("/train")
-    def train(payload: dict):
-        if set(payload) - {"dataset_id", "method", "gat_config"} or "dataset_id" not in payload or payload.get("method", "gat_lstm") != "gat_lstm":
-            raise HTTPException(400, "Indica dataset_id y opcionalmente method=gat_lstm y gat_config.")
-        translate(workbench._read, "datasets", payload["dataset_id"])
-        return translate(workbench.start_job, workbench.train_gat, payload["dataset_id"], None, payload.get("gat_config"))
-
-
     @router.post("/models/{model_id}/evaluate")
     def evaluate(model_id: str, payload: dict):
         if set(payload) != {"dataset_id", "partition"}:

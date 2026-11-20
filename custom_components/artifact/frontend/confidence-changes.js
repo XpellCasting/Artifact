@@ -121,7 +121,7 @@ class ConfidenceChanges extends HTMLElement {
       <ha-card><h2></h2><div class="controls">
         <label>Entidad<select></select></label>
         <label>Desde (hora local de publicación)<input type="datetime-local" required></label>
-        <button class="load">Consultar una hora</button>
+        <button class="load"></button>
       </div><p class="current"></p><details class="current-evidence" hidden><summary>Qué cambió en los filtros</summary>
       <div></div></details><p role="status"></p><div class="rows"></div>
       <button class="more" hidden>Ver más cambios</button></ha-card>`;
@@ -130,10 +130,9 @@ class ConfidenceChanges extends HTMLElement {
     this.status = root.querySelector('[role="status"]');
     this.rows = root.querySelector(".rows");
     this.more = root.querySelector(".more");
-    const start = new Date(Date.now() - 59 * 60 * 1000);
-    this.start.value = new Date(start - start.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    this.loadButton = root.querySelector(".load");
     this.requestId = 0;
-    root.querySelector(".load").onclick = () => this.load();
+    this.loadButton.onclick = () => this.load();
     this.select.onchange = () => { this.showCurrent(); this.load(); };
     this.start.onchange = () => this.load();
     this.more.onclick = () => this.appendPage();
@@ -141,6 +140,12 @@ class ConfidenceChanges extends HTMLElement {
 
   setConfig(config) {
     const selected = this.select.value;
+    this.historyMinutes = config.history_minutes ?? 15;
+    this.loadButton.textContent = `Consultar ${this.historyMinutes} minutos`;
+    if (!this.start.value) {
+      const start = new Date(Date.now() - (this.historyMinutes - 1) * 60000);
+      this.start.value = new Date(start - start.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    }
     this.shadowRoot.querySelector("h2").textContent = config.title;
     this.select.replaceChildren(...config.entities.map(id => new Option(id, id)));
     if (config.entities.includes(selected)) this.select.value = selected;
@@ -177,7 +182,7 @@ class ConfidenceChanges extends HTMLElement {
     const id = this.requestId;
     const start = new Date(this.start.value);
     const query = new URLSearchParams({ filter_entity_id: this.select.value, skip_initial_state: "1",
-      end_time: new Date(start.getTime() + 3600000).toISOString() });
+      end_time: new Date(start.getTime() + this.historyMinutes * 60000).toISOString() });
     this.status.textContent = "Consultando historial…";
     try {
       const history = await this._hass.callApi("GET", "history/period/" + start.toISOString() + "?" + query);
@@ -207,8 +212,8 @@ class ConfidenceChanges extends HTMLElement {
         }
         return ["increase", "decrease"].includes(change.kind);
       }).reverse();
-      this.status.textContent = this.changes.length ? this.changes.length + " cambios en esta hora."
-        : "No hay alzas o bajas con motivo registrado en esta hora.";
+      this.status.textContent = this.changes.length ? `${this.changes.length} cambios en este intervalo.`
+        : "No hay alzas o bajas con motivo registrado en este intervalo.";
       this.offset = 0;
       this.appendPage();
     } catch {

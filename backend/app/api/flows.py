@@ -9,12 +9,11 @@ from fastapi import HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 import app.database.evaluacion_etiquetada as labelled_evaluation
 from app.flow.context_replay import ContextReplay
-from app.flow.definitions import default_flow
-from app.flow.definitions import validate_flow
+from app.flow.definitions import thesis_flows, validate_flow
 from app.flow.evaluacion import CausalFlowRunner
 from fastapi import APIRouter
 from app.api.schemas import FlowRunRequest, HomeAssistantLiveRequest
-from app.services.home_assistant_live import HomeAssistantEventSource
+from app.services.home_assistant_live import HomeAssistantEventSource, live_entity_catalog, reference_entities
 from app.services.historial.cargar_historial import CargadorHistorial
 from app.services.runtime import state, flow_store, flow_evaluation_jobs, home_assistant_bridge
 router = APIRouter()
@@ -28,7 +27,8 @@ def require_classifier_models(flow):
 
 @router.get("/flows", tags=["flow-lab"])
 def flows() -> dict[str, Any]:
-    return {"items": flow_store.list(), "default": default_flow(),
+    presets = thesis_flows()
+    return {"items": flow_store.list(), "default": presets[0], "thesis_templates": presets,
             "evidence_contract": {"version": "module-envelope-v1", "policies": ["independent", "combine_v1"],
                                   "modules": ["statistical_focus", "contextual", "classifier"], "cycles": False}}
 
@@ -128,6 +128,17 @@ def flow_evaluation_status(job_id: str, compact: bool = False):
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="La evaluación no está disponible; el servicio pudo reiniciarse. Las ejecuciones terminadas siguen guardadas.") from exc
 
+@router.get("/flows/live/entities", tags=["flow-evaluation"])
+def live_flow_entities():
+    try:
+        with state.validation_replay_lock:
+            reference = reference_entities(state.historial.entidades if state.historial is not None else None)
+        catalog = live_entity_catalog(home_assistant_bridge, reference)
+        return {"entities": [catalog[entity_id] for entity_id in sorted(catalog)]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/flows/{flow_id}/live/start", tags=["flow-evaluation"])
 def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
     try:
@@ -152,6 +163,7 @@ def start_live_flow(flow_id: str, request: HomeAssistantLiveRequest):
             if source.error and not summary["candidate_count"]:
                 raise ValueError(source.error)
             snapshot["source"].update(filename="Eventos entrantes de Home Assistant", type="home_assistant",
+                                      entity_ids=sorted(source.selected),
                                       connection_error=source.error,
                                       reception={**source.status(), "status": "failed" if source.error else "stopped"})
             return summary, results, snapshot

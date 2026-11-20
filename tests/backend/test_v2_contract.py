@@ -93,6 +93,6 @@ class SegmentContractTests(unittest.TestCase):
             api = FastAPI(); api.include_router(crear_router_diagnostico(service))
             with TestClient(api) as client:
                 self.assertEqual(client.post("/diagnostics/build", json={"method": "robust_nearest_prototype"}).status_code, 422)
-                self.assertEqual(client.post("/diagnostics/train", json={"dataset_id": "a" * 32, "method": "robust_nearest_prototype"}).status_code, 400)
+                self.assertEqual(client.post("/diagnostics/train", json={"dataset_id": "a" * 32, "method": "gat_lstm"}).status_code, 404)
                 self.assertEqual(client.post("/diagnostics/pretrain", json={}).status_code, 404)
                 self.assertEqual(client.get("/diagnostics/sources?method=robust_nearest_prototype").status_code, 422)
