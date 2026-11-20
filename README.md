@@ -423,6 +423,17 @@ python -m unittest discover -s tests/backend -p "test_flow_confidence.py" -v
 
 ### Entidades e historial de confianza
 
+En **Evaluación de flujos → Gestionar sensores de confianza**, selecciona los
+sensores inactivos que quieras retirar, pulsa **Borrar selección** y confirma.
+El borrado distingue los modos **En directo** y **Test**. Quita la entidad del
+catálogo y del registro de Home Assistant. El historial y los resultados de las
+ejecuciones guardadas en Paranoid siguen disponibles. Si vuelves a evaluar el
+sensor en el mismo modo, se publicará de nuevo.
+
+Para que el borrado llegue a Home Assistant, usa la integración **Paranoid 0.6.4**
+o posterior. Si el puente está desconectado, el catálogo se actualiza de inmediato
+y la integración procesa el borrado en la siguiente sincronización.
+
 Al iniciar un flujo en directo, el selector lista los sensores existentes en Home
 Assistant. Al agregar uno que no está en el historial de referencia, aparece un
 aviso. Paranoid evalúa y registra una entidad de confianza por sensor agregado.

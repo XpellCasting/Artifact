@@ -17,7 +17,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import InvalidArtifactResponse
 from .const import CONF_BRIDGE_TOKEN
-from .confidence import ConfidenceHub
+from .confidence import ConfidenceHub, confidence_unique_id, remove_confidence_entity
 
 _LOGGER = logging.getLogger(__name__)
 DOMAINS = {"sensor", "binary_sensor", "switch", "input_boolean", "select", "input_select"}
@@ -107,7 +107,10 @@ class ArtifactBridge:
         try:
             result = []
             if operation in {"confidence_sync", "confidence_update"}:
-                self.confidence.apply(arguments, sync=operation == "confidence_sync")
+                removed = self.confidence.apply(arguments, sync=operation == "confidence_sync")
+                for item in removed:
+                    unique_id = confidence_unique_id(self.entry.entry_id, item["source_entity_id"], item["source_mode"])
+                    remove_confidence_entity(self.hass, self.entry.entry_id, unique_id)
             elif operation == "states":
                 rows = [state.as_dict() for state in self.hass.states.async_all()
                         if state.domain in DOMAINS and not state.attributes.get("paranoid_confidence")]

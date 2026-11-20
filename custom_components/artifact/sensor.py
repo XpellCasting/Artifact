@@ -5,6 +5,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 
 from .const import CONF_WEB_URL, DOMAIN
+from .confidence import confidence_unique_id, remove_confidence_entity
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -13,6 +14,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     @callback
     def discover():
+        known.intersection_update(hub.entities)
         new_keys = sorted(set(hub.entities) - known)
         if new_keys:
             known.update(new_keys)
@@ -37,7 +39,7 @@ class ConfidenceSensor(SensorEntity):
         source = item["source_entity_id"]
         test = item.get("source_mode") == "test"
         self.entity_id = f"sensor.confianza_{key.split('.', 1)[1]}"
-        self._attr_unique_id = f"{entry.entry_id}_confidence_{'test_' if test else ''}{source}"
+        self._attr_unique_id = confidence_unique_id(entry.entry_id, source, item.get("source_mode", "live"))
         self._attr_name = f"Confianza test {source}" if test else f"Confianza {source}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)}, name=entry.title, manufacturer="XpellCasting",
@@ -46,15 +48,15 @@ class ConfidenceSensor(SensorEntity):
 
     @property
     def available(self):
-        return self.hub.connected and self.hub.synchronized and self.hub.entities[self.key]["available"]
+        return self.hub.connected and self.hub.synchronized and self.hub.entities.get(self.key, {}).get("available", False)
 
     @property
     def native_value(self):
-        return self.hub.entities[self.key].get("value")
+        return self.hub.entities.get(self.key, {}).get("value")
 
     @property
     def extra_state_attributes(self):
-        item = self.hub.entities[self.key]
+        item = self.hub.entities.get(self.key, {})
         keys = ("entity_id", "source_entity_id", "source_value", "source_state", "source_timestamp",
                 "evaluated_at", "observation_id", "flow_id", "execution_id", "config_hash",
                 "confidence_kind", "confidence_calibrated", "evidence_coverage", "method",
@@ -67,12 +69,22 @@ class ConfidenceSensor(SensorEntity):
 
     async def async_added_to_hass(self):
         await super().async_added_to_hass()
+        if self.key not in self.hub.entities:
+            self.hass.loop.call_soon(self._remove_if_deleted)
+            return
         self.async_on_remove(self.hub.listen(self._handle_update))
         self.hub.register_entity(self.key, self.entity_id)
 
     @callback
+    def _remove_if_deleted(self):
+        if self.key not in self.hub.entities:
+            remove_confidence_entity(self.hass, self.entry.entry_id, self._attr_unique_id)
+
+    @callback
     def _handle_update(self):
-        item = self.hub.entities[self.key]
+        item = self.hub.entities.get(self.key)
+        if item is None:
+            return
         signature = (item.get("revision"), self.available)
         if item.get("source_mode", "live") == "live":
             # A reading can refresh timestamps without changing the confidence

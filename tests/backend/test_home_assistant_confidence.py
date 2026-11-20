@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import closing
+from functools import partial
 import importlib.util
 from pathlib import Path
 import sqlite3
@@ -154,6 +155,7 @@ class ConfidenceCatalogTests(unittest.TestCase):
         self.assertEqual(live["store_id"], original["store_id"])
         self.assertGreater(live["revision"], original["revision"])
         self.assertFalse(live["available"])
+        self.assertEqual(migrated.snapshot(compact=True)["entities"][0]["source_mode"], "live")
 
 
 class ConfidenceHistoryTests(unittest.TestCase):
@@ -238,6 +240,40 @@ class ConfidenceBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(requests[0]["arguments"]["entities"][1]["entity_id"], "confianza.test_sensor_s0")
             await bridge.close()
 
+    async def test_deletion_is_replayed_on_reconnect_only_to_updated_integrations(self):
+        requests = []
+
+        class Socket:
+            async def send_json(self, message):
+                requests.append(message)
+                self.connection.receive({"type": "result", "request_id": message["request_id"], "success": True})
+
+            async def close(self, **kwargs):
+                pass
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            bridge = HomeAssistantBridge(root / "bridge.json")
+            store = ConfidenceEntityStore(root / "confidence.sqlite3")
+            store.start("live", "flow", ["sensor.temperature"])
+            stopped = store.stop("live")[0]
+            removed = store.delete({("sensor.temperature", "live"): stopped["revision"]})
+            store = ConfidenceEntityStore(store.path)
+            bridge.set_confidence_provider(partial(store.snapshot, include_deleted=True))
+            for supported in (False, True):
+                requests.clear()
+                socket = Socket()
+                socket.connection = await bridge.attach(socket, supports_confidence_removal=supported)
+                await socket.connection.confidence_sync_task
+                self.assertEqual(requests[0]["arguments"]["entities"], removed if supported else [])
+                if supported:
+                    await asyncio.to_thread(bridge.publish_confidence, removed)
+                    self.assertEqual(requests[-1]["operation"], "confidence_update")
+                else:
+                    with self.assertRaisesRegex(ValueError, "Actualiza la integración"):
+                        await asyncio.to_thread(bridge.publish_confidence, removed)
+                bridge.detach(socket.connection)
+
 
 class ConfidenceApiTests(unittest.TestCase):
     def setUp(self):
@@ -256,7 +292,8 @@ class ConfidenceApiTests(unittest.TestCase):
             spec.loader.exec_module(module)
         app = FastAPI()
         app.include_router(module.router)
-        app.include_router(create_confidence_router(self.catalog))
+        self.bridge = Mock()
+        app.include_router(create_confidence_router(self.catalog, self.bridge))
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
 
@@ -285,6 +322,40 @@ class ConfidenceApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/flow-runs/missing/confidence").status_code, 404)
         for query in ("offset=-1", "limit=0", "limit=5001", "limit=invalid"):
             self.assertEqual(self.client.get(f"/flow-runs/{run}/confidence?{query}").status_code, 422)
+
+    def test_delete_is_atomic_and_keeps_saved_history_and_other_modes(self):
+        run = self.flows.save_run("flow", {}, {}, {"output": [reading()]})
+        self.catalog.start("old", "flow", ["sensor.temperature"])
+        live = self.catalog.stop("old")[0]
+        test = self.catalog.start("test", "flow", ["sensor.temperature"], test=True)[0]
+        compact = self.client.get("/confidence/entities?compact=true").json()["entities"]
+        self.assertEqual(len(compact), 2)
+        self.assertNotIn("value", compact[0])
+
+        def selection(item):
+            return {key: item[key] for key in ("source_entity_id", "source_mode", "revision")}
+
+        response = self.client.request("DELETE", "/confidence/entities", json={"entities": [selection(live), selection(test)]})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.catalog.snapshot()["entities"], [live, test])
+        self.bridge.publish_confidence.assert_not_called()
+
+        body = {"entities": [selection(live)]}
+        for _ in range(2):
+            response = self.client.request("DELETE", "/confidence/entities", json=body)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), {"removed": 1, "synchronization": "completed"})
+            self.assertEqual(self.catalog.snapshot()["entities"], [test])
+        tombstone = self.catalog.snapshot(include_deleted=True)["entities"][0]
+        self.assertTrue(tombstone["deleted"])
+        self.assertGreater(tombstone["revision"], live["revision"])
+        self.assertEqual(self.bridge.publish_confidence.call_args.args[0], [tombstone])
+        self.assertEqual(self.client.get(f"/flow-runs/{run}/confidence").json()["points"][0]["value"], 93)
+        self.catalog.start("new", "flow", ["sensor.temperature"])
+        self.catalog.stop("new")
+        response = self.client.request("DELETE", "/confidence/entities", json=body)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(len(self.catalog.snapshot()["entities"]), 2)
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ def crear_app():
     api.include_router(contextual_router)
     api.include_router(flows_router)
     api.include_router(create_bridge_router(home_assistant_bridge))
-    api.include_router(create_confidence_router(confidence_entities))
+    api.include_router(create_confidence_router(confidence_entities, home_assistant_bridge))
     return api
 
 app = crear_app()

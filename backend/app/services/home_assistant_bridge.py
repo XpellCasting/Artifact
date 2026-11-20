@@ -39,9 +39,10 @@ def _confidence_batches(entities):
 
 
 class BridgeConnection:
-    def __init__(self, socket, *, supports_test_confidence=False):
+    def __init__(self, socket, *, supports_test_confidence=False, supports_confidence_removal=False):
         self.socket = socket
         self.supports_test_confidence = supports_test_confidence
+        self.supports_confidence_removal = supports_confidence_removal
         self.loop = asyncio.get_running_loop()
         self.pending = {}
         self.subscriptions = {}
@@ -160,8 +161,9 @@ class HomeAssistantBridge:
             return {"bridge_configured": self.registration is not None,
                     "bridge_connected": bool(self.connection and self.connection.connected)}
 
-    async def attach(self, socket, *, supports_test_confidence=False):
-        connection = BridgeConnection(socket, supports_test_confidence=supports_test_confidence)
+    async def attach(self, socket, *, supports_test_confidence=False, supports_confidence_removal=False):
+        connection = BridgeConnection(socket, supports_test_confidence=supports_test_confidence,
+                                      supports_confidence_removal=supports_confidence_removal)
         with self.lock:
             previous, self.connection = self.connection, connection
         if previous is not None:
@@ -189,6 +191,8 @@ class HomeAssistantBridge:
             entities = snapshot["entities"]
             if not connection.supports_test_confidence:
                 entities = [item for item in entities if item.get("source_mode") != "test"]
+            if not connection.supports_confidence_removal:
+                entities = [item for item in entities if not item.get("deleted")]
             sent = 0
             for batch in _confidence_batches(entities) if entities else [[]]:
                 await connection.request("confidence_sync", {
@@ -204,6 +208,8 @@ class HomeAssistantBridge:
         if not entities:
             return
         connection = self._connection()
+        if not connection.supports_confidence_removal and any(item.get("deleted") for item in entities):
+            raise BridgeOperationUnsupported("Actualiza la integración Paranoid para borrar los sensores de confianza.")
         if not connection.supports_test_confidence and any(item.get("source_mode") == "test" for item in entities):
             raise BridgeOperationUnsupported("Actualiza la integración Paranoid para publicar los sensores de confianza test.")
         for batch in _confidence_batches(entities):

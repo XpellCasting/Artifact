@@ -18,7 +18,7 @@ SOURCE_ID = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
 CATALOG_SCHEMA = """
     CREATE TABLE IF NOT EXISTS confidence_catalog (
         source_entity_id TEXT NOT NULL, source_mode TEXT NOT NULL, session_id TEXT,
-        revision INTEGER NOT NULL, payload TEXT NOT NULL,
+        revision INTEGER NOT NULL, payload TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (source_entity_id, source_mode)
     )
 """
@@ -29,6 +29,10 @@ def confidence_entity_id(source, *, test=False):
         raise ValueError("La entidad de origen no es un sensor compatible para publicar confianza.")
     prefix = "test_" if test else ""
     return f"confianza.{prefix}{source.replace('.', '_')}"
+
+
+class ConfidenceSelectionChanged(ValueError):
+    pass
 
 
 class ConfidenceEntityStore:
@@ -43,10 +47,12 @@ class ConfidenceEntityStore:
                 db.execute("ALTER TABLE confidence_catalog RENAME TO confidence_catalog_live_v1")
                 db.execute(CATALOG_SCHEMA)
                 db.execute("""
-                    INSERT INTO confidence_catalog
+                    INSERT INTO confidence_catalog (source_entity_id,source_mode,session_id,revision,payload)
                     SELECT source_entity_id,'live',session_id,revision,payload FROM confidence_catalog_live_v1
                 """)
                 db.execute("DROP TABLE confidence_catalog_live_v1")
+            elif "deleted" not in columns:
+                db.execute("ALTER TABLE confidence_catalog ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
             db.execute("""
                 CREATE TABLE IF NOT EXISTS confidence_clock (
                     id INTEGER PRIMARY KEY CHECK(id=1),store_id TEXT NOT NULL,revision INTEGER NOT NULL
@@ -87,8 +93,9 @@ class ConfidenceEntityStore:
         db.execute("UPDATE confidence_clock SET revision=revision+1 WHERE id=1")
         revision = db.execute("SELECT revision FROM confidence_clock WHERE id=1").fetchone()[0]
         item.update(store_id=self.store_id, revision=revision)
-        db.execute("INSERT OR REPLACE INTO confidence_catalog VALUES (?,?,?,?,?)",
-                   (item["source_entity_id"], item.get("source_mode", "live"), session_id, revision, _json(item)))
+        db.execute("INSERT OR REPLACE INTO confidence_catalog VALUES (?,?,?,?,?,?)",
+                   (item["source_entity_id"], item.get("source_mode", "live"), session_id, revision,
+                    _json(item), int(item.get("deleted", False))))
         return {key: value for key, value in item.items() if key not in ("_scores", "_facts", "_excluded")}
 
     def start(self, session_id, flow_id, sources, *, test=False):
@@ -152,18 +159,49 @@ class ConfidenceEntityStore:
 
     def stop(self, session_id):
         changed = []
-        with self._database() as db:
+        with self._database(begin_write=True) as db:
             for payload, in db.execute("SELECT payload FROM confidence_catalog WHERE session_id=?", (session_id,)).fetchall():
                 item = json.loads(payload)
                 item.update(available=False, activity="stopped", last_changed=_now())
                 changed.append(self._write(db, None, item))
         return changed
 
-    def snapshot(self):
+    def delete(self, selection):
+        removed = []
+        with self._database(begin_write=True) as db:
+            for (source, mode), expected_revision in selection.items():
+                row = db.execute("""
+                    SELECT session_id,revision,deleted,payload FROM confidence_catalog
+                    WHERE source_entity_id=? AND source_mode=?
+                """, (source, mode)).fetchone()
+                if row is None:
+                    continue
+                session, revision, deleted, payload = row
+                if deleted:
+                    removed.append(json.loads(payload))
+                    continue
+                if session is not None:
+                    raise ConfidenceSelectionChanged(f"{source} está en una evaluación. Detén la evaluación antes de borrar su sensor de confianza.")
+                if revision != expected_revision:
+                    raise ConfidenceSelectionChanged(f"El registro de {source} cambió. Actualiza la lista y revisa la selección.")
+                removed.append(self._write(db, None, {
+                    "entity_id": confidence_entity_id(source, test=mode == "test"),
+                    "source_entity_id": source, "source_mode": mode,
+                    "deleted": True, "available": False,
+                }))
+        return removed
+
+    def snapshot(self, *, include_deleted=False, compact=False):
         with self._database() as db:
             db.execute("BEGIN")
             revision = db.execute("SELECT revision FROM confidence_clock WHERE id=1").fetchone()[0]
-            items = [json.loads(row[0]) for row in db.execute("SELECT payload FROM confidence_catalog ORDER BY source_entity_id,source_mode")]
+            items = [json.loads(row[0]) for row in db.execute("""
+                SELECT payload FROM confidence_catalog WHERE deleted=0 OR ? ORDER BY source_entity_id,source_mode
+            """, (include_deleted,))]
+            if compact:
+                fields = ("entity_id", "source_entity_id", "revision", "available")
+                items = [{**{key: item[key] for key in fields}, "source_mode": item.get("source_mode", "live")}
+                         for item in items]
             for item in items:
                 item.pop("_scores", None)
                 item.pop("_facts", None)

@@ -7,6 +7,7 @@ import { NODE_LABELS, SIGNAL_LABELS, DECISIONS, SIGNALS, clone, connect, default
 import "./flow-lab.css";
 import FutureEventsSource from "./FutureEventsSource.jsx";
 import FlowRunResults from "./FlowRunResults.jsx";
+import ConfidenceEntityManager from "./ConfidenceEntityManager.jsx";
 import { useFlowEvaluationPolling } from "./use-flow-evaluation-polling.js";
 import { confidencePercent } from "./confidence-history-model.js";
 
@@ -364,6 +365,7 @@ function FlowLabContent({ apiBaseUrl, onSelectHistory, historyReady, continuousM
       const sum = (kind, field) => groups.filter(g => !kind || g.expected === kind).reduce((total, g) => total + (g[field] || 0), 0);
       return <tr key={run.run_id}><td>{run.snapshot.source?.filename || "Histórico"}{run.snapshot.source?.fingerprint && <small className="fl-muted"> · {run.snapshot.source.fingerprint.slice(0, 10)}</small>}</td><td>{run.snapshot.flow.name} · {new Date(run.created_at).toLocaleString()}</td><td>{sum("Falla", "detected")} / {sum("Falla", "total")}</td><td>{sum("anomalia", "detected")} / {sum("anomalia", "total")}</td><td>{sum("Falla", "type_identified")} / {groups.filter(g => g.expected === "Falla" && g.fault_type).reduce((n, g) => n + g.total, 0)}</td><td>{sum(null, "false_positives")}</td><td><button disabled={busy} onClick={() => { openRun(run); resultsRef.current?.focus(); }}>Ver resultados</button></td></tr>;
     })}</tbody></table></div>{!runs.some(r => r.summary.evaluation?.labelled) && <p className="fl-muted">Carga un conjunto etiquetado y evalúa un flujo para comenzar la comparación.</p>}</section>
+    <ConfidenceEntityManager apiBaseUrl={apiBaseUrl} />
     <section ref={resultsRef} tabIndex={-1} className="fl-results" aria-label="Resultados de flujos"><div className="fl-results-toolbar"><h3>Ejecuciones</h3><label>Consultar<select aria-label="Ejecución guardada" value={activeRun?.run_id || ""} disabled={busy} onChange={(event) => { const run = runs.find((item) => item.run_id === event.target.value); if (run) openRun(run); }}><option value="">Seleccionar ejecución…</option>{runs.map((run) => <option key={run.run_id} value={run.run_id}>{run.snapshot?.flow?.name} · {run.snapshot.source?.filename || "Histórico"} · {new Date(run.created_at).toLocaleString()}</option>)}</select></label><button disabled={busy} aria-label="Actualizar ejecuciones" onClick={() => refresh().catch((e) => setError(e.message))}><RotateCcw size={16} /></button></div>
       {!activeRun ? <div className="fl-empty"><GitBranch size={28} /><strong>{runsLoaded ? "Tu primera ejecución aparecerá aquí" : "Cargando ejecuciones guardadas…"}</strong><p>{runsLoaded ? "Guarda un flujo y ejecútalo para revisar el recorrido y la evidencia." : "Consultando las pruebas realizadas."}</p></div> : <FlowRunResults
         key={`${apiBaseUrl}/${activeRunId}`} apiBaseUrl={apiBaseUrl} run={activeRun} activeTab={resultsTab} onTabChange={setResultsTab}>

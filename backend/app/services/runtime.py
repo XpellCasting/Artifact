@@ -2,6 +2,7 @@ from __future__ import annotations
 from app.config import setting
 import json
 import os
+from functools import partial
 from pathlib import Path
 from app.services.historial.cargar_historial import CargadorHistorial
 from app.modulos.contextual import ConfiguracionContextual
@@ -48,7 +49,7 @@ state = EstadoAplicacion(
 flow_store = FlowStore(Path(setting('FLOW_LAB_DB_PATH')))
 home_assistant_bridge = HomeAssistantBridge(STORAGE_DIR / "home_assistant_bridge.json")
 confidence_entities = ConfidenceEntityStore(flow_store.path)
-home_assistant_bridge.set_confidence_provider(confidence_entities.snapshot)
+home_assistant_bridge.set_confidence_provider(partial(confidence_entities.snapshot, include_deleted=True))
 flow_evaluation_jobs = FlowEvaluationJobs(flow_store, confidence_store=confidence_entities,
                                          confidence_publish=home_assistant_bridge.publish_confidence)
 history_candidates = HistoryCandidates(STORAGE_DIR / "history_candidates")

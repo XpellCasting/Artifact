@@ -61,7 +61,8 @@ class ArtifactClient:
         url = base.with_scheme("wss" if base.scheme == "https" else "ws")
         return self._session.ws_connect(
             f"{url}/home-assistant/bridge",
-            headers={"Authorization": f"Bearer {token}", "X-Paranoid-Confidence-Test": "1"},
+            headers={"Authorization": f"Bearer {token}", "X-Paranoid-Confidence-Test": "1",
+                     "X-Paranoid-Confidence-Removal": "1"},
             heartbeat=20, max_msg_size=1024 * 1024,
         )
 

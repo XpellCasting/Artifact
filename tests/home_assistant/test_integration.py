@@ -13,6 +13,7 @@ import pytest_asyncio
 from aiohttp import ClientResponseError, ClientSession, web
 from homeassistant.config_entries import ConfigEntryNotReady, ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
@@ -69,7 +70,8 @@ async def endpoint(tmp_path) -> AsyncIterator[tuple[str, dict]]:
         socket = web.WebSocketResponse()
         await socket.prepare(request)
         connection = await state["bridge"].attach(
-            socket, supports_test_confidence=request.headers.get("X-Paranoid-Confidence-Test") == "1")
+            socket, supports_test_confidence=request.headers.get("X-Paranoid-Confidence-Test") == "1",
+            supports_confidence_removal=request.headers.get("X-Paranoid-Confidence-Removal") == "1")
         try:
             async for message in socket:
                 if message.type == web.WSMsgType.TEXT:
@@ -123,6 +125,7 @@ def make_entry(base_url):
         state=ConfigEntryState.SETUP_IN_PROGRESS,
         async_on_unload=Mock(),
         pref_disable_polling=False,
+        pref_disable_new_entities=False,
         runtime_data=None,
         async_create_background_task=lambda current_hass, coroutine, name: current_hass.async_create_background_task(coroutine, name),
     )
@@ -650,5 +653,51 @@ async def test_bridge_synchronizes_persistent_confidence_and_excludes_feedback(h
         assert {row["entity_id"] for row in states} == {"sensor.temperature"}
         await asyncio.to_thread(bridge.publish_confidence, store.stop("live"))
         assert not live_sensor.available
+    finally:
+        await integration.async_close()
+
+
+@pytest.mark.asyncio
+async def test_confidence_removal_deletes_renamed_registry_entity_and_allows_future_evaluation(hass, endpoint, session, tmp_path):
+    store = ConfidenceEntityStore(tmp_path / "confidence.sqlite3")
+    live = store.start("live", "flow", ["sensor.temperature"])[0]
+    stopped = store.stop("live")[0]
+    store.start("test", "flow", ["sensor.temperature"], test=True)
+    endpoint[1]["bridge"].set_confidence_provider(store.snapshot)
+    integration, bridge = await connected_bridge(hass, endpoint, session)
+    try:
+        await bridge.connection.confidence_sync_task
+        hub = integration.confidence
+        entry = integration.entry
+        entry.runtime_data = SimpleNamespace(bridge=integration)
+        added = Mock()
+        await setup_confidence_sensors(hass, entry, added)
+        sensors = {sensor.key: sensor for sensor in added.call_args.args[0]}
+        live_sensor = sensors["confianza.sensor_temperature"]
+        test_sensor = sensors["confianza.test_sensor_temperature"]
+        registry = entity_registry.async_get(hass)
+        await registry.async_load()
+        registered = registry.async_get_or_create("sensor", "artifact", live_sensor.unique_id, config_entry=entry)
+        test_registered = registry.async_get_or_create("sensor", "artifact", test_sensor.unique_id, config_entry=entry)
+        renamed = registry.async_update_entity(registered.entity_id, new_entity_id="sensor.mi_confianza")
+        hub.register_entity(live_sensor.key, renamed.entity_id)
+        hub.register_entity(test_sensor.key, test_registered.entity_id)
+        dashboard_update = hub.dashboard_update = Mock()
+
+        removed = store.delete({("sensor.temperature", "live"): stopped["revision"]})
+        await asyncio.to_thread(bridge.publish_confidence, removed)
+        assert registry.async_get(renamed.entity_id) is None
+        assert registry.async_get(test_registered.entity_id) is not None
+        assert live_sensor.key not in hub.entities and live_sensor.key not in hub.entity_ids
+        dashboard_update.assert_called_once()
+
+        await asyncio.to_thread(bridge.publish_confidence, [live])
+        assert live_sensor.key not in hub.entities
+        assert added.call_count == 1
+        recreated = store.start("new", "flow", ["sensor.temperature"])
+        await asyncio.to_thread(bridge.publish_confidence, recreated)
+        await asyncio.to_thread(bridge.publish_confidence, removed)
+        assert added.call_count == 2
+        assert hub.entities[live_sensor.key]["revision"] == recreated[0]["revision"]
     finally:
         await integration.async_close()

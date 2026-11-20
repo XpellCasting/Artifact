@@ -4,9 +4,23 @@ import math
 import re
 
 from homeassistant.core import callback
+from homeassistant.helpers import entity_registry
 
+from .const import DOMAIN
 
 SOURCE_ID = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
+
+
+def confidence_unique_id(entry_id, source, mode):
+    return f"{entry_id}_confidence_{'test_' if mode == 'test' else ''}{source}"
+
+
+@callback
+def remove_confidence_entity(hass, entry_id, unique_id):
+    registry = entity_registry.async_get(hass)
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+    if entity_id is not None and registry.async_get(entity_id).config_entry_id == entry_id:
+        registry.async_remove(entity_id)
 
 
 class ConfidenceHub:
@@ -18,6 +32,7 @@ class ConfidenceHub:
         self.listeners = set()
         self.dashboard_update = None
         self._sync_entities = set()
+        self._removed_revisions = {}
 
     @callback
     def listen(self, listener):
@@ -55,6 +70,7 @@ class ConfidenceHub:
                     or item.get("store_id") != payload["store_id"]
                     or type(item.get("revision")) is not int or item["revision"] < 0
                     or type(item.get("available")) is not bool
+                    or ("deleted" in item and (item["deleted"] is not True or item["available"]))
                     or (value is not None and (type(value) not in (int, float)
                                               or not math.isfinite(value) or not 0 <= value <= 100))):
                 raise ValueError("La entidad de confianza no es válida.")
@@ -64,16 +80,29 @@ class ConfidenceHub:
         if payload["store_id"] != self.store_id:
             self.store_id = payload["store_id"]
             self.entities = {key: {**value, "available": False, "revision": -1} for key, value in self.entities.items()}
+            self._removed_revisions.clear()
             self.synchronized = False
         if sync and payload.get("reset"):
             self._sync_entities = set()
         changed = set()
+        removed = []
+        dashboard_changed = False
         for item in rows:
             entity = item["entity_id"]
+            revision = item["revision"]
+            previous = self.entities.get(entity)
+            removed_revision = self._removed_revisions.get(entity, -1)
+            if item.get("deleted"):
+                if revision >= removed_revision and (previous is None or revision > previous["revision"]):
+                    self._removed_revisions[entity] = revision
+                    self.entities.pop(entity, None)
+                    if self.entity_ids.pop(entity, None) is not None:
+                        dashboard_changed = True
+                    removed.append(item)
+                continue
             if sync:
                 self._sync_entities.add(entity)
-            previous = self.entities.get(entity)
-            if previous is None or item["revision"] > previous["revision"]:
+            if revision > removed_revision and (previous is None or revision > previous["revision"]):
                 if entity in changed:
                     # A timestamp group may include multiple readings of the same sensor.
                     self._notify()
@@ -86,6 +115,9 @@ class ConfidenceHub:
                     item["available"] = False
             self.synchronized = True
         self._notify()
+        if dashboard_changed and self.dashboard_update is not None:
+            self.dashboard_update()
+        return removed
 
     @callback
     def register_entity(self, key, entity_id):
