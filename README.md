@@ -5,8 +5,8 @@ inusuales y distinguir entre anomalías ambientales y posibles fallas del sensor
 Permite explorar y etiquetar lecturas, aplicar filtros y diseñar flujos visuales
 para evaluar datos en orden temporal, desde archivos CSV o desde Home Assistant.
 
-La aplicación incluye un modelo GAT-LSTM preentrenado que se restaura durante la
-instalación. Su backend está desarrollado con Python y FastAPI, y la interfaz con
+El clasificador permite importar modelos GAT-LSTM preentrenados desde un ZIP.
+Su backend está desarrollado con Python y FastAPI, y la interfaz con
 React. El código puede ampliarse para incorporar nuevos tipos de nodos.
 
 ## Instalación
@@ -16,19 +16,15 @@ Docker Compose o instalar el backend y la interfaz directamente en el equipo.
 
 ### 1. Descargar el proyecto
 
-Instalar Git y Git LFS. Luego, desde la carpeta donde se quiera guardar el proyecto:
+En el [repositorio de Paranoid](https://github.com/XpellCasting/Artifact), elegir
+**Code → Download ZIP** y extraer el proyecto. Abrir PowerShell en la carpeta
+que contiene `docker-compose.yml`. Si ya se dispone de una copia del código,
+abrir esa carpeta directamente.
 
-```powershell
-git lfs install
-git clone https://github.com/XpellCasting/Artifact.git
-cd Artifact
-git lfs pull
-```
-
-Si el repositorio ya está descargado, abrir PowerShell en su carpeta raíz
-(`Artifact`, donde está `docker-compose.yml`) y ejecutar `git lfs install` y
-`git lfs pull`. Git LFS descarga el paquete del modelo en
-`artifacts/gat_lstm/snapshot.tar.gz`, necesario para la restauración inicial.
+Para la evaluación con el modelo C, descargar también `Modelo_C_20261030.zip`
+desde el enlace de Drive proporcionado por quien organiza la prueba. Conservar
+ese ZIP sin descomprimir para importarlo desde la aplicación. Esta instalación
+funciona sin Git LFS.
 
 ### 2. Instalar y ejecutar con Docker
 
@@ -42,9 +38,9 @@ Desde la raíz del repositorio:
 docker compose up --build
 ```
 
-La primera ejecución construye las imágenes, instala las dependencias y restaura
-los archivos ausentes del paquete del modelo preentrenado. Conserva la selección
-de modelo activo existente.
+La primera ejecución construye las imágenes, instala las dependencias e inicia
+la API y la interfaz. En una instalación nueva, el clasificador queda disponible
+al importar y activar un modelo.
 
 En Docker, el primer arranque con un volumen nuevo crea bases SQLite vacías. Los
 flujos, las evaluaciones y los archivos de resultados que se generen se guardan
@@ -68,6 +64,17 @@ docker compose stop
 ```
 
 Los directorios `data/`, `storage/` y `models/` conservan el estado entre reinicios.
+
+### 3. Importar y activar el modelo C
+
+1. En Paranoid, abrir **Clasificador diagnóstico → Modelos y evaluación**.
+2. En **Importar modelo entrenado**, elegir `Modelo_C_20261030.zip` y pulsar
+   **Importar ZIP**.
+3. Pulsar **Activar versión experimental** y comprobar que el encabezado muestra
+   **Modelo entrenado activo** con la versión `4d238952b2af4730a52c1c1a355f738c`.
+
+Los flujos que usan **Modelo activo** utilizarán esa versión. La selección se
+conserva al reiniciar Paranoid.
 
 ### Home Assistant (Marketplace y HACS)
 
@@ -116,16 +123,15 @@ aviso de que los metadatos de áreas no están disponibles.
 
 Requiere Python 3.12 y Node.js 22.13 o superior dentro de la rama 22, o Node.js 24,
 con npm. Estas versiones de Node.js satisfacen los requisitos del lockfile de
-la interfaz. Completar primero la descarga del proyecto y del paquete Git LFS.
+la interfaz. Descargar primero el proyecto como se indica en el paso 1.
 
 En una terminal PowerShell, desde la raíz del repositorio, crear el entorno,
-instalar las dependencias, restaurar el modelo e iniciar la API:
+instalar las dependencias e iniciar la API:
 
 ```powershell
 py -3.12 -m venv backend/.venv
 backend/.venv/Scripts/python.exe -m pip install -r backend/requirements.txt -r backend/requirements-gat.txt
 $env:PYTHONPATH = "$pwd/backend"
-backend/.venv/Scripts/python.exe -m app.bootstrap_gat
 backend/.venv/Scripts/python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -148,10 +154,8 @@ terminales abiertas y presionar `Ctrl+C` en cada una para detener la aplicación
 En los siguientes arranques basta con definir `PYTHONPATH`, iniciar Uvicorn y
 ejecutar `npm run dev` desde `frontend`; no es necesario reinstalar dependencias.
 
-Los archivos de históricos que se quieran analizar deben cargarse desde la
-aplicación. El modelo preentrenado y sus datos asociados se descargan mediante
-Git LFS. Si el arranque informa que el paquete está ausente o incompleto, ejecutar
-`git lfs pull` desde la raíz del repositorio y volver a iniciar la aplicación.
+Para usar el modelo C, seguir el paso 3 en la interfaz. Los históricos que se
+quieran analizar se cargan desde **Selector de Historial**.
 
 ## Desinstalación completa
 

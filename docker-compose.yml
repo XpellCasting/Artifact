@@ -39,8 +39,6 @@ services:
       - active_databases:/app/linux-database
       - ./models:/app/models
       - gat_sequence_cache:/app/gat_sequence_cache
-      - ./artifacts/gat_lstm:/app/artifacts/gat_lstm:ro
-    command: ["python", "-m", "app.bootstrap_gat", "--bundle", "/app/artifacts/gat_lstm", "--serve"]
     ports:
       - "8000:8000"
 
