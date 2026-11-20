@@ -153,6 +153,58 @@ aplicación. El modelo preentrenado y sus datos asociados se descargan mediante
 Git LFS. Si el arranque informa que el paquete está ausente o incompleto, ejecutar
 `git lfs pull` desde la raíz del repositorio y volver a iniciar la aplicación.
 
+## Desinstalación completa
+
+### Retirar la integración de Home Assistant
+
+1. Si hay una sesión en directo, pulsar **Detener recepción y guardar**. Si también
+   se quiere borrar su historial de Home Assistant, abrir el dispositivo **Paranoid**
+   y anotar los identificadores de sus entidades de conexión y confianza, incluidas
+   las de prueba. Usar los identificadores actuales si se renombró alguna entidad.
+2. En **Configuración → Dispositivos y servicios → Paranoid**, abrir el menú de
+   la entrada y elegir **Eliminar**. Esto cierra el vínculo activo y retira los
+   tres paneles de la barra lateral.
+3. Desinstalar **Paranoid** desde Marketplace o HACS, según el método de
+   instalación, y reiniciar Home Assistant.
+
+### Eliminar el servidor y los datos locales
+
+Si se utilizó un servidor compartido, corresponde a quien lo administra decidir
+si se eliminan las evaluaciones y los datos de ese servidor.
+
+- **Con Docker Compose**, abrir una terminal en la carpeta de esta instalación
+  de `Artifact`, junto a `docker-compose.yml`. El siguiente comando elimina los
+  contenedores, las imágenes locales del proyecto y sus volúmenes, **incluidas
+  las bases de datos y las evaluaciones guardadas**.
+
+  ```powershell
+  docker compose down --volumes --rmi local
+  ```
+
+- **Con instalación local sin Docker**, detener la API y la interfaz con
+  `Ctrl+C` en cada una de sus terminales.
+
+En ambos casos, eliminar después la **copia del proyecto utilizada para la
+instalación**. Allí se guardan los históricos importados en `data/`, el vínculo
+con Home Assistant en `storage/home_assistant_bridge.json` y los modelos en
+`models/`. Si se configuraron rutas de datos externas, revisar también esas
+ubicaciones.
+
+### Borrar el historial de la prueba y los datos del navegador
+
+En Home Assistant, con una cuenta administradora, ejecutar `recorder.purge_entities` con los
+identificadores anotados y `keep_days: 0` para borrar todo su historial de
+estados. Por ejemplo, para borrar la confianza de una puerta, seleccionar
+solo `sensor.confianza_binary_sensor_puerta`. Así se conserva el historial del
+sensor original `binary_sensor.puerta`. En **Herramientas → Estadísticas**,
+eliminar también las estadísticas de largo plazo de las entidades de Paranoid.
+[Purga de entidades en Recorder](https://www.home-assistant.io/actions/recorder.purge_entities/) ·
+[Estadísticas de largo plazo](https://www.home-assistant.io/docs/configuration/long-term-statistics/)
+
+Para retirar las copias locales de la prueba, eliminar las exportaciones
+descargadas y borrar los datos del sitio de Paranoid en el navegador utilizado.
+Las copias de seguridad previas conservan los datos que incluían.
+
 ## Uso
 
 1. Abrir **Selector de Historial** y elegir **Home Assistant** o **Archivo CSV**.
