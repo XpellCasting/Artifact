@@ -94,9 +94,9 @@ def _start_csv_flow(flow_id, context_csv=None, context_filename=None):
             runner = CausalFlowRunner(deepcopy(state.filtro_estadistico), deepcopy(state.filtro_contextual), state.diagnostic_workbench)
         context_source = None
         if context_csv is not None:
-            if not any(node["type"] == "contextual" and node.get("config", {}).get("enabled") is not False
+            if not any(node["type"] in {"contextual", "classifier"} and node.get("config", {}).get("enabled") is not False
                        for node in flow["nodes"]):
-                raise ValueError("Activa un filtro contextual en el flujo para usar el CSV de contexto.")
+                raise ValueError("Activa el filtro contextual o el clasificador en el flujo para usar el CSV de contexto.")
             if not context_csv.strip():
                 raise ValueError("El CSV de contexto está vacío.")
             events = CargadorHistorial().cargar_real_csv(context_csv, context_filename).eventos

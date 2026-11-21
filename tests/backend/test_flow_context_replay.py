@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 import pandas as pd
 
@@ -6,6 +7,7 @@ from app.database.evaluacion_etiquetada import separate_csv
 from app.flow.context_replay import ContextReplay
 from app.flow.evaluacion import CausalFlowRunner
 from app.modulos.contextual.contextual import FiltroContextualEspacioTemporal
+from app.services.diagnostico import DiagnosticRunSession
 from app.services.historial.cargar_historial import CargadorHistorial
 
 
@@ -56,7 +58,47 @@ class ContextReplayTests(unittest.TestCase):
         self.assertEqual(len(replay.take_through(candidates["timestamp_dt"].iloc[-1])), 2)
         self.assertEqual(replay.status(advance=False)["buffered"], 0)
 
-    def test_context_feeds_only_the_causal_index_and_keeps_injected_candidate(self):
+    def test_classifier_receives_causal_context_without_a_contextual_node(self):
+        flow = {"name": "Clasificador con contexto", "nodes": [
+            {"id": kind, "type": kind} for kind in ("input", "classifier", "output")
+        ], "edges": [
+            {"id": "in", "source": "input", "target": "classifier"},
+            {"id": "out", "source": "classifier", "target": "output"},
+        ]}
+        loader = CargadorHistorial()
+        def readings(rows):
+            return loader.cargar_real_csv(("entity_id,state,last_changed\n" + "".join(
+                f"sensor.a,{state},2026-06-01T10:{minute:02d}:00Z\n" for minute, state in rows
+            )).encode(), "eventos.csv")
+
+        development = readings([(0, 10)])
+        future = readings([(2, 20), (4, 40)]).eventos
+        context = readings([(3, 30), (1, 11), (2, 99)]).eventos
+        for use_session in (True, False):
+            with self.subTest(use_session=use_session):
+                workbench = Mock(spec=["enrich_contextual", "_run_snapshot"] +
+                                 (["create_run_session"] if use_session else []))
+                workbench._run_snapshot.return_value = {"model": {"window_seconds": 3600}, "references": []}
+                if use_session:
+                    workbench.create_run_session.side_effect = lambda *args: DiagnosticRunSession(workbench, *args)
+                histories = []
+                def classify(statistical, contexts, *, events, session, **kwargs):
+                    if session is None:
+                        histories.append(events["state"].tolist())
+                    else:
+                        at = pd.Timestamp(contexts[0]["timestamp"])
+                        histories.append([r["state"] for r in session.rows_for("sensor.a", at, 3600)])
+                    return contexts
+
+                workbench.enrich_contextual.side_effect = classify
+                replay = ContextReplay(context, future, development.eventos["timestamp_dt"].max(), "contexto.csv")
+                summary, _, _ = CausalFlowRunner(None, None, workbench).evaluate(
+                    flow, development.eventos, future, development.entidades, {}, {}, context_source=replay)
+                self.assertEqual(histories, [["10", "11", "20"], ["10", "11", "20", "30", "40"]])
+                self.assertEqual(summary["candidate_count"], 2)
+                self.assertEqual(summary["performance"]["counts"]["context_rows"], 2)
+
+    def test_contextual_filter_uses_causal_context_and_keeps_injected_candidate(self):
         flow = {"name": "Replay con contexto", "nodes": [
             {"id": kind, "type": kind, "config": {"evidence_policy": "independent"}}
             for kind in ("input", "contextual", "output")

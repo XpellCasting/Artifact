@@ -78,7 +78,8 @@ class CsvFlowRequirementTests(unittest.TestCase):
             "entity_id": ["sensor.a"], "timestamp_dt": [reference + pd.Timedelta(minutes=2)],
         })
         self.runtime.state.validation_replay_state.update(labelled=True, filename="ground_truth.csv")
-        self.runtime.flow_store.get.return_value["nodes"].append({"id": "contextual", "type": "contextual"})
+        self.runtime.flow_store.get.return_value["nodes"].append({"id": "classifier", "type": "classifier"})
+        self.runtime.state.diagnostic_workbench = Mock()
         body = b"entity_id,state,last_changed\nsensor.b,on,2026-01-01T00:01:00Z\n"
         truth = [{"raw_index": 0}]
         with patch.object(self.api_module.labelled_evaluation, "read_truth", return_value=truth), \

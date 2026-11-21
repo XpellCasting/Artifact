@@ -346,20 +346,21 @@ class CausalFlowRunner(FlowRunner):
                              current_batch_rows=len(batch), groups_completed=groups_completed,
                              group_started_at=pd.Timestamp.now(tz="UTC").isoformat())
                     last_progress_at = batch_started
+                history_batch = batch
+                if context_source is not None:
+                    received = context_source.take_through(sample_end)
+                    if not received.empty:
+                        received = received[received.columns.intersection(columns)]
+                        history_batch = pd.concat([received, batch], ignore_index=True)
                 if available is not None:
-                    available = retain(pd.concat([available, batch], ignore_index=True), batch["timestamp_dt"].max())
+                    available = retain(pd.concat([available, history_batch], ignore_index=True), sample_end)
                 for session in self.diagnostic_sessions.values():
-                    session.add_events(batch, events_sorted=True)
+                    session.add_events(history_batch, events_sorted=True)
                 if prepared_context is not None:
                     context_started = perf_counter()
                     advance = getattr(prepared_context, "advance_normalized", prepared_context.advance)
-                    context_batch = batch
-                    if context_source is not None:
-                        received = context_source.take_through(sample_end)
-                        if not received.empty:
-                            context_batch = pd.concat([received, batch], ignore_index=True)
                     advance(
-                        context_batch,
+                        history_batch,
                         sample_end - pd.Timedelta(seconds=horizon),
                     )
                     contextual_index_update_ms += (perf_counter() - context_started) * 1000

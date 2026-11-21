@@ -71,7 +71,7 @@ export default function FutureEventsSource({ apiBaseUrl, busy, canRun, canUpload
           event.target.value = "";
         }} /></label>
         {contextFile && <><strong title={contextFile.name}>{contextFile.name}</strong><button type="button" disabled={busy || !canUpload} onClick={() => onContextFile(null)}>Quitar CSV de contexto</button></>}
-        <p className="fl-hint">Lecturas auxiliares para el filtro contextual durante la evaluación.</p>
+        <p className="fl-hint">El filtro contextual consulta las lecturas auxiliares y el clasificador las usa para comparar segmentos de la misma entidad con DTW. Solo se evalúan las filas del conjunto etiquetado.</p>
       </div>}
       <button className="fl-primary" type="button" disabled={busy || !canRun || !replay?.loaded || !replay?.labelled} onClick={onEvaluate}><Play size={16} />{busy ? "Evaluando…" : dirty ? "Guardar y evaluar CSV" : "Evaluar CSV"}</button>
       {replay?.loaded && connected && <p className="fl-hint">Home Assistant recibe la confianza de esta evaluación en entidades <code>sensor.confianza_test_…</code>.</p>}
